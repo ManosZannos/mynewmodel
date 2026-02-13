@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+runs/
+outputs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+data/
+dataset/
