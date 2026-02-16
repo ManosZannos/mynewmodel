@@ -9,3 +9,5 @@ checkpoints/
 *.ckpt
 data/
 dataset/
+Logs_train/
+runs_10_10/
