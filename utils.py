@@ -435,25 +435,29 @@ def loc_pos(seq_):
 
 def seq_to_graph(seq_, seq_rel, pos_enc=False):
     """
-    Builds node feature tensor V of shape (seq_len, N, 4) from relative features.
+    Builds node feature tensor V of shape (seq_len, N, 4) from absolute features.
+    Paper-faithful: Uses absolute state (LON, LAT, SOG, Heading), not relative.
     If pos_enc=True, prepends a positional index feature.
+    
+    Input: seq_ shape (N, 4, seq_len) where N = number of vessels
+    Output: V shape (seq_len, N, 4)
     """
-    seq_ = seq_.squeeze()
-    seq_rel = seq_rel.squeeze()
-
-    seq_len = seq_.shape[2]
-    max_nodes = seq_.shape[0]
-
-    V = np.zeros((seq_len, max_nodes, 4), dtype=np.float32)
-    for s in range(seq_len):
-        step_rel = seq_rel[:, :, s]
-        for h in range(len(step_rel)):
-            V[s, h, :] = step_rel[h]
+    # Safety checks: ensure correct input shape
+    assert seq_.dim() == 3, f"Expected seq_ (N, 4, T), got {seq_.shape}"
+    assert seq_rel.dim() == 3, f"Expected seq_rel (N, 4, T), got {seq_rel.shape}"
+    assert seq_.shape[1] == 4, f"Expected 4 features, got {seq_.shape[1]}"
+    
+    # Optimized: use permute instead of nested loops
+    # Converts (N, 4, T) -> (T, N, 4) via axis permutation
+    V = seq_.permute(2, 0, 1).contiguous()  # (seq_len, N, 4)
 
     if pos_enc:
-        V = loc_pos(V)
+        # loc_pos expects numpy array
+        V_np = V.cpu().numpy()
+        V_np = loc_pos(V_np)
+        return torch.from_numpy(V_np).float().to(seq_.device)
 
-    return torch.from_numpy(V).type(torch.float)
+    return V.float()
 
 
 def poly_fit(traj, traj_len, threshold):
@@ -600,7 +604,7 @@ class TrajectoryDataset(Dataset):
             pbar.update(1)
             start, end = self.seq_start_end[ss]
 
-            v_ = seq_to_graph(self.obs_traj[start:end, :], self.obs_traj_rel[start:end, :], True)
+            v_ = seq_to_graph(self.obs_traj[start:end, :], self.obs_traj_rel[start:end, :], False)
             self.v_obs.append(v_.clone())
 
             v_ = seq_to_graph(self.pred_traj[start:end, :], self.pred_traj_rel[start:end, :], False)

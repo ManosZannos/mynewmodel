@@ -8,7 +8,7 @@ class AsymmetricConvolution(nn.Module):
     def __init__(self, in_cha, out_cha):
         super(AsymmetricConvolution, self).__init__()
 
-        self.conv1 = nn.Conv2d(in_cha, out_cha, kernel_size=(3, 1), padding=(1, 0), bias=False)#如果padding=(1,1)中第一个参数表示在高度上面的padding,第二个参数表示在宽度上面的padding
+        self.conv1 = nn.Conv2d(in_cha, out_cha, kernel_size=(3, 1), padding=(1, 0), bias=False)
         self.conv2 = nn.Conv2d(in_cha, out_cha, kernel_size=(1, 3), padding=(0, 1))
 
         self.shortcut = lambda x: x
@@ -33,7 +33,7 @@ class AsymmetricConvolution(nn.Module):
 
 class InteractionMask(nn.Module):
 
-    def __init__(self, number_asymmetric_conv_layer=2, spatial_channels=4, temporal_channels=4):
+    def __init__(self, number_asymmetric_conv_layer=2, num_heads=4):
         super(InteractionMask, self).__init__()
 
         self.number_asymmetric_conv_layer = number_asymmetric_conv_layer
@@ -43,10 +43,10 @@ class InteractionMask(nn.Module):
 
         for i in range(self.number_asymmetric_conv_layer):
             self.spatial_asymmetric_convolutions.append(
-                AsymmetricConvolution(spatial_channels, spatial_channels)
+                AsymmetricConvolution(num_heads, num_heads)
             )
             self.temporal_asymmetric_convolutions.append(
-                AsymmetricConvolution(temporal_channels, temporal_channels)
+                AsymmetricConvolution(num_heads, num_heads)
             )
 
         self.spatial_output = nn.Sigmoid()
@@ -54,8 +54,8 @@ class InteractionMask(nn.Module):
 
     def forward(self, dense_spatial_interaction, dense_temporal_interaction, threshold=0.5):
 
-        assert len(dense_temporal_interaction.shape) == 4       #【T，num_heads,N,N】
-        assert len(dense_spatial_interaction.shape) == 4       #   (N num_heads T T)
+        assert len(dense_temporal_interaction.shape) == 4       # (N, num_heads, T, T)
+        assert len(dense_spatial_interaction.shape) == 4        # (T, num_heads, N, N)
 
         for j in range(self.number_asymmetric_conv_layer):
             dense_spatial_interaction = self.spatial_asymmetric_convolutions[j](dense_spatial_interaction)
@@ -64,12 +64,9 @@ class InteractionMask(nn.Module):
         spatial_interaction_mask = self.spatial_output(dense_spatial_interaction)
         temporal_interaction_mask = self.temporal_output(dense_temporal_interaction)
 
-        spatial_zero = torch.zeros_like(spatial_interaction_mask, device='cuda')
-        temporal_zero = torch.zeros_like(temporal_interaction_mask, device='cuda')   #0
-
-        spatial_interaction_mask = torch.where(spatial_interaction_mask > threshold, spatial_interaction_mask,spatial_zero)
-#大于阈值就是激活之后的interaction_mask本身，小于阈值是0
-        temporal_interaction_mask = torch.where(temporal_interaction_mask > threshold, temporal_interaction_mask,temporal_zero)
+        # Paper-faithful: binary masks (0/1) after thresholding
+        spatial_interaction_mask = (spatial_interaction_mask >= threshold).float()
+        temporal_interaction_mask = (temporal_interaction_mask >= threshold).float()
 
         return spatial_interaction_mask, temporal_interaction_mask
 
@@ -88,49 +85,83 @@ class ZeroSoftmax(nn.Module):
 
 class SelfAttention(nn.Module):
 
-    def __init__(self, in_dims=4, d_model=64, num_heads=4):     #d_model表示嵌入向量维度（数据嵌入的维度）
+    def __init__(self, in_dims=4, d_model=64, num_heads=4):    
         super(SelfAttention, self).__init__()
 
         self.embedding = nn.Linear(in_dims, d_model)
         self.query = nn.Linear(d_model, d_model)
         self.key = nn.Linear(d_model, d_model)
 
-        self.scaled_factor = torch.sqrt(torch.Tensor([d_model])).cuda()
+        # Register as buffer so it moves with model.to(device)
+        self.register_buffer("scaled_factor", torch.sqrt(torch.tensor(float(d_model))))
         self.softmax = nn.Softmax(dim=-1)
 
         self.num_heads = num_heads
+        self.d_model = d_model
+
+    def positional_encoding(self, seq_len, d_model, device):
+        """
+        Generate positional encoding as described in the paper (Section 3.2.2, Eq. 6)
+        This is added to temporal graph embeddings
+        """
+        position = torch.arange(seq_len, dtype=torch.float, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float, device=device) * 
+                             -(np.log(10000.0) / d_model))
+        
+        pe = torch.zeros(seq_len, d_model, device=device)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        return pe
 
     def split_heads(self, x):
 
-        # x [batch_size seq_len d_model]    #query  和 key的维度都是  [batch_size, seq_len, d_model]  [batch_size , 序列长度， 嵌入维度]，多头是将embedding 分成h份
-         #多头是将embedding 分成h份，此时size变成[batch_size, seq_len, h, embeeding/h]
-        x = x.reshape(x.shape[0], -1, self.num_heads, x.shape[-1] // self.num_heads).contiguous()   #使用contiguous定义这个的x改变了，但是不影响参数里面的x值
-        #所以里面的意思就是：batch_size, seq_len, h, embeeding/h----------将seq_len与h进行转置，为了方便后面的计算
-        return x.permute(0, 2, 1, 3)  # [batch_size nun_heads seq_len depth]   #permute转换维度  ，这里的深度等于 embeeding/nun_heads
+      
+        x = x.reshape(x.shape[0], -1, self.num_heads, x.shape[-1] // self.num_heads).contiguous()   #contiguous：batch_size, seq_len, h, embeeding/h----------seq_len
+        return x.permute(0, 2, 1, 3)  # [batch_size nun_heads seq_len depth]   #permute, embeeding/nun_heads
 
-    def forward(self, x, mask=False, multi_head=False):
-
+    def forward(self, x, mask=False, multi_head=False, add_positional_encoding=False):
+        """
+        Forward pass with optional positional encoding for temporal graphs
+        
+        Args:
+            x: input tensor [batch_size, seq_len, feature_dim]
+            mask: whether to apply causal mask
+            multi_head: whether to use multi-head attention
+            add_positional_encoding: whether to add positional encoding (for temporal graphs, Eq. 6)
+        """
         # batch_size seq_len 2      spatial_graph[8,57,2]
 
         assert len(x.shape) == 3
 
         embeddings = self.embedding(x)  # batch_size seq_len d_model
+        
+        # Add positional encoding for temporal graph (Eq. 6 in paper)
+        if add_positional_encoding:
+            seq_len = x.shape[1]
+            pos_enc = self.positional_encoding(seq_len, self.d_model, device=x.device)
+            embeddings = embeddings + pos_enc.unsqueeze(0)  # broadcast across batch
+        
         query = self.query(embeddings)  # batch_size seq_len d_model
         key = self.key(embeddings)      # batch_size seq_len d_model
 
         if multi_head:
-            query = self.split_heads(query)  # B num_heads seq_len d_model    #分别将Q和K分成多头，   [batch_size nun_heads seq_len depth] , depth=embeeding/num_head
+            query = self.split_heads(query)  # B num_heads seq_len d_model    [batch_size nun_heads seq_len depth] , depth=embeeding/num_head
             key = self.split_heads(key)  # B num_heads seq_len d_model
-            attention = torch.matmul(query, key.permute(0, 1, 3, 2))  # (batch_size, num_heads, seq_len, seq_len)  是因为这里是Q*K的转置，所以最后两个调换了维度---[batch_size, num_heads,]
-        else:                                                         #---[batch_size, num_heads,depth,seq_len] ---k是这个维度？？？（一样）不对，计算之后--最后应该是两个序列长度，因为呈完之后了
-            attention = torch.matmul(query, key.permute(0, 2, 1))  # (batch_size, seq_len, seq_len)    这里也是，是因为这里是Q*K的转置，所以最后两个调换了维度，最后计算之后的维度为：[batch_size seq_len, seq_len]
-                                                                     #[batch_size seq_len, embedding]----最后两个确实相等-----因为如果没有多头，Q和K的维度都是 [batch_size， seq_len embedding]
-        attention = self.softmax(attention / self.scaled_factor)     # 多头之后维度为[batch_size，num_heads, seq_len, seq_len],不使用多头之后的维度：[batch_size,seq_len,seq_len]
-
-        if mask is True:   #（传的参数是False）
-
-            mask = torch.ones_like(attention)
-            attention = attention * torch.tril(mask)  #将mask变成对角矩阵，右上面的值为0
+            scores = torch.matmul(query, key.permute(0, 1, 3, 2))  # (batch_size, num_heads, seq_len, seq_len)  ---[batch_size, num_heads,]
+        else:                                                         #---[batch_size, num_heads,depth,seq_len] ---k
+            scores = torch.matmul(query, key.permute(0, 2, 1))  # (batch_size, seq_len, seq_len)   ：[batch_size seq_len, seq_len]
+                                                                     #[batch_size seq_len, embedding][batch_size， seq_len embedding]
+        
+        # Scale scores
+        scores = scores / self.scaled_factor
+        
+        # Apply causal mask BEFORE softmax (paper-faithful: current independent of future)
+        if mask is True:
+            causal_mask = torch.tril(torch.ones_like(scores, dtype=torch.bool))
+            scores = scores.masked_fill(~causal_mask, float("-inf"))
+        
+        attention = self.softmax(scores)     # [batch_size，num_heads, seq_len, seq_len],：[batch_size,seq_len,seq_len]
 
         return attention, embeddings
 
@@ -155,54 +186,67 @@ class SpatialTemporalFusion(nn.Module):
 
 class SparseWeightedAdjacency(nn.Module):   #得到邻接矩阵
 
-    def __init__(self, spa_in_dims=4, tem_in_dims=5, embedding_dims=64, obs_len=10, dropout=0,
-                 number_asymmetric_conv_layer=2):
+    def __init__(self, spa_in_dims=4, tem_in_dims=4, embedding_dims=64, obs_len=10, dropout=0,
+                 number_asymmetric_conv_layer=2, num_heads=4):
         super(SparseWeightedAdjacency, self).__init__()
-####这里obs_len换成12了
         # dense interaction
-        self.spatial_attention = SelfAttention(spa_in_dims, embedding_dims)       #自注意力之后得到 attention和embedding
-        self.temporal_attention = SelfAttention(tem_in_dims, embedding_dims)
+        # Paper-faithful: Both use 4D state vector (LON, LAT, SOG, Heading)
+        # Positional encoding is added via sinusoidal PE in temporal attention (Eq. 6)
+        self.spatial_attention = SelfAttention(spa_in_dims, embedding_dims, num_heads=num_heads)
+        self.temporal_attention = SelfAttention(tem_in_dims, embedding_dims, num_heads=num_heads)
 
-        # 多头之后注意力维度为[batch_size，num_heads, seq_len, seq_len],
-        # 不使用多头之后注意力的维度：[batch_size,seq_len,seq_len]
-        # 嵌入向量的维度一直为：# batch_size seq_len d_model
+        # [batch_size，num_heads, seq_len, seq_len],
+        # [batch_size,seq_len,seq_len]
+        # batch_size seq_len d_model
 
         # attention fusion
-        self.spa_fusion = SpatialTemporalFusion(obs_len=obs_len)    #卷积核1
+        self.spa_fusion = SpatialTemporalFusion(obs_len=obs_len) 
 
         # interaction mask
         self.interaction_mask = InteractionMask(
-            number_asymmetric_conv_layer=number_asymmetric_conv_layer
+            number_asymmetric_conv_layer=number_asymmetric_conv_layer,
+            num_heads=num_heads
         )
 
         self.dropout = dropout
         self.zero_softmax = ZeroSoftmax()
 
     def forward(self, graph, identity):
-
-        assert len(graph.shape) == 3   #graph 是三维的
-        # # graph 1 obs_len N 3 ---------graph:[128,8,57,3]---[8,57,3]
-        spatial_graph = graph[:, :, 1:]  # (T N 2)   (obs_len、行人数、坐标x和y)-----(batch_size、序列长度、嵌入维度)  ---这里T是obs_len吧？？？？确定了就是
-        #所以空间图，最后是xy坐标  spatial_graph：graph:[128,8,57,2]---spatial_graph[8,57,2]
-        temporal_graph = graph.permute(1, 0, 2)  # (N T 3)    (行人数、obs_len、坐标x和y 还有个（1，8+1）之间的随机值)   ---这里T是obs_len吧？？？？
-        #时间图：temporal_graph:[128,8,57,3]--temporal_graph[8,57,3]
-        # (T num_heads N N)   (T N d_model)  -------注意力之后变成（[batch_size，num_heads, seq_len, seq_len]）（ # 嵌入向量维度：batch_size seq_len d_model）,---T是batch_size
+        """
+        Args:
+            graph: Input shape (T, N, 4) with 4D state vector [LON, LAT, SOG, Heading]
+                   Paper-faithful: no pos_enc feature, sinusoidal PE added in attention
+            identity: [spatial_identity, temporal_identity] matrices
+        """
+        assert len(graph.shape) == 3
+        
+        # graph shape: (T, N, 4) where T=obs_len, N=num_vessels
+        # Features: [LON, LAT, SOG, Heading] (paper's 4D state vector)
+        
+        # Spatial graph: Use all 4D features
+        spatial_graph = graph  # (T, N, 4) - 4D state vector as per paper
+        
+        # Temporal graph: Use all 4D features, permute to (N, T, 4)
+        temporal_graph = graph.permute(1, 0, 2)  # (N, T, 4)
+        # (T num_heads N N)   (T N d_model)  -------（[batch_size，num_heads, seq_len, seq_len]）（ # ：batch_size seq_len d_model）,---T是batch_size
         dense_spatial_interaction, spatial_embeddings = self.spatial_attention(spatial_graph, multi_head=True) #-----[batch_size，num_heads, seq_len, seq_len]
 
         # (N num_heads T T)   (N T d_model)
-        dense_temporal_interaction, temporal_embeddings = self.temporal_attention(temporal_graph, multi_head=True)
+        # Add positional encoding for temporal graph as per Eq. 6 in paper
+        # Apply causal mask to ensure current state is independent of future state (paper requirement)
+        dense_temporal_interaction, temporal_embeddings = self.temporal_attention(temporal_graph, multi_head=True, add_positional_encoding=True, mask=True)
 
         # attention fusion   dense_spatial_interaction.permute(1, 0, 2, 3))=（num_heads,T,N,N）
         st_interaction = self.spa_fusion(dense_spatial_interaction.permute(1, 0, 2, 3)).permute(1, 0, 2, 3)     #(T num_heads N N) ）
         ts_interaction = dense_temporal_interaction
 
-        spatial_mask, temporal_mask = self.interaction_mask(st_interaction, ts_interaction)  #这里st_interaction是融合了的，但是我没看出哪里表明融合了呢？
-          #经过interaction_mask之后维度没有改变，spatial_mask:(T num_heads N N)  ;temporal_mask:(N num_heads T T)
+        spatial_mask, temporal_mask = self.interaction_mask(st_interaction, ts_interaction)  #st_interaction
+          #经过interaction_mask，spatial_mask:(T num_heads N N)  ;temporal_mask:(N num_heads T T)
         # self-connected
-        spatial_mask = spatial_mask + identity[0].unsqueeze(1)     #[8,N,N]  N表示行人数，identity矩阵值是1，增加一维
+        spatial_mask = spatial_mask + identity[0].unsqueeze(1)     #[8,N,N] ，identity
         temporal_mask = temporal_mask + identity[1].unsqueeze(1)  # [N,8,8]
 
-        normalized_spatial_adjacency_matrix = self.zero_softmax(dense_spatial_interaction * spatial_mask, dim=-1)   #dense_spatial_interaction就是注意力分数之后的矩阵
+        normalized_spatial_adjacency_matrix = self.zero_softmax(dense_spatial_interaction * spatial_mask, dim=-1)   #dense_spatial_interaction
         normalized_temporal_adjacency_matrix = self.zero_softmax(dense_temporal_interaction * temporal_mask, dim=-1)
 
         return normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix,\
@@ -210,6 +254,15 @@ class SparseWeightedAdjacency(nn.Module):   #得到邻接矩阵
 
 
 class GraphConvolution(nn.Module):
+    """
+    Graph Convolution Layer for SMCHN model
+    
+    Applies graph convolution: H' = σ(A · H · W) where:
+    - A: adjacency matrix (captures interactions)
+    - H: node features (vessel state vectors)
+    - W: learnable weight matrix
+    - σ: activation function (PReLU)
+    """
 
     def __init__(self, in_dims=2, embedding_dims=16, dropout=0):
         super(GraphConvolution, self).__init__()
@@ -220,19 +273,71 @@ class GraphConvolution(nn.Module):
         self.dropout = dropout
 
     def forward(self, graph, adjacency):
+        """
+        Args:
+            graph: Node features [batch_size, 1, seq_len, in_dims]
+                   in_dims can be 4 (initial: LON,LAT,SOG,Heading) or embedding_dims (subsequent layers)
+            adjacency: [batch_size, num_heads, seq_len, seq_len]
+        Returns:
+            gcn_features: [batch_size, num_heads, seq_len, embedding_dims]
+        """
+        # Graph convolution: A · H · W
+        gcn_features = self.embedding(torch.matmul(adjacency, graph))
+        gcn_features = F.dropout(self.activation(gcn_features), p=self.dropout, training=self.training)
 
-        # graph [batch_size 1 seq_len 2]
-        # adjacency [batch_size num_heads seq_len seq_len]     邻接矩阵最后两个不应该是 行人数*行人数？？
-        gcn_features = self.embedding(torch.matmul(adjacency, graph)) #torch.matmul用于不同维度的矩阵做乘法
-        gcn_features = F.dropout(self.activation(gcn_features), p=self.dropout)
+        return gcn_features
 
-        return gcn_features  # [batch_size num_heads seq_len hidden_size]
 
-def Mix(x,w1,b1,w2,b2):
-    h = torch.tanh(torch.matmul(x,w1)+b1).cuda()
-    f = torch.nn.Softmax(dim=-1)
-    w = f(torch.matmul(h,w2)+b2).cuda()
-    return w
+class HybridNetwork(nn.Module):
+    """
+    Hybrid network for fusing spatial-temporal and temporal-spatial features
+    as described in Eq. 18 of the paper.
+    
+    This MLP dynamically learns weights w = [w1, w2] to fuse features:
+    w = softmax(Why*tanh(Whid*[Hs ⊕ Ht] + bhid) + bhy)
+    H = w1*Hs + w2*Ht
+    """
+    
+    def __init__(self, feature_dim=16, hidden_dim=64):
+        super(HybridNetwork, self).__init__()
+        
+        # Two-layer MLP as described in paper (Section 3.2.3)
+        # Input: concatenated features [Hs ⊕ Ht]
+        # Output: 2D weight vector [w1, w2]
+        self.fc_hidden = nn.Linear(feature_dim * 2, hidden_dim)
+        self.fc_output = nn.Linear(hidden_dim, 2)
+        
+        self.tanh = nn.Tanh()
+        self.softmax = nn.Softmax(dim=-1)
+    
+    def forward(self, spatial_temporal_features, temporal_spatial_features):
+        """
+        Args:
+            spatial_temporal_features (Hs): features from spatial→temporal GCN path
+            temporal_spatial_features (Ht): features from temporal→spatial GCN path
+            
+        Returns:
+            fused_features (H): weighted combination H = w1*Hs + w2*Ht
+        """
+        # Concatenate features along last dimension [Hs ⊕ Ht]
+        concatenated = torch.cat([spatial_temporal_features, temporal_spatial_features], dim=-1)
+        
+        # Two-layer MLP (Eq. 18)
+        hidden = self.tanh(self.fc_hidden(concatenated))
+        logits = self.fc_output(hidden)
+        
+        # Softmax to get weights w = [w1, w2]
+        weights = self.softmax(logits)  # Shape: [..., 2]
+        
+        # Extract w1 and w2
+        w1 = weights[..., 0:1]  # Keep dimension for broadcasting
+        w2 = weights[..., 1:2]
+        
+        # Weighted fusion: H = w1*Hs + w2*Ht (Eq. 19)
+        fused_features = w1 * spatial_temporal_features + w2 * temporal_spatial_features
+        
+        return fused_features
+
 
 class SparseGraphConvolution(nn.Module):
 
@@ -244,53 +349,61 @@ class SparseGraphConvolution(nn.Module):
         self.spatial_temporal_sparse_gcn = nn.ModuleList()
         self.temporal_spatial_sparse_gcn = nn.ModuleList()
 
-        self.spatial_temporal_sparse_gcn.append(GraphConvolution(in_dims, embedding_dims))  #append()：在 ModuleList 后面添加网络层
+        self.spatial_temporal_sparse_gcn.append(GraphConvolution(in_dims, embedding_dims))  #append()：在 ModuleList 
         self.spatial_temporal_sparse_gcn.append(GraphConvolution(embedding_dims, embedding_dims))
 
         self.temporal_spatial_sparse_gcn.append(GraphConvolution(in_dims, embedding_dims))
         self.temporal_spatial_sparse_gcn.append(GraphConvolution(embedding_dims, embedding_dims))
 
-        self.W1 = torch.tensor(np.random.normal(0, 0.01, (16, 64)), dtype=torch.float).cuda()
-        self.b1 = torch.zeros(64, dtype=torch.float).cuda()
-        self.W2 = torch.tensor(np.random.normal(0, 0.01, (64, 2)), dtype=torch.float).cuda()
-        self.b2 = torch.zeros(2, dtype=torch.float).cuda()
+        # Hybrid network for feature fusion (Eq. 18-19 in paper)
+        self.hybrid_network = HybridNetwork(feature_dim=embedding_dims, hidden_dim=64)
 
 
     def forward(self, graph, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix):
-
-        # graph [1 seq_len num_pedestrians  3]     对的，这里1表示batch_size
-        # _matrix [batch num_heads seq_len seq_len]   对的
-
-        graph = graph[:, :, :, 1:]
+        """
+        Two-layer GCN with hybrid network fusion as described in paper Section 3.2.3
+        
+        Spatial path (Eq. 16): Â'st → GCN1 → Â'ts → GCN2 → Hs
+        Temporal path (Eq. 17): Â'ts → GCN1 → Â'st → GCN2 → Ht
+        Fusion (Eq. 18-19): H = w1*Hs + w2*Ht via hybrid network
+        
+        Args:
+            graph: shape [batch_size, seq_len, num_vessels, 4]
+                   Features: [LON, LAT, SOG, Heading] (paper's 4D state vector)
+            normalized_spatial_adjacency_matrix: shape [batch, num_heads, seq_len, seq_len]
+            normalized_temporal_adjacency_matrix: shape [batch, num_heads, seq_len, seq_len]
+        """
+        # graph is already 4D state vector [LON, LAT, SOG, Heading]
         spa_graph = graph.permute(1, 0, 2, 3)  # (seq_len 1 num_p 2)
         tem_graph = spa_graph.permute(2, 1, 0, 3)  # (num_p 1 seq_len 2)
 
-        gcn_spatial_features0 = self.spatial_temporal_sparse_gcn[0](spa_graph, normalized_spatial_adjacency_matrix)  # [batch_size num_heads seq_len hidden_size]
-        gcn_spatial_features = gcn_spatial_features0.permute(2, 1, 0, 3)  #(8,4,N,16)->(N,4,8,16)
+        # ===== SPATIAL PATH: Â'st → GCN1 → Â'ts → GCN2 → Hs (Eq. 16) =====
+        # First layer: apply spatial adjacency
+        gcn_spatial_layer1 = self.spatial_temporal_sparse_gcn[0](spa_graph, normalized_spatial_adjacency_matrix)
+        # Permute to prepare for temporal adjacency
+        gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)  # (num_p, num_heads, seq_len, hidden_dim)
+        # Second layer: apply temporal adjacency
+        Hs = self.spatial_temporal_sparse_gcn[1](gcn_spatial_layer1_perm, normalized_temporal_adjacency_matrix)
+        # Hs shape: (num_p, num_heads, seq_len, embedding_dims)
 
-        # [num_p num_heads seq_len d]
-        # print("****-----")
-        # print(gcn_spatial_features.shape)
-        # print('tem-adj---',normalized_temporal_adjacency_matrix.shape)
-        # print(self.spatial_temporal_sparse_gcn[1])
-        gcn_spatial_temporal_features = self.spatial_temporal_sparse_gcn[1](gcn_spatial_features, normalized_temporal_adjacency_matrix)
-        # print('gcn-st---,',gcn_spatial_temporal_features.shape)
+        # ===== TEMPORAL PATH: Â'ts → GCN1 → Â'st → GCN2 → Ht (Eq. 17) =====
+        # First layer: apply temporal adjacency
+        gcn_temporal_layer1 = self.temporal_spatial_sparse_gcn[0](tem_graph, normalized_temporal_adjacency_matrix)
+        # Permute to prepare for spatial adjacency
+        gcn_temporal_layer1_perm = gcn_temporal_layer1.permute(2, 1, 0, 3)  # (seq_len, num_heads, num_p, hidden_dim)
+        # Second layer: apply spatial adjacency
+        Ht = self.temporal_spatial_sparse_gcn[1](gcn_temporal_layer1_perm, normalized_spatial_adjacency_matrix)
+        # Ht shape: (seq_len, num_heads, num_p, embedding_dims)
 
-        gcn_temporal_features0 = self.temporal_spatial_sparse_gcn[0](tem_graph,normalized_temporal_adjacency_matrix)
-        gcn_temporal_features1 = gcn_temporal_features0.permute(2, 1, 0, 3)
-        gcn_temporal_spatial_features = self.temporal_spatial_sparse_gcn[1](gcn_temporal_features1,normalized_spatial_adjacency_matrix)
+        # Align dimensions for hybrid network: both should be (num_p, seq_len, num_heads, embedding_dims)
+        # or similar compatible shape
+        Hs_aligned = Hs.permute(0, 2, 1, 3)  # (num_p, seq_len, num_heads, embedding_dims)
+        Ht_aligned = Ht.permute(2, 0, 1, 3)  # (num_p, seq_len, num_heads, embedding_dims)
 
-        x = gcn_spatial_features0 + gcn_temporal_features1   #(8,4,n,16)
-        # w = Mix(x,self.W1,self.b1,self.W2,self.b2)
-        # w1 = w[:,:,:,0]   #(8,4,N)
-        # w2 = w[:,:,:,1]
-        # gcn_spatial_features0 = gcn_spatial_features0.permute(3,0,1,2)
-        # gcn_temporal_features1 = gcn_temporal_features1.permute(3,0,1,2)
-        # H = w1*gcn_spatial_features0 + w2*gcn_temporal_features1   #(16,8,4,n)
-        # H = H.permute(3,1,2,0)
-        H = x.permute(2,0,1,3)
-
-        # gcn_spatial_temporal_features, gcn_temporal_spatial_features.permute(2, 1, 0, 3)
+        # ===== HYBRID NETWORK FUSION: H = w1*Hs + w2*Ht (Eq. 18-19) =====
+        H = self.hybrid_network(Hs_aligned, Ht_aligned)
+        
+        # Return in expected format: (num_p, seq_len, num_heads, embedding_dims)
         return H
 
 class TCN(nn.Module):
@@ -314,6 +427,12 @@ class TCN(nn.Module):
 
 
 class Encoder(nn.Module):
+    """
+    TCN with gating mechanism as described in Eq. 20 of the paper:
+    H(l+1) = g(Wg * H(l)) ⊗ σ(Wf * H(l))
+    
+    where g is tanh activation and σ is sigmoid activation
+    """
     def __init__(self,fin,fout,layers=3,ksize=3):
         super(Encoder, self).__init__()
         self.fin = fin
@@ -321,17 +440,23 @@ class Encoder(nn.Module):
         self.layers = layers
         self.ksize = ksize
 
-        self.tcnf = TCN(self.fin, self.fout, self.layers, self.ksize)
-        self.tcng = TCN(self.fin, self.fout, self.layers, self.ksize)
+        self.tcnf = TCN(self.fin, self.fout, self.layers, self.ksize)  # σ(Wf * H)
+        self.tcng = TCN(self.fin, self.fout, self.layers, self.ksize)  # g(Wg * H)
 
     def forward(self,x):
-        residual = x
-        f = torch.sigmoid(self.tcnf(x))
-        g = torch.tanh(self.tcng(x))
-        return residual + f*g
+        """
+        Gated TCN: H(l+1) = tanh(Wg * H) ⊗ sigmoid(Wf * H)
+        Note: Paper formula (Eq. 20) does NOT include residual connection
+        """
+        f = torch.sigmoid(self.tcnf(x))  # σ(Wf * H(l))
+        g = torch.tanh(self.tcng(x))      # g(Wg * H(l))
+        
+        # Element-wise multiplication (⊗) as per Eq. 20
+        return f * g  # Removed residual connection to match paper
 
 
 class TrajectoryModel(nn.Module):
+
 
     def __init__(self,
                  number_asymmetric_conv_layer=2, embedding_dims=64, number_gcn_layers=1, dropout=0,
@@ -346,7 +471,11 @@ class TrajectoryModel(nn.Module):
 
         # sparse graph learning
         self.sparse_weighted_adjacency_matrices = SparseWeightedAdjacency(
-            number_asymmetric_conv_layer=number_asymmetric_conv_layer,obs_len=obs_len
+            spa_in_dims=4,
+            tem_in_dims=4,
+            number_asymmetric_conv_layer=number_asymmetric_conv_layer,
+            obs_len=obs_len,
+            num_heads=num_heads
         )
 
         # graph convolution
@@ -376,16 +505,22 @@ class TrajectoryModel(nn.Module):
 
 
     def forward(self, graph, identity):
-        # V_obs:[128,8,57,3]  -----空间邻接矩阵identity_spatial：[8,57,57]---  ---时间邻接矩阵identity_temporal：[57,8,8]
-        # graph 1 obs_len N 3 -----这个对，就是V_obs，batch_size,obs_len,N(行人数)，3
+        """
+        Args:
+            graph: V_obs with shape [batch_size, obs_len, N, 4]
+                   Features: [LON, LAT, SOG, Heading] (paper's 4D state vector)
+            identity: [identity_spatial (obs_len, N, N), identity_temporal (N, obs_len, obs_len)]
+        """
+        # Expected input: V_obs shape [batch_size, obs_len, N, 4]
+        # With 4 features: [LON, LAT, SOG, Heading] (paper-faithful)
 
         normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix, spatial_embeddings, temporal_embeddings = \
-            self.sparse_weighted_adjacency_matrices(graph.squeeze(), identity)   #得到归一化之后的离散空间，时间邻接矩阵
+            self.sparse_weighted_adjacency_matrices(graph.squeeze(0), identity)   
 
         H = self.stsgcn(
             graph, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix
-        )   #通过两个GCN得到 spatial-temporal 和temporal-spatial   两个图卷积特征，我不理解的点是 gcn中哪里体现出了？我只看到了线性加上激活函数，是因为输出已经是graph了？？
-#序列长度，多头，batch_size,hidden_size
+        )   
+#batch_size,hidden_size
         # gcn_representation = self.fusion_(gcn_temporal_spatial_features) + gcn_spatial_temporal_features
         # gcn_representation = self.fusion_(gcn_temporal_spatial_features) + self.fusion_(gcn_spatial_temporal_features)
         # gcn_representation = gcn_temporal_spatial_features + gcn_spatial_temporal_features  #[N,4,obs,16]
@@ -414,6 +549,5 @@ class TrajectoryModel(nn.Module):
         # for k in range(1, self.n_tcn):  #1,2,3,4
         #     features = F.dropout(self.tcns[k](features) + features, p=self.dropout)
 
-        # prediction = torch.mean(self.output(features), dim=-2)   #dim=-2相当于dim=0,按列求平均值，有几列就输出几列
-
+        # prediction = torch.mean(self.output(features), dim=-2)   #dim=-2
         return prediction.permute(1, 0, 2).contiguous()
