@@ -120,11 +120,11 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
         N = V_obs.shape[2]   # num vessels in this sample
 
         # Paper-faithful initialization (Section 3.2.1):
-        # Spatial: identity matrix I_N repeated for each time step (T, N, N)
-        identity_spatial = torch.eye(N, device=device).unsqueeze(0).repeat(T, 1, 1)
+        # Spatial: all ones (no prior knowledge of vessel interactions)
+        identity_spatial = torch.ones((T, N, N), device=device)
 
-        # Temporal: identity matrix E = I_T for self-loops only (N, T, T)
-        identity_temporal = torch.eye(T, device=device).unsqueeze(0).repeat(N, 1, 1)
+        # Temporal: upper triangular matrix with 1s (current state independent of future)
+        identity_temporal = torch.triu(torch.ones((N, T, T), device=device), diagonal=0)
 
         identity = [identity_spatial, identity_temporal]
 
@@ -191,11 +191,11 @@ def vald(epoch, model, checkpoint_dir, loader_val):
             N = V_obs.shape[2]   # num vessels in this sample
 
             # Paper-faithful initialization (Section 3.2.1):
-            # Spatial: identity matrix I_N repeated for each time step (T, N, N)
-            identity_spatial = torch.eye(N, device=device).unsqueeze(0).repeat(T, 1, 1)
+            # Spatial: all ones (no prior knowledge of vessel interactions)
+            identity_spatial = torch.ones((T, N, N), device=device)
 
-            # Temporal: identity matrix E = I_T for self-loops only (N, T, T)
-            identity_temporal = torch.eye(T, device=device).unsqueeze(0).repeat(N, 1, 1)
+            # Temporal: upper triangular matrix with 1s (current state independent of future)
+            identity_temporal = torch.triu(torch.ones((N, T, T), device=device), diagonal=0)
 
             identity = [identity_spatial, identity_temporal]
 
