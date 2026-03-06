@@ -18,7 +18,7 @@ def main():
     # Input
     # ----------------------------
     # Prefer the .zip directly (saves disk space and avoids manual extraction)
-    input_path = "data/raw/2020_12/AIS_2020_12_01.zip" 
+    input_path = "data/raw/2021_12/AIS_2021_12_01.zip" 
 
     # If you pass a zip and want a specific inner csv name, set it; otherwise first csv is used
     inner_csv_name = None
@@ -42,10 +42,10 @@ def main():
     # ----------------------------
     # Output
     # ----------------------------
-    dataset_name = "noaa_dec2020"
+    dataset_name = "noaa_dec2021"
     out_dir = os.path.join("dataset", dataset_name, "train")
-    out_csv = os.path.join(out_dir, "day_2020_12_01.csv")
-    out_stats = os.path.join(out_dir, "day_2020_12_01_stats.json")
+    out_csv = os.path.join(out_dir, "day_2021_12_01.csv")
+    out_stats = os.path.join(out_dir, "day_2021_12_01_stats.json")
 
     os.makedirs(out_dir, exist_ok=True)
 
