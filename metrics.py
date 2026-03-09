@@ -101,3 +101,171 @@ def bivariate_loss(V_pred,V_trgt):
     result = torch.mean(result)    
     
     return result
+
+
+# ============================================================================
+# Best-of-K Sampling Evaluation (Paper-Aligned)
+# ============================================================================
+
+def sample_bivariate_gaussian(V_pred, num_samples=20):
+    """
+    Sample trajectories from bivariate Gaussian distribution.
+    
+    Paper quote:
+    "During the inference stage, 20 samples are extracted from the learned 
+    bivariate Gaussian distribution and the closest sample to the ground-truth 
+    is used to calculate the performance index of the model."
+    
+    Args:
+        V_pred: Predicted Gaussian parameters [pred_len, N, 5]
+                where 5 = [μx, μy, log(σx), log(σy), ρ]
+        num_samples: Number of samples to draw (K=20 in paper)
+    
+    Returns:
+        samples: [num_samples, pred_len, N, 2] - sampled (x, y) trajectories
+    """
+    pred_len, N, _ = V_pred.shape
+    device = V_pred.device
+    
+    # Extract Gaussian parameters
+    mux = V_pred[:, :, 0]      # [pred_len, N]
+    muy = V_pred[:, :, 1]      # [pred_len, N]
+    sx = torch.exp(V_pred[:, :, 2])  # [pred_len, N]
+    sy = torch.exp(V_pred[:, :, 3])  # [pred_len, N]
+    corr = torch.tanh(V_pred[:, :, 4])  # [pred_len, N]
+    
+    # Sample from standard bivariate normal: (z1, z2) ~ N(0, I)
+    # Shape: [num_samples, pred_len, N, 2]
+    z = torch.randn(num_samples, pred_len, N, 2, device=device)
+    
+    # Transform to correlated bivariate normal using Cholesky decomposition
+    # X = μ + L @ Z where L is lower triangular from Cholesky decomposition
+    # For 2D: [[sx, 0], [ρ*sy, sy*sqrt(1-ρ²)]]
+    
+    samples = torch.zeros(num_samples, pred_len, N, 2, device=device)
+    
+    # Vectorized transformation
+    sqrt_term = torch.sqrt(torch.clamp(1 - corr**2, min=1e-6))
+    
+    # x = μx + σx * z1
+    samples[:, :, :, 0] = mux.unsqueeze(0) + sx.unsqueeze(0) * z[:, :, :, 0]
+    
+    # y = μy + ρ*σy*z1 + σy*sqrt(1-ρ²)*z2
+    samples[:, :, :, 1] = (
+        muy.unsqueeze(0) + 
+        corr.unsqueeze(0) * sy.unsqueeze(0) * z[:, :, :, 0] +
+        sy.unsqueeze(0) * sqrt_term.unsqueeze(0) * z[:, :, :, 1]
+    )
+    
+    return samples
+
+
+def evaluate_best_of_k(V_pred, V_target, num_samples=20):
+    """
+    Comprehensive best-of-K evaluation (paper-aligned).
+    
+    Paper approach:
+    1. Sample K trajectories from the predicted Gaussian distribution (once)
+    2. For each sample, compute ADE (average displacement over all timesteps)
+    3. Select the sample with minimum ADE (closest to ground truth)
+    4. Report metrics for this SAME best sample
+    
+    This ensures both metrics are computed on the same trajectory, which is
+    more consistent with the paper's description of selecting "the closest
+    sample to the ground-truth".
+    
+    Args:
+        V_pred: Predicted Gaussian parameters [pred_len, N, 5]
+        V_target: Ground truth positions [pred_len, N, 2] (absolute coordinates)
+        num_samples: Number of samples (K=20 in paper)
+    
+    Returns:
+        dict with:
+            'minADE': Minimum ADE across K samples (used for sample selection)
+            'FDE': FDE of the best sample (selected by minADE criterion)
+            'best_sample': The selected trajectory [pred_len, N, 2]
+            'all_ade_values': ADE values for all K samples (for analysis)
+    """
+    # Sample K trajectories from the Gaussian (ONCE)
+    samples = sample_bivariate_gaussian(V_pred, num_samples)  # [K, pred_len, N, 2]
+    
+    K, pred_len, N, _ = samples.shape
+    
+    # Expand target for broadcasting
+    target_expanded = V_target.unsqueeze(0)  # [1, pred_len, N, 2]
+    
+    # Compute displacement at each timestep for all samples: [K, pred_len, N]
+    displacements = torch.sqrt(
+        (samples[:, :, :, 0] - target_expanded[:, :, :, 0])**2 + 
+        (samples[:, :, :, 1] - target_expanded[:, :, :, 1])**2
+    )
+    
+    # Compute ADE for each sample: average over timesteps and vessels [K]
+    ade_per_sample = displacements.mean(dim=[1, 2])
+    
+    # Select best sample based on ADE (closest to ground truth)
+    min_ade_idx = torch.argmin(ade_per_sample)
+    best_sample = samples[min_ade_idx]  # [pred_len, N, 2]
+    
+    # Compute ADE for best sample
+    min_ade = ade_per_sample[min_ade_idx].item()
+    
+    # Compute FDE for the SAME best sample
+    # FDE = average displacement at final timestep only
+    final_displacement = displacements[min_ade_idx, -1, :]  # [N]
+    fde_best_sample = final_displacement.mean().item()
+    
+    return {
+        'minADE': min_ade,                                      # Min ADE (used for selection)
+        'FDE': fde_best_sample,                                 # FDE of best sample
+        'best_sample': best_sample.detach(),                    # Selected trajectory
+        'all_ade_values': ade_per_sample.detach().cpu().numpy()  # All ADE values
+    }
+
+
+def best_of_k_ade(V_pred, V_target, num_samples=20):
+    """
+    Compute minimum Average Displacement Error (minADE) with best-of-K sampling.
+    
+    DEPRECATED: Use evaluate_best_of_k() instead for paper-aligned evaluation.
+    This function is kept for backward compatibility.
+    
+    Paper approach:
+    1. Sample K trajectories from the predicted Gaussian distribution
+    2. For each sample, compute ADE with ground truth
+    3. Select the sample with minimum ADE (closest to ground truth)
+    4. Return this minimum ADE as the final metric
+    
+    Args:
+        V_pred: Predicted Gaussian parameters [pred_len, N, 5]
+        V_target: Ground truth positions [pred_len, N, 2]
+        num_samples: Number of samples (K=20 in paper)
+    
+    Returns:
+        minADE: Minimum average displacement error across all samples
+        best_sample: The sample trajectory with minimum error
+    """
+    results = evaluate_best_of_k(V_pred, V_target, num_samples)
+    return results['minADE'], results['best_sample']
+
+
+def best_of_k_fde(V_pred, V_target, num_samples=20):
+    """
+    Compute FDE of best sample selected by ADE criterion.
+    
+    DEPRECATED: Use evaluate_best_of_k() instead for paper-aligned evaluation.
+    This function is kept for backward compatibility.
+    
+    Note: This returns FDE of the sample with minimum ADE, not minimum FDE.
+    
+    Args:
+        V_pred: Predicted Gaussian parameters [pred_len, N, 5]
+        V_target: Ground truth positions [pred_len, N, 2]
+        num_samples: Number of samples (K=20 in paper)
+    
+    Returns:
+        FDE of best sample (selected by minADE)
+        best_sample: The sample trajectory with minimum ADE
+    """
+    results = evaluate_best_of_k(V_pred, V_target, num_samples)
+    return results['FDE'], results['best_sample']

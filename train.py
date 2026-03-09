@@ -174,6 +174,20 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
 
 
 def vald(epoch, model, checkpoint_dir, loader_val):
+    """
+    Validation loop using bivariate Gaussian loss.
+    
+    NOTE: This computes training loss (negative log-likelihood) for monitoring.
+    For paper-aligned evaluation metrics (minADE-20, minFDE-20), use evaluate.py
+    which implements best-of-K sampling as described in the paper:
+    
+    "During the inference stage, 20 samples are extracted from the learned 
+    bivariate Gaussian distribution and the closest sample to the ground-truth 
+    is used to calculate the performance index of the model."
+    
+    Usage after training:
+        python evaluate.py --checkpoint checkpoints/.../val_best.pth --dataset noaa_dec2021
+    """
     global metrics, constant_metrics
     model.eval()
     loss_batch = 0

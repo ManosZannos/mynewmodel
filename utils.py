@@ -324,6 +324,7 @@ def preprocess_noaa_to_frames(
     heading_range=(0.0, 360.0),
     min_vessels_per_timestamp: int = 3,
     do_zscore: bool = True,
+    zscore_stats: dict | None = None,
 ):
     """
     Complete AIS preprocessing pipeline (paper-aligned)
@@ -349,11 +350,16 @@ def preprocess_noaa_to_frames(
     
     4. Data standardization
        - Z-score normalization: x̃ = (x - μ) / σ
-       - Global statistics across entire dataset
+       - Global statistics across entire dataset (or provided via zscore_stats)
     
     5. Extract frame format
        - Output: frame_id, vessel_id, LON, LAT, SOG, Heading
        - Ready for TrajectoryDataset sliding window extraction
+    
+    Args:
+        zscore_stats: If provided, use these pre-computed statistics for normalization
+                      instead of computing from current data. Required for dataset-level
+                      normalization (compute from train, apply to train/val/test).
     
     Returns:
       - frames_df: DataFrame in frame format
@@ -382,7 +388,11 @@ def preprocess_noaa_to_frames(
     # Step 4: Data standardization (z-score normalization)
     stats = None
     if do_zscore:
-        df, stats = zscore_normalize_global(df, cols=("LON", "LAT", "SOG", "Heading"))
+        df, stats = zscore_normalize_global(
+            df, 
+            cols=("LON", "LAT", "SOG", "Heading"),
+            stats=zscore_stats  # Use provided stats (for dataset-level normalization)
+        )
 
     # Step 5: Convert to frame format
     frames = to_frame_format(df)
