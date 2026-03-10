@@ -75,9 +75,7 @@ def clean_abnormal_data_noaa(
       - Parse BaseDateTime as UTC timestamp
       - Filter by geographic ranges: LAT [30°, 35°], LON [-120°, -115°]
       - Filter by SOG range: [1.0, 22.0] knots
-      - Filter by Heading range: [0°, 360°] (511 = "not available", treated as missing)
-      - Remove moored/anchored vessels (Status codes 1=at anchor, 5=moored) with SOG < 1
-      - Remove all vessels with SOG < 1 ("not at sea")
+      - Filter by Heading range: [0°, 360°] (out-of-range values like 511="not available" are deleted)
     """
     missing = [c for c in NOAA_REQUIRED_COLS if c not in df.columns]
     if missing:
@@ -99,33 +97,22 @@ def clean_abnormal_data_noaa(
     df = df[_valid_mmsi_9digits(df["MMSI"])]
     print(f"  After MMSI validation (9-digit): {len(df):,} rows ({before - len(df):,} removed)")
 
-    # Heading 511 = "not available"
-    df.loc[df["Heading"] == 511, "Heading"] = np.nan
-
-    # Filter by geographic and dynamic ranges
+    # Filter by geographic and dynamic ranges (including Heading)
+    # Paper: "the heading range is set to [0–360], and the data that is out of range is deleted"
+    # Note: Heading=511 means "not available" and should be deleted as out-of-range
     before = len(df)
     df = df[
         df["LAT"].between(lat_range[0], lat_range[1]) &
         df["LON"].between(lon_range[0], lon_range[1]) &
-        df["SOG"].between(sog_range[0], sog_range[1])
+        df["SOG"].between(sog_range[0], sog_range[1]) &
+        df["Heading"].between(heading_range[0], heading_range[1])
     ]
-    print(f"  After range filtering (LAT/LON/SOG): {len(df):,} rows ({before - len(df):,} removed)")
-
-    # Filter heading (allow NaN from 511 values)
-    before = len(df)
-    df = df[(df["Heading"].isna()) | (df["Heading"].between(heading_range[0], heading_range[1]))]
-    print(f"  After Heading filtering: {len(df):,} rows ({before - len(df):,} removed)")
-
-    # Remove moored/anchored vessels with SOG < 1
-    before = len(df)
-    anchored_or_moored = df["Status"].isin([1, 5])  # 1=at anchor, 5=moored
-    df = df[~(anchored_or_moored & (df["SOG"] < 1.0))]
-    print(f"  After removing moored/anchored (SOG<1): {len(df):,} rows ({before - len(df):,} removed)")
-
-    # Remove all vessels not at sea (SOG < 1)
-    before = len(df)
-    df = df[df["SOG"] >= 1.0]
-    print(f"  After removing SOG < 1.0: {len(df):,} rows ({before - len(df):,} removed)")
+    print(f"  After range filtering (LAT/LON/SOG/Heading): {len(df):,} rows ({before - len(df):,} removed)")
+    
+    # Note: SOG < 1.0 already removed by range filter above, so no additional filtering needed.
+    # Paper mentions "removing vessels not at sea" and "moored/anchored with SOG < 1", but this
+    # is already enforced by SOG.between(1.0, 22.0).
+    
     print(f"  Final cleaned rows: {len(df):,} ({initial_count - len(df):,} total removed, {100*(1-len(df)/initial_count):.1f}% reduction)")
 
     return df
@@ -335,8 +322,7 @@ def preprocess_noaa_to_frames(
        - MMSI validation (9 digits)
        - Remove nulls
        - Filter by ranges: LAT [30°,35°], LON [-120°,-115°], SOG [1.0,22.0], Heading [0°,360°]
-       - Remove moored/anchored vessels (SOG < 1)
-       - Remove timestamps with < 3 concurrent vessels
+       - (SOG filter effectively removes moored/anchored vessels)
     
     2. Data interpolation
        - Resample to 1-minute intervals
