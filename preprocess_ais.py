@@ -77,7 +77,7 @@ def main():
     lon_range = (-120.0, -115.0)
     sog_range = (1.0, 22.0)
     heading_range = (0.0, 360.0)
-    min_vessels_per_timestamp = 3
+    min_vessels_per_timestamp = 3  # Paper's value
 
     # ----------------------------
     # Output

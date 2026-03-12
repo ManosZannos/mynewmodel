@@ -151,7 +151,19 @@ def resample_interpolate_1min(df: pd.DataFrame, freq: str = "1min", rolling_wind
         g = g.drop_duplicates(subset=["BaseDateTime"], keep="last").set_index("BaseDateTime")
 
         # Resample to 1-minute frequency
-        r = g.resample(freq).asfreq()
+        # IMPORTANT: Only resample within the vessel's actual time range,
+        # not the entire day. This prevents creating massive NaN gaps that
+        # can't be interpolated (paper-faithful: only fill gaps between actual data points)
+        if len(g) == 0:
+            continue
+        
+        time_start = g.index.min()
+        time_end = g.index.max()
+        
+        # Create 1-minute time range only for vessel's active period
+        time_range = pd.date_range(start=time_start, end=time_end, freq=freq)
+        r = g.reindex(time_range)
+        r.index.name = "BaseDateTime"  # Preserve index name for reset_index()
 
         # Linear interpolation for LON and LAT (position)
         r["LON"] = r["LON"].interpolate(method="time")
@@ -170,8 +182,11 @@ def resample_interpolate_1min(df: pd.DataFrame, freq: str = "1min", rolling_wind
         # Forward/backward fill Status
         r["Status"] = r["Status"].ffill().bfill()
 
-        # Remove any remaining missing values (edges after resample)
+        # Remove any remaining missing values (should be minimal now)
         r = r.dropna(subset=["LON", "LAT", "SOG", "Heading"])
+        
+        if len(r) == 0:
+            continue
 
         r["MMSI"] = mmsi
         out_parts.append(r.reset_index())
