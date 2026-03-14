@@ -78,6 +78,8 @@ def main():
     sog_range = (1.0, 22.0)
     heading_range = (0.0, 360.0)
     min_vessels_per_timestamp = 3  # Paper's value
+    max_gap_minutes = 10           # Gaps > 10 min split vessel trajectory into segments
+                                   # before resampling (prevents fake interpolation)
 
     # ----------------------------
     # Output
@@ -161,7 +163,7 @@ def main():
             
             # Steps 1-3: clean, resample, filter (no z-score yet)
             df = clean_abnormal_data_noaa(df_raw, lat_range, lon_range, sog_range, heading_range)
-            df = resample_interpolate_1min(df, freq="1min", rolling_window=5)
+            df = resample_interpolate_1min(df, freq="1min", rolling_window=5, max_gap_minutes=max_gap_minutes)
             df = filter_timestamps_min_vessels(df, min_vessels_per_timestamp)
             
             # Update streaming statistics (batch Welford's algorithm)
@@ -283,8 +285,9 @@ def main():
                 sog_range=sog_range,
                 heading_range=heading_range,
                 min_vessels_per_timestamp=min_vessels_per_timestamp,
+                max_gap_minutes=max_gap_minutes,
                 do_zscore=True,
-                zscore_stats=global_stats,  # Use global stats!
+                zscore_stats=global_stats,
             )
             print(f"  Normalized: {len(frames_df):,} frame rows")
             
