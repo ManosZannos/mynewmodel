@@ -479,8 +479,9 @@ class TrajectoryModel(nn.Module):
         )
 
         # graph convolution
+        # FIX: use full embedding_dims (64), not embedding_dims // num_heads (16).
         self.stsgcn = SparseGraphConvolution(
-            in_dims=4, embedding_dims=embedding_dims // num_heads, dropout=dropout
+            in_dims=4, embedding_dims=embedding_dims, dropout=dropout
         )
 
         self.fusion_ = nn.Conv2d(num_heads, num_heads, kernel_size=1, bias=False)
@@ -525,14 +526,15 @@ class TrajectoryModel(nn.Module):
         # gcn_representation = self.fusion_(gcn_temporal_spatial_features) + self.fusion_(gcn_spatial_temporal_features)
         # gcn_representation = gcn_temporal_spatial_features + gcn_spatial_temporal_features  #[N,4,obs,16]
 
-        gcn_representation = H
+        gcn_representation = H  # (N, seq_len, num_heads, embedding_dims)
 
-        # features = self.tcns[0](gcn_representation)   #[N,12,4,16]
+        features = self.encoder(gcn_representation)  # (N, pred_len, num_heads, embedding_dims)
 
-        features = self.encoder(gcn_representation)
-        b,l,_,_ = features.shape
-        features = features.contiguous().view(b,self.pred_len,-1)
-        prediction = self.output(features)
+        # Mean over num_heads dim → (N, pred_len, embedding_dims)
+        # This matches the output Linear layer which expects embedding_dims (64)
+        features = features.mean(dim=2)  # (N, pred_len, embedding_dims)
+
+        prediction = self.output(features)  # (N, pred_len, 5)
 
         # f = torch.sigmoid(self.tcnf(gcn_representation))
         # g = torch.tanh(self.tcng(gcn_representation))
