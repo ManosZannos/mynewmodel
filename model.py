@@ -497,7 +497,9 @@ class TrajectoryModel(nn.Module):
         #         nn.Conv2d(pred_len, pred_len, 3, padding=1),
         #         nn.PReLU()
         # ))
-        self.encoder = Encoder(fin=self.obs_len,fout=pred_len)
+        # TCN encoder: maps obs_len → pred_len channels over (num_heads, embedding_dims)
+        # Input shape: (N, obs_len, num_heads, embedding_dims) - Conv2d treats obs_len as channels
+        self.encoder = Encoder(fin=self.obs_len, fout=pred_len)
 
         # self.output = nn.Linear(embedding_dims // num_heads, out_dims)
         self.output = nn.Linear(embedding_dims , out_dims)
@@ -526,15 +528,17 @@ class TrajectoryModel(nn.Module):
         # gcn_representation = self.fusion_(gcn_temporal_spatial_features) + self.fusion_(gcn_spatial_temporal_features)
         # gcn_representation = gcn_temporal_spatial_features + gcn_spatial_temporal_features  #[N,4,obs,16]
 
-        gcn_representation = H  # (N, seq_len, num_heads, embedding_dims)
+        gcn_representation = H  # (N, obs_len, num_heads, embedding_dims)
 
-        features = self.encoder(gcn_representation)  # (N, pred_len, num_heads, embedding_dims)
+        # TCN: (N, obs_len, num_heads, emb) → (N, pred_len, num_heads, emb)
+        # Conv2d treats obs_len as channels, maps to pred_len
+        features = self.encoder(gcn_representation)
 
-        # Mean over num_heads dim → (N, pred_len, embedding_dims)
-        # This matches the output Linear layer which expects embedding_dims (64)
-        features = features.mean(dim=2)  # (N, pred_len, embedding_dims)
+        # Mean over num_heads → (N, pred_len, embedding_dims)
+        features = features.mean(dim=2)
 
-        prediction = self.output(features)  # (N, pred_len, 5)
+        # Output: (N, pred_len, 5)
+        prediction = self.output(features)
 
         # f = torch.sigmoid(self.tcnf(gcn_representation))
         # g = torch.tanh(self.tcng(gcn_representation))
