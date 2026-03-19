@@ -407,22 +407,37 @@ class SparseGraphConvolution(nn.Module):
         return H
 
 class TCN(nn.Module):
-    def __init__(self,fin,fout,layers=3,ksize=3):
+    """
+    Temporal Convolutional Network using causal Conv1d (paper Section 3.2.4).
+
+    Paper quote:
+    "The input is H_in in R^(N x T_obs x f). We treat the temporal dimension
+     as the feature channel and apply the convolution operation. The output
+     size of each convolution operation remains the same as the input size."
+
+    Input:  (N, seq_len, fin)
+    Output: (N, seq_len, fout)   <- seq_len preserved (T_obs = T_pred = 10)
+
+    Left padding of size (k-1) ensures causal order:
+    each output depends only on current and past inputs.
+    """
+    def __init__(self, fin, fout, layers=3, ksize=3):
         super(TCN, self).__init__()
-        self.fin = fin
-        self.fout = fout
-        self.layers = layers
         self.ksize = ksize
-
         self.convs = nn.ModuleList()
-        for i in range(self.layers):
-            self.convs.append(nn.Conv2d(self.fin,self.fout,kernel_size=self.ksize))
+        # First layer: fin -> fout
+        self.convs.append(nn.Conv1d(fin, fout, kernel_size=ksize))
+        # Remaining layers: fout -> fout
+        for _ in range(1, layers):
+            self.convs.append(nn.Conv1d(fout, fout, kernel_size=ksize))
 
-    def forward(self,x):
-        for _,conv_layer in enumerate(self.convs):
-            x = nn.functional.pad(x,(self.ksize-1,0,self.ksize-1,0))
-            x = conv_layer(x)
-        return x
+    def forward(self, x):
+        # x: (N, seq_len, features)
+        x = x.permute(0, 2, 1)          # -> (N, features, seq_len) for Conv1d
+        for conv in self.convs:
+            x = nn.functional.pad(x, (self.ksize - 1, 0))  # left pad only (causal)
+            x = conv(x)
+        return x.permute(0, 2, 1)       # -> (N, seq_len, features)
 
 
 
@@ -497,12 +512,14 @@ class TrajectoryModel(nn.Module):
         #         nn.Conv2d(pred_len, pred_len, 3, padding=1),
         #         nn.PReLU()
         # ))
-        # TCN encoder: maps obs_len → pred_len channels over (num_heads, embedding_dims)
-        # Input shape: (N, obs_len, num_heads, embedding_dims) - Conv2d treats obs_len as channels
-        self.encoder = Encoder(fin=self.obs_len, fout=pred_len)
+        # TCN encoder: Conv1d operates on feature dim (embedding_dims).
+        # seq_len is preserved (T_obs = T_pred = 10 in paper).
+        # Paper: "input H_in in R^(N x T_obs x f), output H_out in R^(N x T_pred x fc)"
+        self.encoder = Encoder(fin=embedding_dims, fout=embedding_dims)
 
-        # self.output = nn.Linear(embedding_dims // num_heads, out_dims)
-        self.output = nn.Linear(embedding_dims , out_dims)
+        # Output layer: embedding_dims (64) -> out_dims (5 Gaussian params)
+        # Input to output is (N, T_pred, embedding_dims) after mean over num_heads + TCN
+        self.output = nn.Linear(embedding_dims, out_dims)
         # self.tcnf = nn.Conv2d(obs_len, pred_len, 3, padding=1)
         # self.tcng = nn.Conv2d(obs_len, pred_len, 3, padding=1)
 
@@ -528,16 +545,15 @@ class TrajectoryModel(nn.Module):
         # gcn_representation = self.fusion_(gcn_temporal_spatial_features) + self.fusion_(gcn_spatial_temporal_features)
         # gcn_representation = gcn_temporal_spatial_features + gcn_spatial_temporal_features  #[N,4,obs,16]
 
-        gcn_representation = H  # (N, obs_len, num_heads, embedding_dims)
+        # Mean over num_heads: (N, T_obs, num_heads, emb) -> (N, T_obs, emb)
+        # Paper: "input H_in in R^(N x T_obs x f)"
+        gcn_representation = H.mean(dim=2)
 
-        # TCN: (N, obs_len, num_heads, emb) → (N, pred_len, num_heads, emb)
-        # Conv2d treats obs_len as channels, maps to pred_len
+        # TCN Conv1d (causal, left-pad): (N, T_obs, emb) -> (N, T_obs, emb)
+        # seq_len preserved since T_obs = T_pred = 10
         features = self.encoder(gcn_representation)
 
-        # Mean over num_heads → (N, pred_len, embedding_dims)
-        features = features.mean(dim=2)
-
-        # Output: (N, pred_len, 5)
+        # Output linear: (N, T_pred, emb) -> (N, T_pred, 5)
         prediction = self.output(features)
 
         # f = torch.sigmoid(self.tcnf(gcn_representation))
