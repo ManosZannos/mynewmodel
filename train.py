@@ -4,6 +4,7 @@ import time
 import argparse
 import pickle
 import random
+import glob
 
 # Parse GPU selection before importing torch
 parser = argparse.ArgumentParser()
@@ -236,6 +237,24 @@ def main(args):
     pred_seq_len = args.pred_len 
 
     data_set = './dataset/' + args.dataset + '/'
+
+    def _get_split_csv_files(split_name):
+        split_dir = os.path.join(data_set, split_name)
+        csv_files = sorted(glob.glob(os.path.join(split_dir, '*.csv')))
+        return split_dir, csv_files
+
+    train_dir, train_csv_files = _get_split_csv_files('train')
+    if not train_csv_files:
+        raise RuntimeError(
+            f"Dataset split 'train' has no CSV files in {train_dir}. "
+            f"Run preprocessing first (python preprocess_ais.py) or use a dataset with generated train/val CSV files."
+        )
+
+    val_dir, val_csv_files = _get_split_csv_files('val')
+    val_split = 'val'
+    if not val_csv_files:
+        print(f"WARNING: No CSV files found in {val_dir}. Falling back to train split for validation.")
+        val_split = 'train'
     
     dset_train = TrajectoryDataset(
         data_set + 'train/',
@@ -249,7 +268,7 @@ def main(args):
         shuffle=True,
         num_workers=0)      
     dset_val = TrajectoryDataset(
-        data_set + 'val/',
+        data_set + val_split + '/',
         obs_len=obs_seq_len,
         pred_len=pred_seq_len,
         skip=1)
