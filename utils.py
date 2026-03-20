@@ -8,20 +8,6 @@ Includes:
 2) TrajectoryDataset: trajectory-wise sliding window (paper-aligned).
    Each window is anchored to a single vessel's continuous trajectory segment.
    Interaction graph at each timestep includes ALL vessels present in those frames.
-
-KEY FIXES vs original version:
-  FIX 1 - resample_interpolate_1min():
-    OLD: reindex over full vessel span (first→last timestamp) → massive artificial
-         stretches across gaps of hours (e.g. 10:00, 10:03, 15:40 → 340 fake points).
-    NEW: split each vessel trajectory into segments at gaps > MAX_GAP_MINUTES before
-         resampling → only genuine 1-min gaps get interpolated, large gaps stay broken.
-
-  FIX 2 - TrajectoryDataset:
-    OLD: sliding window over day-level frames → a vessel survives only if present
-         in EVERY frame of the window (~99% vessel dropout).
-    NEW: sliding window per vessel trajectory segment → every vessel that has
-         seq_len consecutive 1-min points produces windows, and neighbours are
-         collected from the shared frame_id index at each timestep.
 """
 
 import os
@@ -398,7 +384,7 @@ def poly_fit(traj, traj_len, threshold):
 
 
 # ============================================================================
-# TRAJECTORY DATASET (PAPER-ALIGNED: trajectory-wise sliding window)
+# TRAJECTORY DATASET (PAPER-ALIGNED: day-level frame sliding window)
 # ============================================================================
 
 class TrajectoryDataset(Dataset):
@@ -406,17 +392,17 @@ class TrajectoryDataset(Dataset):
     Dataloader for AIS trajectory datasets in frame format:
       frame_id, vessel_id, LON, LAT, SOG, Heading
 
-    PAPER-ALIGNED APPROACH:
-      - For each vessel, extract all continuous trajectory segments
-        (consecutive 1-min timesteps; gaps > max_gap_minutes break a segment)
-      - Slide a window of seq_len steps over each segment (skip=1 by default)
-      - For each window (anchored to the focal vessel), collect ALL other vessels
-        present at those exact frame_ids to build the interaction graph
-      - This matches the paper: "trajectory data is defined as T={p0,...,pn}
-        for each vessel, then sliding window sampling"
+    PAPER-ALIGNED APPROACH (Section 3.2.1):
+      "All vessels in the sea area are constructed as the graph at each time step"
 
-    OLD (WRONG) approach: sliding window over all day-level frames → vessel
-    must appear in EVERY frame of the window, causing ~99% vessel dropout.
+    For each day CSV:
+      1. Build list of unique frame_ids (minutes of the day)
+      2. Slide a window of seq_len frames over the day
+      3. For each window, keep only vessels present in ALL seq_len frames
+      4. Require at least min_ped vessels per window
+
+    This is fast (vectorized numpy) and matches the paper's scene-level graph:
+    all co-present vessels form the spatial graph at each timestep.
     """
 
     def __init__(
@@ -427,8 +413,7 @@ class TrajectoryDataset(Dataset):
         skip=1,
         threshold=0.002,
         min_ped=1,
-        max_gap_minutes=1,   # gap > this breaks a trajectory into separate segments
-        min_neighbours=1,    # minimum number of OTHER vessels needed in a window
+        delim=",",
     ):
         super(TrajectoryDataset, self).__init__()
 
@@ -436,9 +421,6 @@ class TrajectoryDataset(Dataset):
         self.pred_len = pred_len
         self.seq_len = obs_len + pred_len
         self.skip = skip
-        self.data_dir = data_dir
-        self.max_gap_minutes = max_gap_minutes
-        self.min_neighbours = min_neighbours
         self.max_peds_in_frame = 0
 
         all_files = sorted([
@@ -449,14 +431,6 @@ class TrajectoryDataset(Dataset):
         if not all_files:
             raise ValueError(f"No CSV files found in {data_dir}")
 
-        # ------------------------------------------------------------------
-        # Collect all windows across all files
-        # Each window entry: (file_idx, focal_vessel_id, [frame_ids of window])
-        # ------------------------------------------------------------------
-        # We store all data per file in a dict for fast frame lookup.
-        # file_data[file_idx] = dict: frame_id -> array of rows (vessel_id, 4 feats)
-        # ------------------------------------------------------------------
-
         num_peds_in_seq = []
         seq_list = []
         seq_list_rel = []
@@ -464,117 +438,73 @@ class TrajectoryDataset(Dataset):
         non_linear_ped_list = []
 
         for path in all_files:
+            # Load CSV: frame_id, vessel_id, LON, LAT, SOG, Heading
             data = pd.read_csv(path)
-            data = data[["frame_id", "vessel_id", "LON", "LAT", "SOG", "Heading"]].copy()
+            data_np = data[["frame_id", "vessel_id", "LON", "LAT", "SOG", "Heading"]].values.astype(np.float32)
 
-            # Build frame→rows lookup for fast neighbour retrieval
-            # frame_lookup: frame_id (int) -> np.array shape (K, 6) [frame_id, vessel_id, 4 feats]
-            data_np = data.values.astype(np.float64)
-            all_frames = np.unique(data_np[:, 0]).astype(int)
-            frame_lookup = {
-                int(f): data_np[data_np[:, 0] == f]
-                for f in all_frames
-            }
+            frames = np.unique(data_np[:, 0]).tolist()
+            n_frames = len(frames)
 
-            # For each vessel, find its continuous segments and slide windows
-            vessel_ids = data["vessel_id"].unique()
-            print(f"  {os.path.basename(path)}: {len(vessel_ids)} vessels, "
-                  f"{len(all_frames)} frames")
+            # Build frame_id → index map and frame_data list
+            frame_to_idx = {frame: i for i, frame in enumerate(frames)}
+            frame_data = []
+            for frame in frames:
+                frame_data.append(data_np[data_np[:, 0] == frame])
 
-            for vid in vessel_ids:
-                vdata = data[data["vessel_id"] == vid].sort_values("frame_id")
-                fids = vdata["frame_id"].values.astype(int)
-                feats = vdata[["LON", "LAT", "SOG", "Heading"]].values  # (T_v, 4)
+            vessel_ids_in_file = np.unique(data_np[:, 1])
+            print(f"  {os.path.basename(path)}: {len(vessel_ids_in_file)} vessels, {n_frames} frames")
 
-                if len(fids) < self.seq_len:
-                    continue
+            num_sequences = max(0, (n_frames - self.seq_len) // self.skip + 1)
 
-                # Split into continuous segments (gap > max_gap_minutes breaks)
-                gaps = np.diff(fids)
-                break_points = np.where(gaps > self.max_gap_minutes)[0] + 1
-                seg_starts = np.concatenate([[0], break_points])
-                seg_ends = np.concatenate([break_points, [len(fids)]])
+            for idx in range(0, num_sequences * self.skip, self.skip):
+                if idx + self.seq_len > n_frames:
+                    break
 
-                for seg_s, seg_e in zip(seg_starts, seg_ends):
-                    seg_fids = fids[seg_s:seg_e]
-                    seg_feats = feats[seg_s:seg_e]  # (seg_len, 4)
-                    seg_len = len(seg_fids)
+                # All rows in this window
+                curr_seq_data = np.concatenate(frame_data[idx: idx + self.seq_len], axis=0)
 
-                    if seg_len < self.seq_len:
+                # Vessels that appear in this window
+                peds_in_curr_seq = np.unique(curr_seq_data[:, 1])
+                self.max_peds_in_frame = max(self.max_peds_in_frame, len(peds_in_curr_seq))
+
+                curr_seq     = np.zeros((len(peds_in_curr_seq), 4, self.seq_len), dtype=np.float32)
+                curr_seq_rel = np.zeros((len(peds_in_curr_seq), 4, self.seq_len), dtype=np.float32)
+                curr_loss_mask = np.zeros((len(peds_in_curr_seq), self.seq_len), dtype=np.float32)
+
+                num_peds_considered = 0
+                _non_linear_ped = []
+
+                for ped_id in peds_in_curr_seq:
+                    curr_ped_seq = curr_seq_data[curr_seq_data[:, 1] == ped_id]
+                    curr_ped_seq = np.around(curr_ped_seq, decimals=4)
+
+                    pad_front = frame_to_idx[curr_ped_seq[0, 0]] - idx
+                    pad_end   = frame_to_idx[curr_ped_seq[-1, 0]] - idx + 1
+
+                    # Vessel must be present in ALL frames of the window
+                    if pad_end - pad_front != self.seq_len:
+                        continue
+                    if curr_ped_seq.shape[0] != self.seq_len:
                         continue
 
-                    # Slide window over this segment
-                    n_windows = (seg_len - self.seq_len) // self.skip + 1
-                    for w in range(0, n_windows * self.skip, self.skip):
-                        if w + self.seq_len > seg_len:
-                            break
+                    feat_seq = np.transpose(curr_ped_seq[:, 2:]).astype(np.float32)  # (4, seq_len)
+                    rel_feat_seq = np.zeros_like(feat_seq)
+                    rel_feat_seq[:, 1:] = feat_seq[:, 1:] - feat_seq[:, :-1]
 
-                        win_fids = seg_fids[w: w + self.seq_len]      # (seq_len,)
-                        win_feats = seg_feats[w: w + self.seq_len]     # (seq_len, 4)
+                    _idx = num_peds_considered
+                    curr_seq[_idx, :, pad_front:pad_end]     = feat_seq
+                    curr_seq_rel[_idx, :, pad_front:pad_end] = rel_feat_seq
+                    curr_loss_mask[_idx, pad_front:pad_end]  = 1.0
 
-                        # --------------------------------------------------
-                        # Collect ALL vessels present at these frame_ids
-                        # This is the interaction scene for this window
-                        # --------------------------------------------------
-                        # vessel_feats: dict vessel_id -> array (seq_len, 4) or None
-                        scene_vessels = {}  # vid2 -> (seq_len, 4) feat array
+                    _non_linear_ped.append(poly_fit(feat_seq, pred_len, threshold))
+                    num_peds_considered += 1
 
-                        # Focal vessel always included
-                        scene_vessels[vid] = win_feats
-
-                        for t, fid in enumerate(win_fids):
-                            if fid not in frame_lookup:
-                                continue
-                            rows = frame_lookup[fid]  # (K, 6): frame_id, vessel_id, 4 feats
-                            for row in rows:
-                                vid2 = int(row[1])
-                                if vid2 == vid:
-                                    continue
-                                if vid2 not in scene_vessels:
-                                    scene_vessels[vid2] = np.full((self.seq_len, 4), np.nan)
-                                scene_vessels[vid2][t] = row[2:6]
-
-                        # Keep only vessels present in ALL timesteps
-                        # (partial vessels cause NaN; drop them for graph consistency)
-                        valid_vessels = []
-                        for vid2, feat_arr in scene_vessels.items():
-                            if not np.any(np.isnan(feat_arr)):
-                                valid_vessels.append((vid2, feat_arr))
-
-                        # Need at least focal vessel + min_neighbours others
-                        n_valid = len(valid_vessels)
-                        if n_valid < 1 + self.min_neighbours:
-                            continue
-
-                        self.max_peds_in_frame = max(self.max_peds_in_frame, n_valid)
-
-                        # --------------------------------------------------
-                        # Build curr_seq: (N, 4, seq_len)
-                        # Put focal vessel first, then neighbours
-                        # --------------------------------------------------
-                        # Sort: focal first, then by vessel_id for reproducibility
-                        valid_vessels.sort(key=lambda x: (0 if x[0] == vid else 1, x[0]))
-
-                        N = len(valid_vessels)
-                        curr_seq = np.zeros((N, 4, self.seq_len), dtype=np.float32)
-                        curr_seq_rel = np.zeros((N, 4, self.seq_len), dtype=np.float32)
-                        curr_loss_mask = np.ones((N, self.seq_len), dtype=np.float32)
-
-                        _non_linear = []
-                        for i, (vid2, feat_arr) in enumerate(valid_vessels):
-                            feat_T = feat_arr.T.astype(np.float32)  # (4, seq_len)
-                            rel = np.zeros_like(feat_T)
-                            rel[:, 1:] = feat_T[:, 1:] - feat_T[:, :-1]
-
-                            curr_seq[i] = feat_T
-                            curr_seq_rel[i] = rel
-                            _non_linear.append(poly_fit(feat_T, pred_len, threshold))
-
-                        num_peds_in_seq.append(N)
-                        seq_list.append(curr_seq)
-                        seq_list_rel.append(curr_seq_rel)
-                        loss_mask_list.append(curr_loss_mask)
-                        non_linear_ped_list.extend(_non_linear)
+                if num_peds_considered > min_ped:
+                    non_linear_ped_list += _non_linear_ped
+                    num_peds_in_seq.append(num_peds_considered)
+                    loss_mask_list.append(curr_loss_mask[:num_peds_considered])
+                    seq_list.append(curr_seq[:num_peds_considered])
+                    seq_list_rel.append(curr_seq_rel[:num_peds_considered])
 
         if not seq_list:
             raise ValueError(
@@ -583,25 +513,24 @@ class TrajectoryDataset(Dataset):
             )
 
         print(f"\nTotal sequences: {len(seq_list)}")
-
         self.num_seq = len(seq_list)
 
-        seq_arr = np.concatenate(seq_list, axis=0)          # (total_N, 4, seq_len)
-        seq_rel_arr = np.concatenate(seq_list_rel, axis=0)
-        loss_mask_arr = np.concatenate(loss_mask_list, axis=0)
-        non_linear_arr = np.asarray(non_linear_ped_list, dtype=np.float32)
+        seq_arr         = np.concatenate(seq_list, axis=0)
+        seq_rel_arr     = np.concatenate(seq_list_rel, axis=0)
+        loss_mask_arr   = np.concatenate(loss_mask_list, axis=0)
+        non_linear_arr  = np.asarray(non_linear_ped_list, dtype=np.float32)
 
-        self.obs_traj = torch.from_numpy(seq_arr[:, :, :self.obs_len]).float()
-        self.pred_traj = torch.from_numpy(seq_arr[:, :, self.obs_len:]).float()
+        self.obs_traj     = torch.from_numpy(seq_arr[:, :, :self.obs_len]).float()
+        self.pred_traj    = torch.from_numpy(seq_arr[:, :, self.obs_len:]).float()
         self.obs_traj_rel = torch.from_numpy(seq_rel_arr[:, :, :self.obs_len]).float()
-        self.pred_traj_rel = torch.from_numpy(seq_rel_arr[:, :, self.obs_len:]).float()
-        self.loss_mask = torch.from_numpy(loss_mask_arr).float()
+        self.pred_traj_rel= torch.from_numpy(seq_rel_arr[:, :, self.obs_len:]).float()
+        self.loss_mask    = torch.from_numpy(loss_mask_arr).float()
         self.non_linear_ped = torch.from_numpy(non_linear_arr).float()
 
         cum_start_idx = [0] + np.cumsum(num_peds_in_seq).tolist()
         self.seq_start_end = [(s, e) for s, e in zip(cum_start_idx, cum_start_idx[1:])]
 
-        self.v_obs = []
+        self.v_obs  = []
         self.v_pred = []
         print("Processing graph tensors...")
 
@@ -609,13 +538,10 @@ class TrajectoryDataset(Dataset):
         for ss in range(len(self.seq_start_end)):
             pbar.update(1)
             start, end = self.seq_start_end[ss]
-
             v_ = seq_to_graph(self.obs_traj[start:end, :], self.obs_traj_rel[start:end, :], False)
             self.v_obs.append(v_.clone())
-
             v_ = seq_to_graph(self.pred_traj[start:end, :], self.pred_traj_rel[start:end, :], False)
             self.v_pred.append(v_.clone())
-
         pbar.close()
 
     def __len__(self):
