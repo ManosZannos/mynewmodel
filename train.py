@@ -78,100 +78,43 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
     global metrics, constant_metrics
     model.train()
     loss_batch = 0
-    num_updates = 0
-    loader_len = len(loader_train)
-    
-    # Accumulation state - clean counters
-    accum_loss_sum = 0.0
-    accum_samples = 0
+    batch_count = 0
 
     for cnt, batch in enumerate(loader_train):
-        # Get data
         batch = [tensor.to(device) for tensor in batch]
         obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, \
         loss_mask, V_obs, V_tr = batch
 
-        # print("obs_len---",obs_traj.shape)[1, 87, 4, 10])
+        T = V_obs.shape[1]
+        N = V_obs.shape[2]
 
-        # obs_traj observed absolute coordinate [1 N 2 obs_len] 
-        # pred_traj_gt ground truth absolute coordinate [1 N 2 pred_len]
-        # obs_traj_rel velocity of observed trajectory [1 N 2 obs_len]
-        # pred_traj_gt_rel velocity of ground-truth [1 N 2 pred_len]
-        # non_linear_ped 0/1 tensor indicated whether the trajectory of pedestrians n is linear [1 N]
-        # loss_mask 0/1 tensor indicated whether the trajectory point at time t is loss [1 N obs_len+pred_len]
-        # V_obs input graph of observed trajectory represented by velocity  [1 obs_len N 3]  ， batch_size ,128
-        # V_tr target graph of ground-truth represented by velocity  [1 pred_len N 2]
-        # V_tr = V_tr[:,0:2]
-        # print("V-TR---",V_tr.shape)
-
-        # PAPER NOTE (Section 3.2.1):
-        # According to the paper, adjacency matrices should be initialized as:
-        #   - Spatial graph: all elements = 1 (not identity matrix)
-        #   - Temporal graph: upper triangular matrix with 1s (not identity matrix)
-        # Current implementation uses identity matrices (diagonal=1, rest=0)
-        # This may need to be changed to match paper exactly:
-        #
-        # Correct initialization per paper would be:
-    
-        #
-        # However, these are then filtered by the sparse adjacency generation module,
-        # so the current identity matrix approach may be acceptable as a "self-connection" mask.
-        
-        T = V_obs.shape[1]   # obs_len
-        N = V_obs.shape[2]   # num vessels in this sample
-
-        # Paper-faithful initialization (Section 3.2.1):
-        # Spatial: all ones (no prior knowledge of vessel interactions)
         identity_spatial = torch.ones((T, N, N), device=device)
-
-        # Temporal: upper triangular matrix with 1s (current state independent of future)
         identity_temporal = torch.triu(torch.ones((N, T, T), device=device), diagonal=0)
-
         identity = [identity_spatial, identity_temporal]
 
-        # Zero gradients at the start of each accumulation cycle
-        if accum_samples == 0:
-            optimizer.zero_grad(set_to_none=True)
-
-#V_obs:[128,8,57,3]   identity_spatial：[8,57,57]--- identity_temporal：[57,8,8]
+        optimizer.zero_grad()
         V_pred = model(V_obs, identity)
-        V_pred = V_pred.squeeze(0)  # Remove batch dimension only
-        V_tr = V_tr.squeeze(0)      # Remove batch dimension only    
+        V_pred = V_pred.squeeze(0)
+        V_tr = V_tr.squeeze(0)
 
         l = graph_loss(V_pred, V_tr)
-        
-        # Accumulate unscaled loss for metrics (per-sample)
-        accum_loss_sum += l.item()
-        accum_samples += 1
-        
-        # Scale for gradient accumulation
-        l = l / args.batch_size
         l.backward()
+        optimizer.step()
 
-        # Update weights at the end of each accumulation cycle
-        is_last = (cnt == loader_len - 1)
-        if accum_samples >= args.batch_size or is_last:
-            if args.clip_grad is not None:  
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+        loss_batch += l.item()
+        batch_count += 1
+        
+        if cnt % 500 == 0:
+            print('TRAIN:', '\t Epoch:', epoch, '\t Loss:', loss_batch / batch_count)
 
-            optimizer.step()
-            
-            # Metrics - average per-sample loss for this update
-            num_updates += 1
-            avg_loss_this_update = accum_loss_sum / accum_samples
-            loss_batch += avg_loss_this_update
-            print('TRAIN:', '\t Epoch:', epoch, '\t Loss:', loss_batch / num_updates)
-            
-            # Reset accumulation counters
-            accum_loss_sum = 0.0
-            accum_samples = 0
-            
-    metrics['train_loss'].append(loss_batch / max(1, num_updates))
+    avg_loss = loss_batch / max(1, batch_count)
+    metrics['train_loss'].append(avg_loss)
+    print('TRAIN:', '\t Epoch:', epoch, '\t Loss:', avg_loss)
 
-    if metrics['train_loss'][-1] < constant_metrics['min_train_loss']:   
-        constant_metrics['min_train_loss'] = metrics['train_loss'][-1]    
+    if metrics['train_loss'][-1] < constant_metrics['min_train_loss']:
+        constant_metrics['min_train_loss'] = metrics['train_loss'][-1]
         constant_metrics['min_train_epoch'] = epoch
-        torch.save(model.state_dict(), checkpoint_dir + 'train_best.pth')  # OK
+        torch.save(model.state_dict(), checkpoint_dir + 'train_best.pth')
 
 
 def vald(epoch, model, checkpoint_dir, loader_val):
