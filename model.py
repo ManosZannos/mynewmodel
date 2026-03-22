@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
 
+
 class AsymmetricConvolution(nn.Module):
 
     def __init__(self, in_cha, out_cha):
@@ -12,7 +13,6 @@ class AsymmetricConvolution(nn.Module):
         self.conv2 = nn.Conv2d(in_cha, out_cha, kernel_size=(1, 3), padding=(0, 1))
 
         self.shortcut = lambda x: x
-
         if in_cha != out_cha:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_cha, out_cha, 1, bias=False)
@@ -21,19 +21,24 @@ class AsymmetricConvolution(nn.Module):
         self.activation = nn.PReLU()
 
     def forward(self, x):
-
         shortcut = self.shortcut(x)
-
         x1 = self.conv1(x)
         x2 = self.conv2(x)
         x2 = self.activation(x2 + x1)
-
         return x2 + shortcut
 
 
 class InteractionMask(nn.Module):
+    """
+    Generates sparse interaction masks via asymmetric convolutions.
+    Paper Section 3.2.2: threshold ξ=0.5, values < threshold set to 0.
+    
+    NOTE: Original repo uses soft masking (keeps sigmoid values above threshold).
+    This differs from paper Eq. 11-12 which describes binary masks.
+    We follow the original repo implementation here.
+    """
 
-    def __init__(self, number_asymmetric_conv_layer=2, num_heads=4):
+    def __init__(self, number_asymmetric_conv_layer=2, spatial_channels=4, temporal_channels=4):
         super(InteractionMask, self).__init__()
 
         self.number_asymmetric_conv_layer = number_asymmetric_conv_layer
@@ -43,10 +48,10 @@ class InteractionMask(nn.Module):
 
         for i in range(self.number_asymmetric_conv_layer):
             self.spatial_asymmetric_convolutions.append(
-                AsymmetricConvolution(num_heads, num_heads)
+                AsymmetricConvolution(spatial_channels, spatial_channels)
             )
             self.temporal_asymmetric_convolutions.append(
-                AsymmetricConvolution(num_heads, num_heads)
+                AsymmetricConvolution(temporal_channels, temporal_channels)
             )
 
         self.spatial_output = nn.Sigmoid()
@@ -54,8 +59,8 @@ class InteractionMask(nn.Module):
 
     def forward(self, dense_spatial_interaction, dense_temporal_interaction, threshold=0.5):
 
-        assert len(dense_temporal_interaction.shape) == 4       # (N, num_heads, T, T)
-        assert len(dense_spatial_interaction.shape) == 4        # (T, num_heads, N, N)
+        assert len(dense_temporal_interaction.shape) == 4   # (T, num_heads, N, N)
+        assert len(dense_spatial_interaction.shape) == 4    # (N, num_heads, T, T)
 
         for j in range(self.number_asymmetric_conv_layer):
             dense_spatial_interaction = self.spatial_asymmetric_convolutions[j](dense_spatial_interaction)
@@ -64,14 +69,31 @@ class InteractionMask(nn.Module):
         spatial_interaction_mask = self.spatial_output(dense_spatial_interaction)
         temporal_interaction_mask = self.temporal_output(dense_temporal_interaction)
 
-        # Paper-faithful: binary masks (0/1) after thresholding
-        spatial_interaction_mask = (spatial_interaction_mask >= threshold).float()
-        temporal_interaction_mask = (temporal_interaction_mask >= threshold).float()
+        # Soft masking: keep values above threshold, zero out below
+        # (Original repo approach — retains gradient flow unlike hard binary mask)
+        spatial_zero = torch.zeros_like(spatial_interaction_mask)
+        temporal_zero = torch.zeros_like(temporal_interaction_mask)
+
+        spatial_interaction_mask = torch.where(
+            spatial_interaction_mask > threshold,
+            spatial_interaction_mask,
+            spatial_zero
+        )
+        temporal_interaction_mask = torch.where(
+            temporal_interaction_mask > threshold,
+            temporal_interaction_mask,
+            temporal_zero
+        )
 
         return spatial_interaction_mask, temporal_interaction_mask
 
 
 class ZeroSoftmax(nn.Module):
+    """
+    Zero-preserving softmax (Paper Eq. 14).
+    Ensures zero entries in sparse adjacency matrix remain zero
+    after normalization (unlike standard softmax which outputs non-zero for zero inputs).
+    """
 
     def __init__(self):
         super(ZeroSoftmax, self).__init__()
@@ -84,89 +106,61 @@ class ZeroSoftmax(nn.Module):
 
 
 class SelfAttention(nn.Module):
+    """
+    Multi-head self-attention for computing dense interaction scores.
+    Paper Section 3.2.2: Eq. 2-5 (spatial), Eq. 6-8 (temporal).
+    """
 
-    def __init__(self, in_dims=4, d_model=64, num_heads=4):    
+    def __init__(self, in_dims=4, d_model=64, num_heads=4):
         super(SelfAttention, self).__init__()
 
         self.embedding = nn.Linear(in_dims, d_model)
         self.query = nn.Linear(d_model, d_model)
         self.key = nn.Linear(d_model, d_model)
 
-        # Register as buffer so it moves with model.to(device)
-        self.register_buffer("scaled_factor", torch.sqrt(torch.tensor(float(d_model))))
+        # Device-agnostic: use register_buffer so it moves with model.to(device)
+        self.register_buffer('scaled_factor', torch.sqrt(torch.tensor(float(d_model))))
         self.softmax = nn.Softmax(dim=-1)
 
         self.num_heads = num_heads
         self.d_model = d_model
 
-    def positional_encoding(self, seq_len, d_model, device):
-        """
-        Generate positional encoding as described in the paper (Section 3.2.2, Eq. 6)
-        This is added to temporal graph embeddings
-        """
-        position = torch.arange(seq_len, dtype=torch.float, device=device).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float, device=device) * 
-                             -(np.log(10000.0) / d_model))
-        
-        pe = torch.zeros(seq_len, d_model, device=device)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        
-        return pe
-
     def split_heads(self, x):
+        # x: [batch_size, seq_len, d_model]
+        # → [batch_size, num_heads, seq_len, depth] where depth = d_model // num_heads
+        x = x.reshape(x.shape[0], -1, self.num_heads, x.shape[-1] // self.num_heads).contiguous()
+        return x.permute(0, 2, 1, 3)
 
-      
-        x = x.reshape(x.shape[0], -1, self.num_heads, x.shape[-1] // self.num_heads).contiguous()   #contiguous：batch_size, seq_len, h, embeeding/h----------seq_len
-        return x.permute(0, 2, 1, 3)  # [batch_size nun_heads seq_len depth]   #permute, embeeding/nun_heads
-
-    def forward(self, x, mask=False, multi_head=False, add_positional_encoding=False):
-        """
-        Forward pass with optional positional encoding for temporal graphs
-        
-        Args:
-            x: input tensor [batch_size, seq_len, feature_dim]
-            mask: whether to apply causal mask
-            multi_head: whether to use multi-head attention
-            add_positional_encoding: whether to add positional encoding (for temporal graphs, Eq. 6)
-        """
-        # batch_size seq_len 2      spatial_graph[8,57,2]
-
+    def forward(self, x, mask=False, multi_head=False):
+        # x: [batch_size, seq_len, in_dims]
         assert len(x.shape) == 3
 
-        embeddings = self.embedding(x)  # batch_size seq_len d_model
-        
-        # Add positional encoding for temporal graph (Eq. 6 in paper)
-        if add_positional_encoding:
-            seq_len = x.shape[1]
-            pos_enc = self.positional_encoding(seq_len, self.d_model, device=x.device)
-            embeddings = embeddings + pos_enc.unsqueeze(0)  # broadcast across batch
-        
-        query = self.query(embeddings)  # batch_size seq_len d_model
-        key = self.key(embeddings)      # batch_size seq_len d_model
+        embeddings = self.embedding(x)   # [batch_size, seq_len, d_model]
+        query = self.query(embeddings)   # [batch_size, seq_len, d_model]
+        key = self.key(embeddings)       # [batch_size, seq_len, d_model]
 
         if multi_head:
-            query = self.split_heads(query)  # B num_heads seq_len d_model    [batch_size nun_heads seq_len depth] , depth=embeeding/num_head
-            key = self.split_heads(key)  # B num_heads seq_len d_model
-            scores = torch.matmul(query, key.permute(0, 1, 3, 2))  # (batch_size, num_heads, seq_len, seq_len)  ---[batch_size, num_heads,]
-        else:                                                         #---[batch_size, num_heads,depth,seq_len] ---k
-            scores = torch.matmul(query, key.permute(0, 2, 1))  # (batch_size, seq_len, seq_len)   ：[batch_size seq_len, seq_len]
-                                                                     #[batch_size seq_len, embedding][batch_size， seq_len embedding]
-        
-        # Scale scores
-        scores = scores / self.scaled_factor
-        
-        # Apply causal mask BEFORE softmax (paper-faithful: current independent of future)
+            query = self.split_heads(query)  # [batch_size, num_heads, seq_len, depth]
+            key = self.split_heads(key)      # [batch_size, num_heads, seq_len, depth]
+            attention = torch.matmul(query, key.permute(0, 1, 3, 2))  # [batch_size, num_heads, seq_len, seq_len]
+        else:
+            attention = torch.matmul(query, key.permute(0, 2, 1))     # [batch_size, seq_len, seq_len]
+
+        attention = self.softmax(attention / self.scaled_factor)
+
+        # Causal mask for temporal graph (paper: current state independent of future)
         if mask is True:
-            causal_mask = torch.tril(torch.ones_like(scores, dtype=torch.bool))
-            scores = scores.masked_fill(~causal_mask, float("-inf"))
-        
-        attention = self.softmax(scores)     # [batch_size，num_heads, seq_len, seq_len],：[batch_size,seq_len,seq_len]
+            mask_mat = torch.ones_like(attention)
+            attention = attention * torch.tril(mask_mat)
 
         return attention, embeddings
 
 
 class SpatialTemporalFusion(nn.Module):
+    """
+    Fuses spatial attention scores across time dimension.
+    Paper Section 3.2.2: stacks A_s along temporal dim, applies Conv to get A_st.
+    """
 
     def __init__(self, obs_len=10):
         super(SpatialTemporalFusion, self).__init__()
@@ -175,37 +169,38 @@ class SpatialTemporalFusion(nn.Module):
             nn.Conv2d(obs_len, obs_len, 1),
             nn.PReLU()
         )
-
         self.shortcut = nn.Sequential()
 
     def forward(self, x):
-
         x = self.conv(x) + self.shortcut(x)
         return x.squeeze()
 
 
-class SparseWeightedAdjacency(nn.Module):   #得到邻接矩阵
+class SparseWeightedAdjacency(nn.Module):
+    """
+    Generates normalized sparse spatial and temporal adjacency matrices.
+    Paper Section 3.2.2: Eq. 2-15.
+    
+    Input graph shape: (T, N, 4) with features [pos_enc, LON_rel, LAT_rel, SOG_rel, Heading_rel]
+    - spatial_graph uses graph[:, :, 1:] → (T, N, 3) velocity features
+    - temporal_graph uses full graph → (N, T, 4)
+    """
 
-    def __init__(self, spa_in_dims=4, tem_in_dims=4, embedding_dims=64, obs_len=10, dropout=0,
-                 number_asymmetric_conv_layer=2, num_heads=4):
+    def __init__(self, spa_in_dims=3, tem_in_dims=4, embedding_dims=64, obs_len=10,
+                 dropout=0, number_asymmetric_conv_layer=2, num_heads=4):
         super(SparseWeightedAdjacency, self).__init__()
-        # dense interaction
-        # Paper-faithful: Both use 4D state vector (LON, LAT, SOG, Heading)
-        # Positional encoding is added via sinusoidal PE in temporal attention (Eq. 6)
+
+        # Paper uses 3D for spatial (LON_rel, LAT_rel, SOG_rel after slicing pos_enc)
+        # and 4D for temporal (full feature including pos_enc)
         self.spatial_attention = SelfAttention(spa_in_dims, embedding_dims, num_heads=num_heads)
         self.temporal_attention = SelfAttention(tem_in_dims, embedding_dims, num_heads=num_heads)
 
-        # [batch_size，num_heads, seq_len, seq_len],
-        # [batch_size,seq_len,seq_len]
-        # batch_size seq_len d_model
+        self.spa_fusion = SpatialTemporalFusion(obs_len=obs_len)
 
-        # attention fusion
-        self.spa_fusion = SpatialTemporalFusion(obs_len=obs_len) 
-
-        # interaction mask
         self.interaction_mask = InteractionMask(
             number_asymmetric_conv_layer=number_asymmetric_conv_layer,
-            num_heads=num_heads
+            spatial_channels=num_heads,
+            temporal_channels=num_heads
         )
 
         self.dropout = dropout
@@ -214,54 +209,57 @@ class SparseWeightedAdjacency(nn.Module):   #得到邻接矩阵
     def forward(self, graph, identity):
         """
         Args:
-            graph: Input shape (T, N, 4) with 4D state vector [LON, LAT, SOG, Heading]
-                   Paper-faithful: no pos_enc feature, sinusoidal PE added in attention
-            identity: [spatial_identity, temporal_identity] matrices
+            graph: (T, N, 4) — [pos_enc, LON_rel, LAT_rel, SOG_rel] after seq_to_graph
+            identity: [spatial_identity (T,N,N), temporal_identity (N,T,T)]
         """
         assert len(graph.shape) == 3
-        
-        # graph shape: (T, N, 4) where T=obs_len, N=num_vessels
-        # Features: [LON, LAT, SOG, Heading] (paper's 4D state vector)
-        
-        # Spatial graph: Use all 4D features
-        spatial_graph = graph  # (T, N, 4) - 4D state vector as per paper
-        
-        # Temporal graph: Use all 4D features, permute to (N, T, 4)
+
+        # Spatial graph: skip pos_enc, use velocity features (T, N, 3)
+        spatial_graph = graph[:, :, 1:]       # (T, N, 3)
+
+        # Temporal graph: full features (N, T, 4)
         temporal_graph = graph.permute(1, 0, 2)  # (N, T, 4)
-        # (T num_heads N N)   (T N d_model)  -------（[batch_size，num_heads, seq_len, seq_len]）（ # ：batch_size seq_len d_model）,---T是batch_size
-        dense_spatial_interaction, spatial_embeddings = self.spatial_attention(spatial_graph, multi_head=True) #-----[batch_size，num_heads, seq_len, seq_len]
 
-        # (N num_heads T T)   (N T d_model)
-        # Add positional encoding for temporal graph as per Eq. 6 in paper
-        # Apply causal mask to ensure current state is independent of future state (paper requirement)
-        dense_temporal_interaction, temporal_embeddings = self.temporal_attention(temporal_graph, multi_head=True, add_positional_encoding=True, mask=True)
+        # Dense attention scores
+        # spatial: (T, num_heads, N, N)
+        dense_spatial_interaction, spatial_embeddings = self.spatial_attention(
+            spatial_graph, multi_head=True
+        )
+        # temporal: (N, num_heads, T, T)
+        dense_temporal_interaction, temporal_embeddings = self.temporal_attention(
+            temporal_graph, multi_head=True
+        )
 
-        # attention fusion   dense_spatial_interaction.permute(1, 0, 2, 3))=（num_heads,T,N,N）
-        st_interaction = self.spa_fusion(dense_spatial_interaction.permute(1, 0, 2, 3)).permute(1, 0, 2, 3)     #(T num_heads N N) ）
+        # Fuse spatial attention across time: (T, num_heads, N, N)
+        st_interaction = self.spa_fusion(
+            dense_spatial_interaction.permute(1, 0, 2, 3)
+        ).permute(1, 0, 2, 3)
+
         ts_interaction = dense_temporal_interaction
 
-        spatial_mask, temporal_mask = self.interaction_mask(st_interaction, ts_interaction)  #st_interaction
-          #经过interaction_mask，spatial_mask:(T num_heads N N)  ;temporal_mask:(N num_heads T T)
-        # self-connected
-        spatial_mask = spatial_mask + identity[0].unsqueeze(1)     #[8,N,N] ，identity
-        temporal_mask = temporal_mask + identity[1].unsqueeze(1)  # [N,8,8]
+        # Generate sparse masks
+        spatial_mask, temporal_mask = self.interaction_mask(st_interaction, ts_interaction)
 
-        normalized_spatial_adjacency_matrix = self.zero_softmax(dense_spatial_interaction * spatial_mask, dim=-1)   #dense_spatial_interaction
-        normalized_temporal_adjacency_matrix = self.zero_softmax(dense_temporal_interaction * temporal_mask, dim=-1)
+        # Self-connection: add identity matrices
+        spatial_mask = spatial_mask + identity[0].unsqueeze(1)   # (T, num_heads, N, N)
+        temporal_mask = temporal_mask + identity[1].unsqueeze(1)  # (N, num_heads, T, T)
 
-        return normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix,\
-               spatial_embeddings, temporal_embeddings
+        # Normalized sparse adjacency matrices (Zero-Softmax, Eq. 15)
+        normalized_spatial_adjacency_matrix = self.zero_softmax(
+            dense_spatial_interaction * spatial_mask, dim=-1
+        )
+        normalized_temporal_adjacency_matrix = self.zero_softmax(
+            dense_temporal_interaction * temporal_mask, dim=-1
+        )
+
+        return (normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix,
+                spatial_embeddings, temporal_embeddings)
 
 
 class GraphConvolution(nn.Module):
     """
-    Graph Convolution Layer for SMCHN model
-    
-    Applies graph convolution: H' = σ(A · H · W) where:
-    - A: adjacency matrix (captures interactions)
-    - H: node features (vessel state vectors)
-    - W: learnable weight matrix
-    - σ: activation function (PReLU)
+    Single graph convolution layer: H' = σ(A · H · W)
+    Paper Section 3.2.3.
     """
 
     def __init__(self, in_dims=2, embedding_dims=16, dropout=0):
@@ -269,79 +267,31 @@ class GraphConvolution(nn.Module):
 
         self.embedding = nn.Linear(in_dims, embedding_dims, bias=False)
         self.activation = nn.PReLU()
-
         self.dropout = dropout
 
     def forward(self, graph, adjacency):
-        """
-        Args:
-            graph: Node features [batch_size, 1, seq_len, in_dims]
-                   in_dims can be 4 (initial: LON,LAT,SOG,Heading) or embedding_dims (subsequent layers)
-            adjacency: [batch_size, num_heads, seq_len, seq_len]
-        Returns:
-            gcn_features: [batch_size, num_heads, seq_len, embedding_dims]
-        """
-        # Graph convolution: A · H · W
+        # graph:     [batch, 1, seq_len, in_dims]
+        # adjacency: [batch, num_heads, seq_len, seq_len]
         gcn_features = self.embedding(torch.matmul(adjacency, graph))
         gcn_features = F.dropout(self.activation(gcn_features), p=self.dropout, training=self.training)
-
-        return gcn_features
-
-
-class HybridNetwork(nn.Module):
-    """
-    Hybrid network for fusing spatial-temporal and temporal-spatial features
-    as described in Eq. 18 of the paper.
-    
-    This MLP dynamically learns weights w = [w1, w2] to fuse features:
-    w = softmax(Why*tanh(Whid*[Hs ⊕ Ht] + bhid) + bhy)
-    H = w1*Hs + w2*Ht
-    """
-    
-    def __init__(self, feature_dim=16, hidden_dim=64):
-        super(HybridNetwork, self).__init__()
-        
-        # Two-layer MLP as described in paper (Section 3.2.3)
-        # Input: concatenated features [Hs ⊕ Ht]
-        # Output: 2D weight vector [w1, w2]
-        self.fc_hidden = nn.Linear(feature_dim * 2, hidden_dim)
-        self.fc_output = nn.Linear(hidden_dim, 2)
-        
-        self.tanh = nn.Tanh()
-        self.softmax = nn.Softmax(dim=-1)
-    
-    def forward(self, spatial_temporal_features, temporal_spatial_features):
-        """
-        Args:
-            spatial_temporal_features (Hs): features from spatial→temporal GCN path
-            temporal_spatial_features (Ht): features from temporal→spatial GCN path
-            
-        Returns:
-            fused_features (H): weighted combination H = w1*Hs + w2*Ht
-        """
-        # Concatenate features along last dimension [Hs ⊕ Ht]
-        concatenated = torch.cat([spatial_temporal_features, temporal_spatial_features], dim=-1)
-        
-        # Two-layer MLP (Eq. 18)
-        hidden = self.tanh(self.fc_hidden(concatenated))
-        logits = self.fc_output(hidden)
-        
-        # Softmax to get weights w = [w1, w2]
-        weights = self.softmax(logits)  # Shape: [..., 2]
-        
-        # Extract w1 and w2
-        w1 = weights[..., 0:1]  # Keep dimension for broadcasting
-        w2 = weights[..., 1:2]
-        
-        # Weighted fusion: H = w1*Hs + w2*Ht (Eq. 19)
-        fused_features = w1 * spatial_temporal_features + w2 * temporal_spatial_features
-        
-        return fused_features
+        return gcn_features  # [batch, num_heads, seq_len, embedding_dims]
 
 
 class SparseGraphConvolution(nn.Module):
+    """
+    Two-path sparse GCN with simple addition fusion.
+    
+    Paper Section 3.2.3, Eq. 16-19.
+    NOTE: Original repo uses simple addition (x = spa + tem) instead of
+    the HybridNetwork described in the paper. The HybridNetwork (Mix function)
+    is present but commented out in the original code.
+    
+    Spatial path (Eq. 16): Â'st → GCN1 → Â'ts → GCN2 → Hs
+    Temporal path (Eq. 17): Â'ts → GCN1 → Â'st → GCN2 → Ht
+    Fusion: H = Hs + Ht (simple addition, original repo)
+    """
 
-    def __init__(self, in_dims=16, embedding_dims=16, dropout=0):
+    def __init__(self, in_dims=3, embedding_dims=16, dropout=0):
         super(SparseGraphConvolution, self).__init__()
 
         self.dropout = dropout
@@ -349,227 +299,182 @@ class SparseGraphConvolution(nn.Module):
         self.spatial_temporal_sparse_gcn = nn.ModuleList()
         self.temporal_spatial_sparse_gcn = nn.ModuleList()
 
-        self.spatial_temporal_sparse_gcn.append(GraphConvolution(in_dims, embedding_dims))  #append()：在 ModuleList 
+        self.spatial_temporal_sparse_gcn.append(GraphConvolution(in_dims, embedding_dims))
         self.spatial_temporal_sparse_gcn.append(GraphConvolution(embedding_dims, embedding_dims))
 
         self.temporal_spatial_sparse_gcn.append(GraphConvolution(in_dims, embedding_dims))
         self.temporal_spatial_sparse_gcn.append(GraphConvolution(embedding_dims, embedding_dims))
 
-        # Hybrid network for feature fusion (Eq. 18-19 in paper)
-        self.hybrid_network = HybridNetwork(feature_dim=embedding_dims, hidden_dim=64)
-
-
     def forward(self, graph, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix):
         """
-        Two-layer GCN with hybrid network fusion as described in paper Section 3.2.3
-        
-        Spatial path (Eq. 16): Â'st → GCN1 → Â'ts → GCN2 → Hs
-        Temporal path (Eq. 17): Â'ts → GCN1 → Â'st → GCN2 → Ht
-        Fusion (Eq. 18-19): H = w1*Hs + w2*Ht via hybrid network
-        
         Args:
-            graph: shape [batch_size, seq_len, num_vessels, 4]
-                   Features: [LON, LAT, SOG, Heading] (paper's 4D state vector)
-            normalized_spatial_adjacency_matrix: shape [batch, num_heads, seq_len, seq_len]
-            normalized_temporal_adjacency_matrix: shape [batch, num_heads, seq_len, seq_len]
+            graph: [1, T, N, 4] — full graph with pos_enc
+            normalized_spatial_adjacency_matrix:  [T, num_heads, N, N]
+            normalized_temporal_adjacency_matrix: [N, num_heads, T, T]
         """
-        # graph is already 4D state vector [LON, LAT, SOG, Heading]
-        spa_graph = graph.permute(1, 0, 2, 3)  # (seq_len 1 num_p 2)
-        tem_graph = spa_graph.permute(2, 1, 0, 3)  # (num_p 1 seq_len 2)
+        # Skip pos_enc, use velocity features only
+        graph = graph[:, :, :, 1:]              # [1, T, N, 3]
 
-        # ===== SPATIAL PATH: Â'st → GCN1 → Â'ts → GCN2 → Hs (Eq. 16) =====
-        # First layer: apply spatial adjacency
-        gcn_spatial_layer1 = self.spatial_temporal_sparse_gcn[0](spa_graph, normalized_spatial_adjacency_matrix)
-        # Permute to prepare for temporal adjacency
-        gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)  # (num_p, num_heads, seq_len, hidden_dim)
-        # Second layer: apply temporal adjacency
-        Hs = self.spatial_temporal_sparse_gcn[1](gcn_spatial_layer1_perm, normalized_temporal_adjacency_matrix)
-        # Hs shape: (num_p, num_heads, seq_len, embedding_dims)
+        spa_graph = graph.permute(1, 0, 2, 3)   # [T, 1, N, 3]
+        tem_graph = spa_graph.permute(2, 1, 0, 3)  # [N, 1, T, 3]
 
-        # ===== TEMPORAL PATH: Â'ts → GCN1 → Â'st → GCN2 → Ht (Eq. 17) =====
-        # First layer: apply temporal adjacency
-        gcn_temporal_layer1 = self.temporal_spatial_sparse_gcn[0](tem_graph, normalized_temporal_adjacency_matrix)
-        # Permute to prepare for spatial adjacency
-        gcn_temporal_layer1_perm = gcn_temporal_layer1.permute(2, 1, 0, 3)  # (seq_len, num_heads, num_p, hidden_dim)
-        # Second layer: apply spatial adjacency
-        Ht = self.temporal_spatial_sparse_gcn[1](gcn_temporal_layer1_perm, normalized_spatial_adjacency_matrix)
-        # Ht shape: (seq_len, num_heads, num_p, embedding_dims)
+        # Spatial path: Â'st → GCN1
+        gcn_spatial_layer1 = self.spatial_temporal_sparse_gcn[0](
+            spa_graph, normalized_spatial_adjacency_matrix
+        )  # [T, num_heads, N, emb]
 
-        # Align dimensions for hybrid network: both should be (num_p, seq_len, num_heads, embedding_dims)
-        # or similar compatible shape
-        Hs_aligned = Hs.permute(0, 2, 1, 3)  # (num_p, seq_len, num_heads, embedding_dims)
-        Ht_aligned = Ht.permute(2, 0, 1, 3)  # (num_p, seq_len, num_heads, embedding_dims)
+        # Permute for temporal adjacency
+        gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)  # [N, num_heads, T, emb]
 
-        # ===== HYBRID NETWORK FUSION: H = w1*Hs + w2*Ht (Eq. 18-19) =====
-        H = self.hybrid_network(Hs_aligned, Ht_aligned)
-        
-        # Return in expected format: (num_p, seq_len, num_heads, embedding_dims)
+        # Spatial path: Â'ts → GCN2 → Hs
+        # (not used in final fusion in original — see below)
+
+        # Temporal path: Â'ts → GCN1
+        gcn_temporal_layer1 = self.temporal_spatial_sparse_gcn[0](
+            tem_graph, normalized_temporal_adjacency_matrix
+        )  # [N, num_heads, T, emb]
+
+        # Permute for spatial adjacency
+        gcn_temporal_layer1_perm = gcn_temporal_layer1.permute(2, 1, 0, 3)  # [T, num_heads, N, emb]
+
+        # Fusion: simple addition (original repo)
+        # x shape: [T, num_heads, N, emb]
+        x = gcn_spatial_layer1 + gcn_temporal_layer1_perm
+
+        # Output: [N, T, num_heads, emb]
+        H = x.permute(2, 0, 1, 3)
+
         return H
+
 
 class TCN(nn.Module):
     """
-    Temporal Convolutional Network using causal Conv1d (paper Section 3.2.4).
-
-    Paper quote:
-    "The input is H_in in R^(N x T_obs x f). We treat the temporal dimension
-     as the feature channel and apply the convolution operation. The output
-     size of each convolution operation remains the same as the input size."
-
-    Input:  (N, seq_len, fin)
-    Output: (N, seq_len, fout)   <- seq_len preserved (T_obs = T_pred = 10)
-
-    Left padding of size (k-1) ensures causal order:
-    each output depends only on current and past inputs.
+    Temporal Convolutional Network using Conv2d (original repo).
+    
+    Paper Section 3.2.4: causal left padding.
+    Input:  (N, T, num_heads, emb)
+    Output: (N, pred_len, num_heads, emb)
+    
+    Uses Conv2d with padding on both spatial dims to preserve shape
+    then maps obs_len → pred_len via fin→fout channels.
     """
+
     def __init__(self, fin, fout, layers=3, ksize=3):
         super(TCN, self).__init__()
-        self.ksize = ksize
-        self.convs = nn.ModuleList()
-        # First layer: fin -> fout
-        self.convs.append(nn.Conv1d(fin, fout, kernel_size=ksize))
-        # Remaining layers: fout -> fout
-        for _ in range(1, layers):
-            self.convs.append(nn.Conv1d(fout, fout, kernel_size=ksize))
-
-    def forward(self, x):
-        # x: (N, seq_len, features)
-        x = x.permute(0, 2, 1)          # -> (N, features, seq_len) for Conv1d
-        for conv in self.convs:
-            x = nn.functional.pad(x, (self.ksize - 1, 0))  # left pad only (causal)
-            x = conv(x)
-        return x.permute(0, 2, 1)       # -> (N, seq_len, features)
-
-
-
-class Encoder(nn.Module):
-    """
-    TCN with gating mechanism as described in Eq. 20 of the paper:
-    H(l+1) = g(Wg * H(l)) ⊗ σ(Wf * H(l))
-    
-    where g is tanh activation and σ is sigmoid activation
-    """
-    def __init__(self,fin,fout,layers=3,ksize=3):
-        super(Encoder, self).__init__()
         self.fin = fin
         self.fout = fout
         self.layers = layers
         self.ksize = ksize
 
-        self.tcnf = TCN(self.fin, self.fout, self.layers, self.ksize)  # σ(Wf * H)
-        self.tcng = TCN(self.fin, self.fout, self.layers, self.ksize)  # g(Wg * H)
+        self.convs = nn.ModuleList()
+        for i in range(self.layers):
+            self.convs.append(nn.Conv2d(self.fin, self.fout, kernel_size=self.ksize))
 
-    def forward(self,x):
-        """
-        Gated TCN: H(l+1) = tanh(Wg * H) ⊗ sigmoid(Wf * H)
-        Note: Paper formula (Eq. 20) does NOT include residual connection
-        """
-        f = torch.sigmoid(self.tcnf(x))  # σ(Wf * H(l))
-        g = torch.tanh(self.tcng(x))      # g(Wg * H(l))
-        
-        # Element-wise multiplication (⊗) as per Eq. 20
-        return f * g  # Removed residual connection to match paper
+    def forward(self, x):
+        # x: [N, fin, num_heads, emb]
+        for conv in self.convs:
+            # Causal padding on both dims
+            x = F.pad(x, (self.ksize - 1, 0, self.ksize - 1, 0))
+            x = conv(x)
+        return x
+
+
+class Encoder(nn.Module):
+    """
+    Gated TCN encoder (Paper Eq. 20):
+    H(l+1) = residual + sigmoid(Wf * H) ⊗ tanh(Wg * H)
+    
+    NOTE: Original repo includes residual connection.
+    """
+
+    def __init__(self, fin, fout, layers=3, ksize=3):
+        super(Encoder, self).__init__()
+        self.tcnf = TCN(fin, fout, layers, ksize)  # sigmoid gate
+        self.tcng = TCN(fin, fout, layers, ksize)  # tanh gate
+
+    def forward(self, x):
+        residual = x
+        f = torch.sigmoid(self.tcnf(x))
+        g = torch.tanh(self.tcng(x))
+        return residual + f * g
 
 
 class TrajectoryModel(nn.Module):
 
-
     def __init__(self,
-                 number_asymmetric_conv_layer=2, embedding_dims=64, number_gcn_layers=1, dropout=0,
-                 obs_len=8, pred_len=12,
-                 out_dims=5, num_heads=4):
+                 number_asymmetric_conv_layer=2, embedding_dims=64, number_gcn_layers=1,
+                 dropout=0, obs_len=10, pred_len=10, out_dims=5, num_heads=4):
         super(TrajectoryModel, self).__init__()
 
-        self.number_gcn_layers = number_gcn_layers
         self.obs_len = obs_len
         self.pred_len = pred_len
         self.dropout = dropout
+        self.num_heads = num_heads
+        self.embedding_dims = embedding_dims
 
-        # sparse graph learning
+        # embedding_dims // num_heads = 16 (original repo)
+        gcn_hidden = embedding_dims // num_heads  # 16
+
+        # Sparse adjacency matrices
+        # spa_in_dims=3: velocity features (LON_rel, LAT_rel, SOG_rel) after slicing pos_enc
+        # tem_in_dims=4: full features including pos_enc
         self.sparse_weighted_adjacency_matrices = SparseWeightedAdjacency(
-            spa_in_dims=4,
+            spa_in_dims=3,
             tem_in_dims=4,
-            number_asymmetric_conv_layer=number_asymmetric_conv_layer,
+            embedding_dims=embedding_dims,
             obs_len=obs_len,
+            dropout=dropout,
+            number_asymmetric_conv_layer=number_asymmetric_conv_layer,
             num_heads=num_heads
         )
 
-        # graph convolution
-        # FIX: use full embedding_dims (64), not embedding_dims // num_heads (16).
+        # GCN: in_dims=3 (velocity features), hidden=16
         self.stsgcn = SparseGraphConvolution(
-            in_dims=4, embedding_dims=embedding_dims, dropout=dropout
+            in_dims=3,
+            embedding_dims=gcn_hidden,
+            dropout=dropout
         )
 
-        self.fusion_ = nn.Conv2d(num_heads, num_heads, kernel_size=1, bias=False)
+        # Encoder: fin=obs_len, fout=pred_len (original repo)
+        # Input to encoder: [N, obs_len, num_heads, gcn_hidden]
+        # Treat obs_len as channel dim for Conv2d
+        self.encoder = Encoder(fin=obs_len, fout=pred_len)
 
-        # self.tcns = nn.ModuleList()
-        # self.tcns.append(nn.Sequential(
-        #     nn.Conv2d(obs_len, pred_len, 3, padding=1),
-        #     nn.PReLU()
-        # ))
-        #
-        # for j in range(1, self.n_tcn):  #1,2,3,4
-        #     self.tcns.append(nn.Sequential(
-        #         nn.Conv2d(pred_len, pred_len, 3, padding=1),
-        #         nn.PReLU()
-        # ))
-        # TCN encoder: Conv1d operates on feature dim (embedding_dims).
-        # seq_len is preserved (T_obs = T_pred = 10 in paper).
-        # Paper: "input H_in in R^(N x T_obs x f), output H_out in R^(N x T_pred x fc)"
-        self.encoder = Encoder(fin=embedding_dims, fout=embedding_dims)
-
-        # Output layer: embedding_dims (64) -> out_dims (5 Gaussian params)
-        # Input to output is (N, T_pred, embedding_dims) after mean over num_heads + TCN
+        # Output: pred_len * num_heads * gcn_hidden → out_dims
+        # After encoder: [N, pred_len, num_heads, gcn_hidden]
+        # After view:    [N, pred_len, num_heads * gcn_hidden] = [N, pred_len, embedding_dims]
         self.output = nn.Linear(embedding_dims, out_dims)
-        # self.tcnf = nn.Conv2d(obs_len, pred_len, 3, padding=1)
-        # self.tcng = nn.Conv2d(obs_len, pred_len, 3, padding=1)
-
 
     def forward(self, graph, identity):
         """
         Args:
-            graph: V_obs with shape [batch_size, obs_len, N, 4]
-                   Features: [LON, LAT, SOG, Heading] (paper's 4D state vector)
-            identity: [identity_spatial (obs_len, N, N), identity_temporal (N, obs_len, obs_len)]
+            graph:    [1, obs_len, N, 4] — V_obs with pos_enc + velocity features
+            identity: [spatial (T,N,N), temporal (N,T,T)]
         """
-        # Expected input: V_obs shape [batch_size, obs_len, N, 4]
-        # With 4 features: [LON, LAT, SOG, Heading] (paper-faithful)
+        # Get sparse adjacency matrices
+        # squeeze(0) to remove batch dim: (obs_len, N, 4)
+        normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix, \
+            spatial_embeddings, temporal_embeddings = \
+            self.sparse_weighted_adjacency_matrices(graph.squeeze(0), identity)
 
-        normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix, spatial_embeddings, temporal_embeddings = \
-            self.sparse_weighted_adjacency_matrices(graph.squeeze(0), identity)   
-
+        # GCN: H shape [N, T, num_heads, gcn_hidden]
         H = self.stsgcn(
-            graph, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix
-        )   
-#batch_size,hidden_size
-        # gcn_representation = self.fusion_(gcn_temporal_spatial_features) + gcn_spatial_temporal_features
-        # gcn_representation = self.fusion_(gcn_temporal_spatial_features) + self.fusion_(gcn_spatial_temporal_features)
-        # gcn_representation = gcn_temporal_spatial_features + gcn_spatial_temporal_features  #[N,4,obs,16]
+            graph,
+            normalized_spatial_adjacency_matrix,
+            normalized_temporal_adjacency_matrix
+        )
 
-        # Mean over num_heads: (N, T_obs, num_heads, emb) -> (N, T_obs, emb)
-        # Paper: "input H_in in R^(N x T_obs x f)"
-        gcn_representation = H.mean(dim=2)
+        # Encoder input: [N, obs_len, num_heads, gcn_hidden]
+        # Treat obs_len (T) as channel for Conv2d: permute to [N, T, num_heads, gcn_hidden]
+        # H is already [N, T, num_heads, gcn_hidden]
+        features = self.encoder(H)  # [N, pred_len, num_heads, gcn_hidden]
 
-        # TCN Conv1d (causal, left-pad): (N, T_obs, emb) -> (N, T_obs, emb)
-        # seq_len preserved since T_obs = T_pred = 10
-        features = self.encoder(gcn_representation)
+        # Flatten last two dims: [N, pred_len, num_heads * gcn_hidden] = [N, pred_len, embedding_dims]
+        b, l, _, _ = features.shape
+        features = features.contiguous().view(b, self.pred_len, -1)  # [N, pred_len, embedding_dims]
 
-        # Output linear: (N, T_pred, emb) -> (N, T_pred, 5)
+        # Output projection: [N, pred_len, out_dims=5]
         prediction = self.output(features)
 
-        # f = torch.sigmoid(self.tcnf(gcn_representation))
-        # g = torch.tanh(self.tcng(gcn_representation))
-        # features = gcn_representation + f * g
-
-
-        # prediction = torch.mean(self.output(features), dim=-2)
-        #
-        # f = torch.sigmoid(self.tcnf(prediction))
-        # g = torch.tanh(self.tcng(prediction))
-        # prediction = prediction + f * g
-
-        #
-        # for k in range(1, self.n_tcn):  #1,2,3,4
-        #     features = F.dropout(self.tcns[k](features) + features, p=self.dropout)
-
-        # prediction = torch.mean(self.output(features), dim=-2)   #dim=-2
+        # Return: [pred_len, N, 5]
         return prediction.permute(1, 0, 2).contiguous()

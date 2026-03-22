@@ -353,20 +353,40 @@ def loc_pos(seq_):
 
 def seq_to_graph(seq_, seq_rel, pos_enc=False):
     """
-    Builds node feature tensor V of shape (seq_len, N, 4) from absolute features.
-    Input: seq_ shape (N, 4, seq_len)
-    Output: V shape (seq_len, N, 4)
-    """
-    assert seq_.dim() == 3, f"Expected seq_ (N, 4, T), got {seq_.shape}"
-    assert seq_rel.dim() == 3, f"Expected seq_rel (N, 4, T), got {seq_rel.shape}"
-    assert seq_.shape[1] == 4, f"Expected 4 features, got {seq_.shape[1]}"
+    Builds node feature tensor V from RELATIVE features (velocities).
 
-    V = seq_.permute(2, 0, 1).contiguous()  # (seq_len, N, 4)
+    Original repo (paper-faithful):
+      - V always contains seq_rel (velocities), NOT absolute positions
+      - When pos_enc=True, prepends a positional index as extra feature
+        → output shape: (seq_len, N, 4) with [pos_idx, LON_rel, LAT_rel, SOG_rel]
+      - When pos_enc=False:
+        → output shape: (seq_len, N, 3) with [LON_rel, LAT_rel, SOG_rel]
+
+    Note: original repo uses only first 3 features (LON, LAT, SOG) of seq_rel,
+    discarding Heading — matching spa_in_dims=3 in SparseWeightedAdjacency.
+
+    Args:
+        seq_:    (N, 4, seq_len) — absolute positions (used only for shape)
+        seq_rel: (N, 4, seq_len) — velocities (differences between consecutive steps)
+        pos_enc: if True, prepend positional index [1, 2, ..., seq_len]
+
+    Returns:
+        V: torch.FloatTensor of shape (seq_len, N, 4) if pos_enc else (seq_len, N, 3)
+    """
+    assert seq_rel.dim() == 3, f"Expected seq_rel (N, F, T), got {seq_rel.shape}"
+
+    # Use only first 3 features: LON_rel, LAT_rel, SOG_rel (original repo: graph[:, :, 1:])
+    # seq_rel shape: (N, 4, seq_len) → take first 3 features → (N, 3, seq_len)
+    seq_rel_3 = seq_rel[:, :3, :]  # (N, 3, seq_len)
+
+    # Permute to (seq_len, N, 3)
+    V = seq_rel_3.permute(2, 0, 1).contiguous()  # (seq_len, N, 3)
 
     if pos_enc:
+        # Add positional index as first feature → (seq_len, N, 4)
         V_np = V.cpu().numpy()
-        V_np = loc_pos(V_np)
-        return torch.from_numpy(V_np).float().to(seq_.device)
+        V_np = loc_pos(V_np)  # (seq_len, N, 4): [pos_idx, LON_rel, LAT_rel, SOG_rel]
+        return torch.from_numpy(V_np).float()
 
     return V.float()
 
@@ -538,8 +558,11 @@ class TrajectoryDataset(Dataset):
         for ss in range(len(self.seq_start_end)):
             pbar.update(1)
             start, end = self.seq_start_end[ss]
-            v_ = seq_to_graph(self.obs_traj[start:end, :], self.obs_traj_rel[start:end, :], False)
+            # V_obs: velocities + positional encoding → (obs_len, N, 4)
+            # matches original repo: seq_to_graph(..., pos_enc=True)
+            v_ = seq_to_graph(self.obs_traj[start:end, :], self.obs_traj_rel[start:end, :], True)
             self.v_obs.append(v_.clone())
+            # V_pred: absolute positions → (pred_len, N, 4) used as loss target
             v_ = seq_to_graph(self.pred_traj[start:end, :], self.pred_traj_rel[start:end, :], False)
             self.v_pred.append(v_.clone())
         pbar.close()
