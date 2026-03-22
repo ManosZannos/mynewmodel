@@ -186,12 +186,12 @@ class SparseWeightedAdjacency(nn.Module):
     - temporal_graph uses full graph → (N, T, 4)
     """
 
-    def __init__(self, spa_in_dims=3, tem_in_dims=4, embedding_dims=64, obs_len=10,
+    def __init__(self, spa_in_dims=4, tem_in_dims=5, embedding_dims=64, obs_len=10,
                  dropout=0, number_asymmetric_conv_layer=2, num_heads=4):
         super(SparseWeightedAdjacency, self).__init__()
 
-        # Paper uses 3D for spatial (LON_rel, LAT_rel, SOG_rel after slicing pos_enc)
-        # and 4D for temporal (full feature including pos_enc)
+        # spa_in_dims=4: velocity features (LON_rel, LAT_rel, SOG_rel, Heading_rel) after slicing pos_enc
+        # tem_in_dims=5: full features including pos_enc [pos_enc, LON_rel, LAT_rel, SOG_rel, Heading_rel]
         self.spatial_attention = SelfAttention(spa_in_dims, embedding_dims, num_heads=num_heads)
         self.temporal_attention = SelfAttention(tem_in_dims, embedding_dims, num_heads=num_heads)
 
@@ -209,16 +209,16 @@ class SparseWeightedAdjacency(nn.Module):
     def forward(self, graph, identity):
         """
         Args:
-            graph: (T, N, 4) — [pos_enc, LON_rel, LAT_rel, SOG_rel] after seq_to_graph
+            graph: (T, N, 5) — [pos_enc, LON_rel, LAT_rel, SOG_rel, Heading_rel]
             identity: [spatial_identity (T,N,N), temporal_identity (N,T,T)]
         """
         assert len(graph.shape) == 3
 
-        # Spatial graph: skip pos_enc, use velocity features (T, N, 3)
-        spatial_graph = graph[:, :, 1:]       # (T, N, 3)
+        # Spatial graph: skip pos_enc → (T, N, 4) velocity features
+        spatial_graph = graph[:, :, 1:]       # (T, N, 4)
 
-        # Temporal graph: full features (N, T, 4)
-        temporal_graph = graph.permute(1, 0, 2)  # (N, T, 4)
+        # Temporal graph: full features → (N, T, 5)
+        temporal_graph = graph.permute(1, 0, 2)  # (N, T, 5)
 
         # Dense attention scores
         # spatial: (T, num_heads, N, N)
@@ -291,7 +291,7 @@ class SparseGraphConvolution(nn.Module):
     Fusion: H = Hs + Ht (simple addition, original repo)
     """
 
-    def __init__(self, in_dims=3, embedding_dims=16, dropout=0):
+    def __init__(self, in_dims=4, embedding_dims=16, dropout=0):
         super(SparseGraphConvolution, self).__init__()
 
         self.dropout = dropout
@@ -312,34 +312,42 @@ class SparseGraphConvolution(nn.Module):
             normalized_spatial_adjacency_matrix:  [T, num_heads, N, N]
             normalized_temporal_adjacency_matrix: [N, num_heads, T, T]
         """
-        # Skip pos_enc, use velocity features only
-        graph = graph[:, :, :, 1:]              # [1, T, N, 3]
+        # Skip pos_enc, use all 4 velocity features
+        graph = graph[:, :, :, 1:]              # [1, T, N, 4]
 
-        spa_graph = graph.permute(1, 0, 2, 3)   # [T, 1, N, 3]
-        tem_graph = spa_graph.permute(2, 1, 0, 3)  # [N, 1, T, 3]
+        spa_graph = graph.permute(1, 0, 2, 3)   # [T, 1, N, 4]
+        tem_graph = spa_graph.permute(2, 1, 0, 3)  # [N, 1, T, 4]
 
         # Spatial path: Â'st → GCN1
         gcn_spatial_layer1 = self.spatial_temporal_sparse_gcn[0](
             spa_graph, normalized_spatial_adjacency_matrix
         )  # [T, num_heads, N, emb]
 
-        # Permute for temporal adjacency
+        # Permute for GCN2 (temporal adjacency)
         gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)  # [N, num_heads, T, emb]
 
-        # Spatial path: Â'ts → GCN2 → Hs
-        # (not used in final fusion in original — see below)
+        # Spatial path: Â'ts → GCN2 (computed but not used in fusion — matches original repo)
+        gcn_spatial_temporal_features = self.spatial_temporal_sparse_gcn[1](
+            gcn_spatial_layer1_perm, normalized_temporal_adjacency_matrix
+        )  # [N, num_heads, T, emb] — not used in fusion
 
         # Temporal path: Â'ts → GCN1
         gcn_temporal_layer1 = self.temporal_spatial_sparse_gcn[0](
             tem_graph, normalized_temporal_adjacency_matrix
         )  # [N, num_heads, T, emb]
 
-        # Permute for spatial adjacency
+        # Permute for GCN2 (spatial adjacency)
         gcn_temporal_layer1_perm = gcn_temporal_layer1.permute(2, 1, 0, 3)  # [T, num_heads, N, emb]
 
-        # Fusion: simple addition (original repo)
-        # x shape: [T, num_heads, N, emb]
-        x = gcn_spatial_layer1 + gcn_temporal_layer1_perm
+        # Temporal path: Â'st → GCN2 (computed but not used in fusion — matches original repo)
+        gcn_temporal_spatial_features = self.temporal_spatial_sparse_gcn[1](
+            gcn_temporal_layer1_perm, normalized_spatial_adjacency_matrix
+        )  # [T, num_heads, N, emb] — not used in fusion
+
+        # Fusion: simple addition of GCN1 outputs (original repo)
+        # gcn_spatial_layer1:      [T, num_heads, N, emb]
+        # gcn_temporal_layer1_perm:[T, num_heads, N, emb]
+        x = gcn_spatial_layer1 + gcn_temporal_layer1_perm  # [T, num_heads, N, emb]
 
         # Output: [N, T, num_heads, emb]
         H = x.permute(2, 0, 1, 3)
@@ -416,11 +424,11 @@ class TrajectoryModel(nn.Module):
         gcn_hidden = embedding_dims // num_heads  # 16
 
         # Sparse adjacency matrices
-        # spa_in_dims=3: velocity features (LON_rel, LAT_rel, SOG_rel) after slicing pos_enc
-        # tem_in_dims=4: full features including pos_enc
+        # spa_in_dims=4: velocity features after slicing pos_enc
+        # tem_in_dims=5: full features including pos_enc
         self.sparse_weighted_adjacency_matrices = SparseWeightedAdjacency(
-            spa_in_dims=3,
-            tem_in_dims=4,
+            spa_in_dims=4,
+            tem_in_dims=5,
             embedding_dims=embedding_dims,
             obs_len=obs_len,
             dropout=dropout,
@@ -428,9 +436,9 @@ class TrajectoryModel(nn.Module):
             num_heads=num_heads
         )
 
-        # GCN: in_dims=3 (velocity features), hidden=16
+        # GCN: in_dims=4 (velocity features after slicing pos_enc), hidden=16
         self.stsgcn = SparseGraphConvolution(
-            in_dims=3,
+            in_dims=4,
             embedding_dims=gcn_hidden,
             dropout=dropout
         )
@@ -448,7 +456,7 @@ class TrajectoryModel(nn.Module):
     def forward(self, graph, identity):
         """
         Args:
-            graph:    [1, obs_len, N, 4] — V_obs with pos_enc + velocity features
+            graph:    [1, obs_len, N, 5] — V_obs with [pos_enc, LON_rel, LAT_rel, SOG_rel, Heading_rel]
             identity: [spatial (T,N,N), temporal (N,T,T)]
         """
         # Get sparse adjacency matrices

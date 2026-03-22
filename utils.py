@@ -358,34 +358,29 @@ def seq_to_graph(seq_, seq_rel, pos_enc=False):
     Original repo (paper-faithful):
       - V always contains seq_rel (velocities), NOT absolute positions
       - When pos_enc=True, prepends a positional index as extra feature
-        → output shape: (seq_len, N, 4) with [pos_idx, LON_rel, LAT_rel, SOG_rel]
+        → output shape: (seq_len, N, 5) with [pos_idx, LON_rel, LAT_rel, SOG_rel, Heading_rel]
       - When pos_enc=False:
-        → output shape: (seq_len, N, 3) with [LON_rel, LAT_rel, SOG_rel]
-
-    Note: original repo uses only first 3 features (LON, LAT, SOG) of seq_rel,
-    discarding Heading — matching spa_in_dims=3 in SparseWeightedAdjacency.
+        → output shape: (seq_len, N, 4) with [LON_rel, LAT_rel, SOG_rel, Heading_rel]
 
     Args:
-        seq_:    (N, 4, seq_len) — absolute positions (used only for shape)
+        seq_:    (N, 4, seq_len) — absolute positions (used only for shape reference)
         seq_rel: (N, 4, seq_len) — velocities (differences between consecutive steps)
         pos_enc: if True, prepend positional index [1, 2, ..., seq_len]
 
     Returns:
-        V: torch.FloatTensor of shape (seq_len, N, 4) if pos_enc else (seq_len, N, 3)
+        V: torch.FloatTensor of shape (seq_len, N, 5) if pos_enc else (seq_len, N, 4)
     """
     assert seq_rel.dim() == 3, f"Expected seq_rel (N, F, T), got {seq_rel.shape}"
 
-    # Use only first 3 features: LON_rel, LAT_rel, SOG_rel (original repo: graph[:, :, 1:])
-    # seq_rel shape: (N, 4, seq_len) → take first 3 features → (N, 3, seq_len)
-    seq_rel_3 = seq_rel[:, :3, :]  # (N, 3, seq_len)
-
-    # Permute to (seq_len, N, 3)
-    V = seq_rel_3.permute(2, 0, 1).contiguous()  # (seq_len, N, 3)
+    # Use all 4 features: LON_rel, LAT_rel, SOG_rel, Heading_rel
+    # seq_rel shape: (N, 4, seq_len) → permute → (seq_len, N, 4)
+    V = seq_rel.permute(2, 0, 1).contiguous()  # (seq_len, N, 4)
 
     if pos_enc:
-        # Add positional index as first feature → (seq_len, N, 4)
+        # Add positional index as first feature → (seq_len, N, 5)
+        # [pos_idx, LON_rel, LAT_rel, SOG_rel, Heading_rel]
         V_np = V.cpu().numpy()
-        V_np = loc_pos(V_np)  # (seq_len, N, 4): [pos_idx, LON_rel, LAT_rel, SOG_rel]
+        V_np = loc_pos(V_np)  # (seq_len, N, 5)
         return torch.from_numpy(V_np).float()
 
     return V.float()

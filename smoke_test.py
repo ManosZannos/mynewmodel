@@ -93,15 +93,16 @@ try:
     if dataset is None:
         batch_size = 1
         N = 20  # dummy number of vessels
-        V_obs = torch.randn(batch_size, obs_len, N, 4).to(device)
+        # V_obs: [batch, obs_len, N, 5] = [pos_enc, LON_rel, LAT_rel, SOG_rel, Heading_rel]
+        V_obs = torch.randn(batch_size, obs_len, N, 5).to(device)
         V_tr = torch.randn(batch_size, pred_len, N, 4).to(device)
         print(f"    Using dummy data: V_obs {V_obs.shape}")
     
-    # Create identity matrices (paper-faithful)
+    # Create identity matrices (original repo)
     T = V_obs.shape[1]  # obs_len
     N = V_obs.shape[2]  # num vessels
-    identity_spatial = torch.ones((T, N, N), device=device)
-    identity_temporal = torch.triu(torch.ones((N, T, T), device=device), diagonal=0)
+    identity_spatial  = torch.ones((T, N, N), device=device) * torch.eye(N, device=device)
+    identity_temporal = torch.ones((N, T, T), device=device) * torch.eye(T, device=device)
     identity = [identity_spatial, identity_temporal]
     
     # Forward pass
