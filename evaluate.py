@@ -172,9 +172,9 @@ def evaluate_model(model, loader, device, global_stats, num_samples=20):
             T = V_obs.shape[1]   # obs_len
             N = V_obs.shape[2]   # num vessels in this sequence
             
-            # Paper-faithful initialization
-            identity_spatial = torch.ones((T, N, N), device=device)
-            identity_temporal = torch.triu(torch.ones((N, T, T), device=device), diagonal=0)
+            # Identity matrices (original repo)
+            identity_spatial  = torch.ones((T, N, N), device=device) * torch.eye(N, device=device)
+            identity_temporal = torch.ones((N, T, T), device=device) * torch.eye(T, device=device)
             identity = [identity_spatial, identity_temporal]
             
             # Forward pass - get Gaussian parameters (in normalized space)
@@ -183,10 +183,10 @@ def evaluate_model(model, loader, device, global_stats, num_samples=20):
             
             # Ensure no extra dimensions (squeeze is safe even if not needed)
             V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 5]
-            V_tr = V_tr.squeeze(0)      # [pred_len, N, 4] (LON, LAT, SOG, Heading)
-            
-            # Extract only x, y coordinates from ground truth (ABSOLUTE positions, normalized)
-            V_target = V_tr[:, :, :2]   # [pred_len, N, 2] - (LON, LAT) normalized
+
+            # Target: absolute positions from pred_traj_gt (NOT V_tr which is velocities)
+            # pred_traj_gt: [N, 4, pred_len] -> [pred_len, N, 4]
+            V_target = pred_traj_gt.squeeze(0).permute(2, 0, 1)[:, :, :2]  # [pred_len, N, 2]
             
             # DENORMALIZE to real-world coordinates (degrees) - PAPER ALIGNED
             V_pred_denorm = denormalize_predictions(V_pred, global_stats)
