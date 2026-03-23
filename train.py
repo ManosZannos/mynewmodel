@@ -107,9 +107,9 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
         V_pred = model(V_obs, identity)
         V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 5]
 
-        # Target: absolute positions from pred_traj_gt (NOT V_tr which is velocities)
-        # pred_traj_gt: [N, 4, pred_len] -> [pred_len, N, 4]
-        V_target = pred_traj_gt.squeeze(0).permute(2, 0, 1)  # [pred_len, N, 4]
+        # Target: V_tr contains velocities — matches original repo
+        # V_tr shape: [1, pred_len, N, 4] → squeeze → [pred_len, N, 4]
+        V_target = V_tr.squeeze(0)  # [pred_len, N, 4]
 
         # Gradient accumulation (original repo style)
         if batch_count % args.batch_size != 0 and cnt != turn_point:
@@ -171,8 +171,9 @@ def vald(epoch, model, checkpoint_dir, loader_val):
             V_pred = model(V_obs, identity)
             V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 5]
 
-            # Target: absolute positions from pred_traj_gt
-            V_target = pred_traj_gt.squeeze(0).permute(2, 0, 1)  # [pred_len, N, 4]
+            # Target: V_tr contains velocities — matches original repo
+            # V_tr shape: [1, pred_len, N, 4] → squeeze → [pred_len, N, 4]
+            V_target = V_tr.squeeze(0)  # [pred_len, N, 4]
 
             if batch_count % args.batch_size != 0 and cnt != turn_point:
                 l = graph_loss(V_pred, V_target)
