@@ -178,18 +178,29 @@ def evaluate_model(model, loader, device, global_stats, num_samples=20):
             identity = [identity_spatial, identity_temporal]
             
             # Forward pass - get Gaussian parameters (in normalized space)
-            # Model returns: [pred_len, N, 5] (no explicit batch dim after permute)
+            # Model predicts VELOCITIES (matching V_tr training target)
             V_pred = model(V_obs, identity)  # [pred_len, N, 5]
-            
-            # Ensure no extra dimensions (squeeze is safe even if not needed)
             V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 5]
 
-            # Target: absolute positions from pred_traj_gt (NOT V_tr which is velocities)
-            # pred_traj_gt: [N, 4, pred_len] -> [pred_len, N, 4]
+            # Last observed absolute position (normalized): [N, 2]
+            # obs_traj: [N, 4, obs_len] → last timestep → first 2 features (LON, LAT)
+            last_obs = obs_traj.squeeze(0)[:, :2, -1]  # [N, 2]
+
+            # Convert predicted velocity Gaussian parameters to absolute position Gaussian:
+            # μ_abs[t] = last_obs + cumsum(μ_vel[0:t+1])
+            # σ stays the same (velocity σ ≈ position σ for small steps)
+            mu_vel = V_pred[:, :, :2]  # [pred_len, N, 2]
+            mu_abs = torch.cumsum(mu_vel, dim=0) + last_obs.unsqueeze(0)  # [pred_len, N, 2]
+
+            # Build absolute-position Gaussian parameters [pred_len, N, 5]
+            V_pred_abs = V_pred.clone()
+            V_pred_abs[:, :, :2] = mu_abs  # replace velocity means with absolute means
+
+            # Target: absolute positions from pred_traj_gt [pred_len, N, 2]
             V_target = pred_traj_gt.squeeze(0).permute(2, 0, 1)[:, :, :2]  # [pred_len, N, 2]
-            
-            # DENORMALIZE to real-world coordinates (degrees) - PAPER ALIGNED
-            V_pred_denorm = denormalize_predictions(V_pred, global_stats)
+
+            # DENORMALIZE to real-world coordinates (degrees)
+            V_pred_denorm = denormalize_predictions(V_pred_abs, global_stats)
             V_target_denorm = denormalize_coordinates(V_target, global_stats)
             
             # Evaluate with best-of-K sampling in REAL-WORLD coordinates
