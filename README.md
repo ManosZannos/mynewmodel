@@ -13,7 +13,7 @@ Faithful reconstruction of the SMCHN model proposed in:
 | minADE-20 (10-min) | 0.0010° | 0.0015° |
 | FDE (10-min) | 0.0012° | 0.0021° |
 
-Dataset: AIS data, San Diego Harbor, December 2021 ([marinecadastre.gov](https://marinecadastre.gov))
+Dataset: AIS data, San Diego Harbor, December 2021 ([NOAA AIS Data](https://coast.noaa.gov/htdata/CMSP/AISDataHandler/2021/index.html))
 
 ---
 
@@ -43,7 +43,7 @@ pip install torch numpy pandas tqdm tensorboard termcolor
 
 ## Data Preprocessing
 
-Download AIS data from [marinecadastre.gov](https://marinecadastre.gov) and place zip files in `data/raw/2021_12/`.
+Download AIS data from [NOAA AIS Data Handler](https://coast.noaa.gov/htdata/CMSP/AISDataHandler/2021/index.html) and place zip files in `data/raw/2021_12/`.
 
 ```bash
 python preprocess_ais.py
