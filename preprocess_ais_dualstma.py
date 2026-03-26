@@ -50,56 +50,87 @@ def main():
     # ----------------------------
     # Input
     # ----------------------------
-    raw_data_folder = "data/raw/2021_12"  # Folder with all AIS_*.zip files
-    inner_csv_name = None  # Auto-detect first CSV in each zip
-    nrows = None  # Use None for full processing, or set limit for testing (e.g., 2_000_000)
+    # DualSTMA (Huang et al., 2024) — DOI: 10.3390/jmse12112031
+    # Dataset: MarineCadastre.gov, AIS data 2021
+    # Preprocessed dataset also available at:
+    #   https://github.com/AIR-SkyForecast/METO-S2S/tree/main/dataset_json
+    #
+    # 4 US coastal regions (process each separately, then combine):
+    #   Southwestern: LON 120°W–114°W, LAT 28°N–35°N
+    #   Northeastern: LON 71°W–65°W,  LAT 41°N–46°N
+    #   Southeastern: LON 81°W–75°W,  LAT 30°N–36°N
+    #   Northwestern: LON 127°W–122°W, LAT 42°N–50°N
+    #
+    # Run this script once per region, changing the params below.
+    # Then train on the combined dataset.
+    #
+    # NOTE: If using the preprocessed GitHub dataset, skip preprocessing
+    # and go directly to training with obs_len=10, pred_len=5.
+
+    # Select region (change as needed):
+    REGION = "southwestern"  # Options: southwestern, northeastern, southeastern, northwestern
+
+    REGION_PARAMS = {
+        "southwestern": {"lon": (-120.0, -114.0), "lat": (28.0, 35.0)},
+        "northeastern": {"lon": (-71.0,  -65.0),  "lat": (41.0, 46.0)},
+        "southeastern": {"lon": (-81.0,  -75.0),  "lat": (30.0, 36.0)},
+        "northwestern": {"lon": (-127.0, -122.0), "lat": (42.0, 50.0)},
+    }
+
+    raw_data_folder = f"data/raw/marinecadastre_2021_{REGION}"
+    inner_csv_name = None
+    nrows = None  # Use None for full processing, or set limit for testing
 
     # ----------------------------
-    # Train/Val/Test Split (Paper: 6:2:2 ratio)
+    # Train/Val/Test Split (DualSTMA: 8:1:1 chronological)
     # ----------------------------
-    # Approximate 6:2:2 split over 31 days
-    # Train: days 1-19 (19 days)
-    # Val:   days 20-25 (6 days)
-    # Test:  days 26-31 (6 days)
-    
-    train_days = list(range(1, 20))    # Days 1-19 → train/ (60%)
-    val_days = list(range(20, 26))     # Days 20-25 → val/ (20%)
-    test_days = list(range(26, 32))    # Days 26-31 → test/ (20%)
+    # 2021 data — use full year or subset of months
+    # Approximate 8:1:1 over available days:
+    # If using monthly files (e.g., Jan–Dec 2021):
+    #   Train: months 1–9  (Jan–Sep)
+    #   Val:   month  10   (Oct)
+    #   Test:  months 11–12 (Nov–Dec)
+    # If using daily files within a month, adjust accordingly.
+    # Here we use day-based split within available files (8:1:1):
+    #   Train: days 1–25  (~80%)
+    #   Val:   days 26–28 (~10%)
+    #   Test:  days 29–31 (~10%)
+    train_days = list(range(1, 26))    # days 1–25  → train (~80%)
+    val_days   = list(range(26, 29))   # days 26–28 → val   (~10%)
+    test_days  = list(range(29, 32))   # days 29–31 → test  (~10%)
 
-    #train_days = [1,2,3,4,5]
-    #val_days = [6]
-    #test_days = []
-
     # ----------------------------
-    # Paper preprocessing params
+    # Paper preprocessing params (DualSTMA, Section 4.1.2)
     # ----------------------------
-    lat_range = (30.0, 35.0)
-    lon_range = (-120.0, -115.0)
-    sog_range = (1.0, 22.0)
+    lat_range     = REGION_PARAMS[REGION]["lat"]
+    lon_range     = REGION_PARAMS[REGION]["lon"]
+    sog_range     = (0.5, 40.0)        # Paper removes stationary vessels (SOG~0)
     heading_range = (0.0, 360.0)
-    min_vessels_per_timestamp = 3  # Paper's value
-    max_gap_minutes = 10           # Gaps > 10 min split vessel trajectory into segments
-                                   # before resampling (prevents fake interpolation)
+    min_vessels_per_timestamp = 2      # Multi-vessel context needed
+    max_gap_minutes = 10               # Gaps > 10 min → new segment before resampling
+    resample_freq  = "10min"           # KEY: DualSTMA uses 10-min interval ← changed from 1min
 
     # ----------------------------
     # Output
     # ----------------------------
-    dataset_name = "noaa_dec2021"
+    dataset_name = f"marinecadastre_2021_{REGION}"
     dataset_base = os.path.join("dataset", dataset_name)
     global_stats_path = os.path.join(dataset_base, "global_stats.json")
 
     # Find all AIS zip files
     zip_files = sorted(glob.glob(os.path.join(raw_data_folder, "AIS_*.zip")))
-    
+
     if not zip_files:
         print(f"ERROR: No AIS_*.zip files found in {raw_data_folder}")
+        print(f"Download from: https://marinecadastre.gov/ais/")
+        print(f"Or use preprocessed data from: https://github.com/AIR-SkyForecast/METO-S2S/tree/main/dataset_json")
         return
 
     # Categorize files by split
     train_files = []
-    val_files = []
-    test_files = []
-    
+    val_files   = []
+    test_files  = []
+
     for zip_path in zip_files:
         filename = os.path.basename(zip_path)
         day_num = get_day_from_filename(filename)
@@ -163,7 +194,7 @@ def main():
             
             # Steps 1-3: clean, resample, filter (no z-score yet)
             df = clean_abnormal_data_noaa(df_raw, lat_range, lon_range, sog_range, heading_range)
-            df = resample_interpolate_1min(df, freq="1min", rolling_window=5, max_gap_minutes=max_gap_minutes)
+            df = resample_interpolate_1min(df, freq=resample_freq, rolling_window=5, max_gap_minutes=max_gap_minutes)
             df = filter_timestamps_min_vessels(df, min_vessels_per_timestamp)
             
             # Update streaming statistics (batch Welford's algorithm)
@@ -286,6 +317,7 @@ def main():
                 heading_range=heading_range,
                 min_vessels_per_timestamp=min_vessels_per_timestamp,
                 max_gap_minutes=max_gap_minutes,
+                resample_freq=resample_freq,
                 do_zscore=True,
                 zscore_stats=global_stats,
             )
@@ -307,13 +339,26 @@ def main():
     print(f"{'='*80}")
     print("PREPROCESSING COMPLETE!")
     print(f"{'='*80}")
-    print(f"Dataset: {dataset_name}")
-    print(f"Location: {dataset_base}/")
+    print(f"Dataset:      {dataset_name}")
+    print(f"Region:       {REGION} {REGION_PARAMS[REGION]}")
+    print(f"Sampling:     {resample_freq} (DualSTMA-aligned)")
+    print(f"Location:     {dataset_base}/")
     print(f"Global stats: {global_stats_path}")
     print(f"\nTrain files: {len(train_files)}")
     print(f"Val files:   {len(val_files)}")
     print(f"Test files:  {len(test_files)}")
-    print(f"\nNext: python train.py --dataset {dataset_name}")
+    print(f"\nNext steps (DualSTMA comparison):")
+    print(f"  # obs_len=10 × 10min = 100min observation")
+    print(f"  # pred_len=5  × 10min = 50min prediction (matches DualSTMA)")
+    print(f"  python train.py --dataset {dataset_name} --tag SMCHN_dualstma \\")
+    print(f"    --obs_len 10 --pred_len 5 --num_epochs 200 --lr 0.00001 --clip_grad 1.0")
+    print(f"  python evaluate.py --dataset {dataset_name} \\")
+    print(f"    --checkpoint checkpoints/SMCHN_dualstma/{dataset_name}/val_best.pth \\")
+    print(f"    --split test --num_samples 20")
+    print(f"\nComparison target: DualSTMA (Huang et al., 2024)")
+    print(f"  DOI: 10.3390/jmse12112031")
+    print(f"  ADE 10min: 0.000609°  FDE 10min: 0.000807°")
+    print(f"  ADE 50min: 0.002436°  FDE 50min: 0.003946°")
     print(f"{'='*80}")
 
 
