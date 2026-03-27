@@ -425,7 +425,7 @@ class TrajectoryDataset(Dataset):
         self,
         data_dir,
         obs_len=10,
-        pred_len=10,
+        pred_len=5,
         skip=1,
         threshold=0.002,
         min_ped=1,

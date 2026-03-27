@@ -60,7 +60,7 @@ python train.py \
   --dataset noaa_dec2021 \
   --tag SMCHN \
   --obs_len 10 \
-  --pred_len 10 \
+  --pred_len 5 \
   --num_epochs 200 \
   --lr 0.00001 \
   --clip_grad 1.0

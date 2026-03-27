@@ -17,7 +17,7 @@ print(f"  CUDA available: {torch.cuda.is_available()}")
 
 # Test parameters
 obs_len = 10
-pred_len = 10
+pred_len = 5
 embedding_dims = 64
 num_gcn_layers = 1
 num_heads = 4

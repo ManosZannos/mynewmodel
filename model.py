@@ -391,8 +391,9 @@ class Encoder(nn.Module):
     """
     Gated TCN encoder (Paper Eq. 20):
     H(l+1) = residual + sigmoid(Wf * H) ⊗ tanh(Wg * H)
-    
-    NOTE: Original repo includes residual connection.
+
+    When fin != fout (e.g. obs_len=10, pred_len=5), a projection
+    Conv2d maps residual to the correct output shape before addition.
     """
 
     def __init__(self, fin, fout, layers=3, ksize=3):
@@ -400,8 +401,18 @@ class Encoder(nn.Module):
         self.tcnf = TCN(fin, fout, layers, ksize)  # sigmoid gate
         self.tcng = TCN(fin, fout, layers, ksize)  # tanh gate
 
+        # Residual projection when fin != fout
+        if fin != fout:
+            self.residual_proj = nn.Conv2d(fin, fout, kernel_size=1, bias=False)
+        else:
+            self.residual_proj = None
+
     def forward(self, x):
-        residual = x
+        # x: [N, fin, num_heads, gcn_hidden]
+        if self.residual_proj is not None:
+            residual = self.residual_proj(x)  # [N, fout, num_heads, gcn_hidden]
+        else:
+            residual = x
         f = torch.sigmoid(self.tcnf(x))
         g = torch.tanh(self.tcng(x))
         return residual + f * g
@@ -411,7 +422,7 @@ class TrajectoryModel(nn.Module):
 
     def __init__(self,
                  number_asymmetric_conv_layer=2, embedding_dims=64, number_gcn_layers=1,
-                 dropout=0, obs_len=10, pred_len=10, out_dims=5, num_heads=4):
+                 dropout=0, obs_len=10, pred_len=5, out_dims=5, num_heads=4):
         super(TrajectoryModel, self).__init__()
 
         self.obs_len = obs_len
