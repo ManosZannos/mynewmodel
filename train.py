@@ -218,20 +218,11 @@ def main(args):
 
     val_split = 'val'
 
-    # Use JSON dataset for marinecadastre_2021 (DualSTMA comparison)
-    # Use CSV dataset for all other datasets
-    if args.dataset == 'marinecadastre_2021':
-        dset_train = TrajectoryDatasetJSON(
-            os.path.join(data_set, 'train.json'),
-            obs_len=obs_seq_len,
-            pred_len=pred_seq_len,
-            skip=1)
-    else:
-        dset_train = TrajectoryDataset(
-            data_set + 'train/',
-            obs_len=obs_seq_len,
-            pred_len=pred_seq_len,
-            skip=1)
+    dset_train = TrajectoryDataset(
+        data_set + 'train/',
+        obs_len=obs_seq_len,
+        pred_len=pred_seq_len,
+        skip=1)
 
     loader_train = DataLoader(
         dset_train,
@@ -239,18 +230,11 @@ def main(args):
         shuffle=True,
         num_workers=0)
 
-    if args.dataset == 'marinecadastre_2021':
-        dset_val = TrajectoryDatasetJSON(
-            os.path.join(data_set, 'val.json'),
-            obs_len=obs_seq_len,
-            pred_len=pred_seq_len,
-            skip=1)
-    else:
-        dset_val = TrajectoryDataset(
-            data_set + val_split + '/',
-            obs_len=obs_seq_len,
-            pred_len=pred_seq_len,
-            skip=1)
+    dset_val = TrajectoryDataset(
+        data_set + 'val/',
+        obs_len=obs_seq_len,
+        pred_len=pred_seq_len,
+        skip=1)
 
     loader_val = DataLoader(
         dset_val,
