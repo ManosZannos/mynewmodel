@@ -113,7 +113,7 @@ def main():
     # ----------------------------
     # Output
     # ----------------------------
-    dataset_name = f"marinecadastre_2021_{REGION}"
+    dataset_name = "marinecadastre_2021"
     dataset_base = os.path.join("dataset", dataset_name)
     global_stats_path = os.path.join(dataset_base, "global_stats.json")
 

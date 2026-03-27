@@ -9,9 +9,9 @@ import glob
 parser = argparse.ArgumentParser()
 parser.add_argument('--gpu_num', default="0", type=str, help='GPU device number')
 parser.add_argument('--obs_len', type=int, default=10)
-parser.add_argument('--pred_len', type=int, default=10)
-parser.add_argument('--dataset', default='eth',
-                    help='eth,hotel,univ,zara1,zara2')
+parser.add_argument('--pred_len', type=int, default=5)
+parser.add_argument('--dataset', default='marinecadastre_2021',
+                    help='Dataset name (folder under ./dataset/)')
 parser.add_argument('--batch_size', type=int, default=32,
                     help='minibatch size (used for gradient accumulation)')
 parser.add_argument('--num_epochs', type=int, default=200,
@@ -24,7 +24,7 @@ parser.add_argument('--milestones', type=int, default=[0, 100],
                     help='number of steps to drop the lr')
 parser.add_argument('--use_lrschd', action="store_true", default=False,
                     help='Use lr rate scheduler')
-parser.add_argument('--tag', default='AddGCN_10_10', help='personal tag for the model')
+parser.add_argument('--tag', default='SMCHN_dualstma', help='personal tag for the model')
 
 # Parse early to set CUDA device before importing torch
 args_early, _ = parser.parse_known_args()
@@ -210,23 +210,28 @@ def main(args):
         return split_dir, csv_files
 
     train_dir, train_csv_files = _get_split_csv_files('train')
-    if not train_csv_files:
+    if not train_csv_files and args.dataset != 'marinecadastre_2021':
         raise RuntimeError(
             f"Dataset split 'train' has no CSV files in {train_dir}. "
             f"Run preprocessing first (python preprocess_ais.py)."
         )
 
-    val_dir, val_csv_files = _get_split_csv_files('val')
     val_split = 'val'
-    if not val_csv_files:
-        print(f"WARNING: No CSV files found in {val_dir}. Falling back to train split.")
-        val_split = 'train'
 
-    dset_train = TrajectoryDataset(
-        data_set + 'train/',
-        obs_len=obs_seq_len,
-        pred_len=pred_seq_len,
-        skip=1)
+    # Use JSON dataset for marinecadastre_2021 (DualSTMA comparison)
+    # Use CSV dataset for all other datasets
+    if args.dataset == 'marinecadastre_2021':
+        dset_train = TrajectoryDatasetJSON(
+            os.path.join(data_set, 'train.json'),
+            obs_len=obs_seq_len,
+            pred_len=pred_seq_len,
+            skip=1)
+    else:
+        dset_train = TrajectoryDataset(
+            data_set + 'train/',
+            obs_len=obs_seq_len,
+            pred_len=pred_seq_len,
+            skip=1)
 
     loader_train = DataLoader(
         dset_train,
@@ -234,11 +239,18 @@ def main(args):
         shuffle=True,
         num_workers=0)
 
-    dset_val = TrajectoryDataset(
-        data_set + val_split + '/',
-        obs_len=obs_seq_len,
-        pred_len=pred_seq_len,
-        skip=1)
+    if args.dataset == 'marinecadastre_2021':
+        dset_val = TrajectoryDatasetJSON(
+            os.path.join(data_set, 'val.json'),
+            obs_len=obs_seq_len,
+            pred_len=pred_seq_len,
+            skip=1)
+    else:
+        dset_val = TrajectoryDataset(
+            data_set + val_split + '/',
+            obs_len=obs_seq_len,
+            pred_len=pred_seq_len,
+            skip=1)
 
     loader_val = DataLoader(
         dset_val,

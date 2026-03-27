@@ -35,9 +35,9 @@ def setup_args():
     parser = argparse.ArgumentParser(description='Trajectory Prediction Evaluation')
     
     # Dataset parameters
-    parser.add_argument('--dataset', type=str, default='noaa_dec2021',
+    parser.add_argument('--dataset', type=str, default='marinecadastre_2021',
                         help='Dataset name (folder under ./dataset/)')
-    parser.add_argument('--split', type=str, default='val',
+    parser.add_argument('--split', type=str, default='test',
                         choices=['train', 'val', 'test'],
                         help='Which split to evaluate on')
     
@@ -46,8 +46,8 @@ def setup_args():
                         help='Path to model checkpoint (.pth file)')
     parser.add_argument('--obs_len', type=int, default=10,
                         help='Observation sequence length')
-    parser.add_argument('--pred_len', type=int, default=10,
-                        help='Prediction sequence length')
+    parser.add_argument('--pred_len', type=int, default=5,
+                        help='Prediction sequence length (5 × 10min = 50min, matches DualSTMA)')
     
     # Evaluation parameters
     parser.add_argument('--num_samples', type=int, default=20,
@@ -230,16 +230,26 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Load dataset
-    data_path = os.path.join('./dataset', args.dataset, args.split)
-    print(f"\nLoading dataset from: {data_path}")
-    
-    dataset = TrajectoryDataset(
-        data_path,
-        obs_len=args.obs_len,
-        pred_len=args.pred_len,
-        skip=1
-    )
+    # Use JSON dataset for marinecadastre_2021 (DualSTMA comparison)
+    if args.dataset == 'marinecadastre_2021':
+        from utils import TrajectoryDatasetJSON
+        json_path = os.path.join('./dataset', args.dataset, f'{args.split}.json')
+        print(f"\nLoading JSON dataset from: {json_path}")
+        dataset = TrajectoryDatasetJSON(
+            json_path,
+            obs_len=args.obs_len,
+            pred_len=args.pred_len,
+            skip=1
+        )
+    else:
+        data_path = os.path.join('./dataset', args.dataset, args.split)
+        print(f"\nLoading dataset from: {data_path}")
+        dataset = TrajectoryDataset(
+            data_path,
+            obs_len=args.obs_len,
+            pred_len=args.pred_len,
+            skip=1
+        )
     
     loader = DataLoader(
         dataset,
@@ -294,16 +304,25 @@ def main():
     
     # Print results
     print(f"\n{'='*80}")
-    print(f"EVALUATION RESULTS (Best-of-{args.num_samples}) - PAPER ALIGNED")
+    print(f"EVALUATION RESULTS (Best-of-{args.num_samples}) - DualSTMA COMPARISON")
     print(f"{'='*80}")
     print(f"Dataset: {args.dataset} ({args.split} split)")
     print(f"Checkpoint: {args.checkpoint}")
     print(f"Total sequences: {results['total_sequences']}")
-    print(f"\nMetrics (in real-world coordinates - degrees):")
-    print(f"  minADE-{args.num_samples}: {results['minADE']:.6f}°")
-    print(f"  FDE (of best sample):      {results['FDE']:.6f}°")
-    print(f"\nNote: Metrics computed after denormalization using global_stats.json")
-    print(f"      Expected range: 0.001-0.003° (as per paper)")
+    print(f"obs_len={args.obs_len} × 10min = {args.obs_len*10}min observation")
+    print(f"pred_len={args.pred_len} × 10min = {args.pred_len*10}min prediction")
+    print(f"\nMetrics (degrees) — DualSTMA baseline for comparison:")
+    print(f"  {'Horizon':>8} | {'SMCHN (ours)':>14} | {'DualSTMA':>14}")
+    print(f"  {'-'*42}")
+    dualstma = {
+        'ADE': {10: 0.000609, 20: 0.000853, 30: 0.001157, 40: 0.001522, 50: 0.002436},
+        'FDE': {10: 0.000807, 20: 0.001164, 30: 0.001771, 40: 0.002378, 50: 0.003946},
+    }
+    horizon_min = args.pred_len * 10
+    print(f"  {'ADE':>8} | {results['minADE']:>14.6f}° | {dualstma['ADE'].get(horizon_min, 'N/A'):>14}")
+    print(f"  {'FDE':>8} | {results['FDE']:>14.6f}° | {dualstma['FDE'].get(horizon_min, 'N/A'):>14}")
+    print(f"\nNote: DualSTMA is deterministic; SMCHN uses best-of-{args.num_samples} sampling.")
+    print(f"      Metrics in degrees (lower is better).")
     print(f"{'='*80}")
     
     # Optionally save detailed results
