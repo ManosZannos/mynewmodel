@@ -356,17 +356,6 @@ class SparseGraphConvolution(nn.Module):
 
 
 class TCN(nn.Module):
-    """
-    Temporal Convolutional Network using Conv2d (original repo).
-    
-    Paper Section 3.2.4: causal left padding.
-    Input:  (N, T, num_heads, emb)
-    Output: (N, pred_len, num_heads, emb)
-    
-    Uses Conv2d with padding on both spatial dims to preserve shape
-    then maps obs_len → pred_len via fin→fout channels.
-    """
-
     def __init__(self, fin, fout, layers=3, ksize=3):
         super(TCN, self).__init__()
         self.fin = fin
@@ -376,12 +365,11 @@ class TCN(nn.Module):
 
         self.convs = nn.ModuleList()
         for i in range(self.layers):
-            self.convs.append(nn.Conv2d(self.fin, self.fout, kernel_size=self.ksize))
+            in_ch = fin if i == 0 else fout   # ← μόνο το πρώτο layer παίρνει fin
+            self.convs.append(nn.Conv2d(in_ch, fout, kernel_size=self.ksize))
 
     def forward(self, x):
-        # x: [N, fin, num_heads, emb]
         for conv in self.convs:
-            # Causal padding on both dims
             x = F.pad(x, (self.ksize - 1, 0, self.ksize - 1, 0))
             x = conv(x)
         return x
