@@ -63,6 +63,8 @@ else:
 
     all_ok = True
     for col, s in stats.items():
+        if not isinstance(s, dict):  # skip _note and other non-dict entries
+            continue
         mean, std = s["mean"], s["std"]
         exp = EXPECTED.get(col, {})
         mean_ok = exp.get("mean", (None, None))
