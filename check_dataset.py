@@ -21,12 +21,12 @@ import glob
 import numpy as np
 import pandas as pd
 
-DATASET_NAME = "noaa_dec2021"
+DATASET_NAME = "marinecadastre_2021"
 DATASET_BASE = os.path.join("dataset", DATASET_NAME)
 GLOBAL_STATS_PATH = os.path.join(DATASET_BASE, "global_stats.json")
 
 OBS_LEN = 10
-PRED_LEN = 10
+PRED_LEN = 5
 SEQ_LEN = OBS_LEN + PRED_LEN
 MAX_GAP_MINUTES = 1   # after resampling, gap > 1 min = new segment
 MIN_NEIGHBOURS = 1    # minimum other vessels needed per window
