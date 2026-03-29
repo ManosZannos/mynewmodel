@@ -21,14 +21,14 @@ import glob
 import numpy as np
 import pandas as pd
 
-DATASET_NAME = "marinecadastre_2021"
+DATASET_NAME = "noaa_dec2021"
 DATASET_BASE = os.path.join("dataset", DATASET_NAME)
 GLOBAL_STATS_PATH = os.path.join(DATASET_BASE, "global_stats.json")
 
 OBS_LEN = 10
-PRED_LEN = 5    # DualSTMA: 5 × 10min = 50min
+PRED_LEN = 10
 SEQ_LEN = OBS_LEN + PRED_LEN
-MAX_GAP_MINUTES = 1   # after 10-min resampling, gap > 1 step = new segment
+MAX_GAP_MINUTES = 1   # after resampling, gap > 1 min = new segment
 MIN_NEIGHBOURS = 1    # minimum other vessels needed per window
 
 SPLITS = ["train", "val", "test"]
@@ -51,11 +51,14 @@ else:
     with open(GLOBAL_STATS_PATH) as f:
         stats = json.load(f)
 
+    # Expected ranges for METO-S2S min-max normalization (from max_min.json)
+    # global_stats stores: mean=min_value, std=range_value
+    # actual = norm * std + mean
     EXPECTED = {
-        "LON": {"mean": (-120.0, -114.0), "std": (0.5, 5.0)},
-        "LAT": {"mean": (28.0, 35.0),     "std": (0.5, 5.0)},
-        "SOG": {"mean": (0.5, 40.0),      "std": (0.5, 15.0)},
-        "Heading": {"mean": (0, 360),     "std": (50, 150)},
+        "LON": {"mean": (-133.30, -133.29), "std": (72.0, 73.0)},
+        "LAT": {"mean": (20.90,   20.91),   "std": (28.0, 29.0)},
+        "SOG": {"mean": (-0.1,    0.1),     "std": (29.0, 32.0)},
+        "Heading": {"mean": (-0.1, 0.1),    "std": (3.0,  3.2)},
     }
 
     all_ok = True

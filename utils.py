@@ -425,7 +425,7 @@ class TrajectoryDataset(Dataset):
         self,
         data_dir,
         obs_len=10,
-        pred_len=5,
+        pred_len=10,
         skip=1,
         threshold=0.002,
         min_ped=1,
@@ -580,21 +580,14 @@ class TrajectoryDataset(Dataset):
         ]
 
 # ============================================================================
-# TRAJECTORY DATASET JSON (DualSTMA comparison — METO-S2S format)
-# Reads train.json / val.json / test.json directly, no CSV conversion needed.
-#
-# JSON format (per trajectory, per point):
-#   [timestamp_ms, lon_norm, lat_norm, sog_norm, heading_norm,
-#    distance, vessel_type, month, day, hour, lon_raw, lat_raw, mmsi]
-#
-# global_stats.json is computed from lon_raw / lat_raw in train.json
-# and is needed by evaluate.py for denormalization.
+# METO-S2S JSON UTILITIES
+# JSON field indices (verified against max_min.json):
+#   JSON[1] = LAT_norm, JSON[2] = LON_norm  (lat comes first!)
 # ============================================================================
 
-# Field indices in each JSON point
 _J_TIMESTAMP  = 0
-_J_LON_NORM   = 1
-_J_LAT_NORM   = 2
+_J_LAT_NORM   = 1   # JSON[1] = lat_norm
+_J_LON_NORM   = 2   # JSON[2] = lon_norm
 _J_SOG_NORM   = 3
 _J_HEAD_NORM  = 4
 _J_LON_RAW    = 10
@@ -645,209 +638,3 @@ def compute_global_stats_from_json(train_json_path: str) -> dict:
     print(f"  LAT: mean={stats['LAT']['mean']:.4f}, std={stats['LAT']['std']:.4f}")
 
     return stats
-
-
-class TrajectoryDatasetJSON(Dataset):
-    """
-    Dataset loader for METO-S2S JSON format (DualSTMA comparison).
-
-    Reads train.json / val.json / test.json directly.
-    Each JSON file is a list of trajectories.
-    Each trajectory is a list of points:
-      [timestamp_ms, lon_norm, lat_norm, sog_norm, heading_norm,
-       distance, vessel_type, month, day, hour, lon_raw, lat_raw, mmsi]
-
-    Data is already normalized by METO-S2S preprocessing.
-    Sampling interval: 10 min (DualSTMA-aligned).
-
-    Sliding window per trajectory (not per frame like TrajectoryDataset):
-      - obs_len=10 × 10min = 100min observation
-      - pred_len=5  × 10min = 50min prediction
-
-    Interaction graph: all vessels sharing the same timestamp window.
-    Built by grouping trajectories by their timestamp overlap.
-    """
-
-    def __init__(
-        self,
-        json_path: str,
-        obs_len: int = 10,
-        pred_len: int = 5,
-        skip: int = 1,
-        threshold: float = 0.002,
-        min_ped: int = 1,
-    ):
-        import json as _json
-
-        super(TrajectoryDatasetJSON, self).__init__()
-
-        self.obs_len  = obs_len
-        self.pred_len = pred_len
-        self.seq_len  = obs_len + pred_len
-        self.skip     = skip
-        self.max_peds_in_frame = 0
-
-        print(f"Loading {json_path} ...")
-        with open(json_path, "r") as f:
-            raw = _json.load(f)
-        print(f"  {len(raw)} trajectories loaded")
-
-        # ── Build frame_id → list of (vessel_idx, point_idx) ────────────
-        # frame_id = timestamp_ms // (10 * 60 * 1000)  [10-min units]
-        # We need to find windows where multiple vessels co-exist.
-
-        # Step 1: convert each trajectory to numpy array and assign frame_ids
-        trajs = []   # list of (mmsi, frames_array, feat_array)
-        for traj in raw:
-            if len(traj) < self.seq_len:
-                continue
-            mmsi   = traj[0][_J_MMSI]
-            frames = np.array([p[_J_TIMESTAMP] // (10 * 60 * 1000) for p in traj], dtype=np.int64)
-            feats  = np.array(
-                [[p[_J_LON_NORM], p[_J_LAT_NORM], p[_J_SOG_NORM], p[_J_HEAD_NORM]] for p in traj],
-                dtype=np.float32
-            )  # (T, 4)
-            trajs.append((mmsi, frames, feats))
-
-        print(f"  {len(trajs)} trajectories with >= {self.seq_len} points")
-
-        # Step 2: build frame → set of traj indices
-        frame_to_trajs: dict = {}
-        for ti, (mmsi, frames, feats) in enumerate(trajs):
-            for fi, fid in enumerate(frames):
-                if fid not in frame_to_trajs:
-                    frame_to_trajs[fid] = []
-                frame_to_trajs[fid].append((ti, fi))
-
-        # Step 3: sliding window per trajectory
-        num_peds_in_seq  = []
-        seq_list         = []
-        seq_list_rel     = []
-        loss_mask_list   = []
-        non_linear_ped_list = []
-
-        for ti, (mmsi, frames, feats) in enumerate(trajs):
-            T = len(frames)
-            num_windows = max(0, (T - self.seq_len) // self.skip + 1)
-
-            for w in range(0, num_windows * self.skip, self.skip):
-                if w + self.seq_len > T:
-                    break
-
-                # Frame IDs for this window
-                win_frames = frames[w: w + self.seq_len]
-
-                # Check continuity (no gaps > 1 step in the anchor trajectory)
-                if np.any(np.diff(win_frames) != 1):
-                    continue
-
-                # Find all vessels that are present in ALL frames of this window
-                # (intersection of vessel sets across all window frame_ids)
-                present_sets = [
-                    set(idx for idx, _ in frame_to_trajs.get(fid, []))
-                    for fid in win_frames
-                ]
-                common_traj_idxs = set.intersection(*present_sets) if present_sets else set()
-                common_traj_idxs = sorted(common_traj_idxs)
-
-                if len(common_traj_idxs) <= min_ped:
-                    continue
-
-                self.max_peds_in_frame = max(self.max_peds_in_frame, len(common_traj_idxs))
-
-                N = len(common_traj_idxs)
-                curr_seq      = np.zeros((N, 4, self.seq_len), dtype=np.float32)
-                curr_seq_rel  = np.zeros((N, 4, self.seq_len), dtype=np.float32)
-                curr_loss_mask = np.zeros((N, self.seq_len), dtype=np.float32)
-                _non_linear   = []
-                num_considered = 0
-
-                for ni, cti in enumerate(common_traj_idxs):
-                    _, c_frames, c_feats = trajs[cti]
-
-                    # Find the point index in this trajectory for win_frames[0]
-                    matches = np.where(c_frames == win_frames[0])[0]
-                    if len(matches) == 0:
-                        continue
-                    start_fi = matches[0]
-                    end_fi   = start_fi + self.seq_len
-
-                    if end_fi > len(c_frames):
-                        continue
-
-                    # Check this vessel is also continuous
-                    if np.any(np.diff(c_frames[start_fi:end_fi]) != 1):
-                        continue
-
-                    feat_seq = c_feats[start_fi:end_fi].T  # (4, seq_len)
-                    rel_feat_seq = np.zeros_like(feat_seq)
-                    rel_feat_seq[:, 1:] = feat_seq[:, 1:] - feat_seq[:, :-1]
-
-                    curr_seq[num_considered]      = feat_seq
-                    curr_seq_rel[num_considered]  = rel_feat_seq
-                    curr_loss_mask[num_considered] = 1.0
-
-                    _non_linear.append(poly_fit(feat_seq, pred_len, threshold))
-                    num_considered += 1
-
-                if num_considered <= min_ped:
-                    continue
-
-                non_linear_ped_list += _non_linear[:num_considered]
-                num_peds_in_seq.append(num_considered)
-                loss_mask_list.append(curr_loss_mask[:num_considered])
-                seq_list.append(curr_seq[:num_considered])
-                seq_list_rel.append(curr_seq_rel[:num_considered])
-
-        if not seq_list:
-            raise ValueError(
-                f"No valid sequences from {json_path}. "
-                "Check obs_len/pred_len and trajectory lengths."
-            )
-
-        print(f"  Total sequences: {len(seq_list)}")
-        self.num_seq = len(seq_list)
-
-        seq_arr        = np.concatenate(seq_list,       axis=0)
-        seq_rel_arr    = np.concatenate(seq_list_rel,   axis=0)
-        loss_mask_arr  = np.concatenate(loss_mask_list, axis=0)
-        non_linear_arr = np.asarray(non_linear_ped_list, dtype=np.float32)
-
-        self.obs_traj      = torch.from_numpy(seq_arr[:, :, :self.obs_len]).float()
-        self.pred_traj     = torch.from_numpy(seq_arr[:, :, self.obs_len:]).float()
-        self.obs_traj_rel  = torch.from_numpy(seq_rel_arr[:, :, :self.obs_len]).float()
-        self.pred_traj_rel = torch.from_numpy(seq_rel_arr[:, :, self.obs_len:]).float()
-        self.loss_mask     = torch.from_numpy(loss_mask_arr).float()
-        self.non_linear_ped = torch.from_numpy(non_linear_arr).float()
-
-        cum_start_idx = [0] + np.cumsum(num_peds_in_seq).tolist()
-        self.seq_start_end = [(s, e) for s, e in zip(cum_start_idx, cum_start_idx[1:])]
-
-        self.v_obs  = []
-        self.v_pred = []
-        print("Processing graph tensors...")
-        pbar = tqdm(total=len(self.seq_start_end))
-        for ss in range(len(self.seq_start_end)):
-            pbar.update(1)
-            start, end = self.seq_start_end[ss]
-            v_ = seq_to_graph(self.obs_traj[start:end, :], self.obs_traj_rel[start:end, :], True)
-            self.v_obs.append(v_.clone())
-            v_ = seq_to_graph(self.pred_traj[start:end, :], self.pred_traj_rel[start:end, :], False)
-            self.v_pred.append(v_.clone())
-        pbar.close()
-
-    def __len__(self):
-        return self.num_seq
-
-    def __getitem__(self, index):
-        start, end = self.seq_start_end[index]
-        return [
-            self.obs_traj[start:end, :],
-            self.pred_traj[start:end, :],
-            self.obs_traj_rel[start:end, :],
-            self.pred_traj_rel[start:end, :],
-            self.non_linear_ped[start:end],
-            self.loss_mask[start:end, :],
-            self.v_obs[index],
-            self.v_pred[index],
-        ]
