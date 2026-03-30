@@ -31,7 +31,7 @@ print(f"  Device: {device}")
 print(colored("\n1️⃣ Testing Dataset Loading...", "yellow"))
 
 # Check if preprocessed data exists
-dataset_path = os.path.join('./dataset', 'marinecadastre_2021', 'train')
+dataset_path = './dataset/noaa_dec2021/train'
 if os.path.exists(dataset_path):
     try:
         dataset = TrajectoryDataset(
@@ -83,7 +83,7 @@ try:
         dropout=0.0,
         obs_len=obs_len,
         pred_len=pred_len,
-        out_dims=2,  # Direct (lon, lat) velocity prediction
+        out_dims=2,  # deterministic: (lon_vel, lat_vel)
         num_heads=num_heads
     ).to(device)
     
@@ -111,10 +111,10 @@ try:
     print(colored("  ✓ Forward pass successful", "green"))
     print(f"    Input:  V_obs {list(V_obs.shape)}")
     print(f"    Output: V_pred {list(V_pred.shape)}")
-    print(f"    Expected: [pred_len={pred_len}, N={N}, 2]")
+    print(f"    Expected: [pred_len={pred_len}, N={N}, 5]")
     
     # Check shape
-    expected_shape = (pred_len, N, 2)
+    expected_shape = (pred_len, N, 5)
     actual_shape = tuple(V_pred.shape) if V_pred.dim() == 3 else tuple(V_pred.squeeze(0).shape)
     
     if actual_shape == expected_shape:
@@ -133,64 +133,64 @@ except Exception as e:
     exit(1)
 
 # ============================================================================
-# 3️⃣ Gaussian Sampling Test
+# 3️⃣ Deterministic Evaluation Test
 # ============================================================================
-print(colored("\n3️⃣ Testing Gaussian Sampling...", "yellow"))
+print(colored("\n3️⃣ Testing Deterministic Evaluation...", "yellow"))
 
 try:
-    num_samples = 20
-    samples = sample_bivariate_gaussian(V_pred, num_samples)
-    
-    print(colored("  ✓ Gaussian sampling successful", "green"))
-    print(f"    V_pred shape:  {list(V_pred.shape)}")  # [pred_len, N, 5]
-    print(f"    Samples shape: {list(samples.shape)}")  # [K, pred_len, N, 2]
-    print(f"    Expected: [K={num_samples}, pred_len={pred_len}, N={N}, 2]")
-    
-    # Check shape
-    expected_samples_shape = (num_samples, pred_len, N, 2)
-    if tuple(samples.shape) == expected_samples_shape:
-        print(colored("  ✓ Samples shape correct", "green"))
-    else:
-        print(colored(f"  ⚠ Samples shape mismatch", "yellow"))
-        
+    LAT_MIN, LAT_RANGE = 20.90883, 28.32044
+    LON_MIN, LON_RANGE = -133.29703, 72.60811
+
+    last_obs = obs_traj.squeeze(0)[:, :2, -1]  # [N, 2]
+    pred_abs = torch.cumsum(V_pred, dim=0) + last_obs.unsqueeze(0)  # [pred_len, N, 2]
+
+    pred_lon = pred_abs[:, :, 0] * LON_RANGE + LON_MIN
+    pred_lat = pred_abs[:, :, 1] * LAT_RANGE + LAT_MIN
+
+    gt_abs = pred_traj_gt.squeeze(0).permute(2, 0, 1)[:, :, :2]
+    gt_lon = gt_abs[:, :, 0] * LON_RANGE + LON_MIN
+    gt_lat = gt_abs[:, :, 1] * LAT_RANGE + LAT_MIN
+
+    disp = torch.sqrt((pred_lon - gt_lon)**2 + (pred_lat - gt_lat)**2)
+    ade = disp.mean().item()
+    fde = disp[-1].mean().item()
+
+    print(colored("  ✓ Deterministic evaluation successful", "green"))
+    print(f"    V_pred shape: {list(V_pred.shape)}  (deterministic, out_dims=2)")
+    print(f"    ADE (dummy data): {ade:.4f}°")
+    print(f"    FDE (dummy data): {fde:.4f}°")
+
 except Exception as e:
-    print(colored(f"  ✗ Gaussian sampling failed: {e}", "red"))
+    print(colored(f"  ✗ Deterministic evaluation failed: {e}", "red"))
     import traceback
     traceback.print_exc()
     exit(1)
 
 # ============================================================================
-# 4️⃣ Best-of-K Evaluation Test
+# 4️⃣ Loss Function Test
 # ============================================================================
-print(colored("\n4️⃣ Testing Best-of-K Evaluation...", "yellow"))
+print(colored("\n4️⃣ Testing Loss Function...", "yellow"))
 
 try:
-    # Ground truth (use first 2 features: LON, LAT)
-    V_target = V_tr.squeeze(0)[:, :, :2]  # [pred_len, N, 2]
-    
-    # Evaluate
-    results = evaluate_best_of_k(V_pred, V_target, num_samples=num_samples)
-    
-    print(colored("  ✓ Best-of-K evaluation successful", "green"))
-    print(f"    V_pred shape:   {list(V_pred.shape)}")    # [pred_len, N, 5]
-    print(f"    V_target shape: {list(V_target.shape)}")  # [pred_len, N, 2]
-    print(f"    minADE-{num_samples}: {results['minADE']:.4f}")
-    print(f"    FDE (best sample): {results['FDE']:.4f}")
-    print(f"    Best sample shape: {list(results['best_sample'].shape)}")
-    
-    # Check return keys
-    expected_keys = {'minADE', 'FDE', 'best_sample', 'all_ade_values'}
-    actual_keys = set(results.keys())
-    
-    if expected_keys == actual_keys:
-        print(colored("  ✓ Return dict keys correct", "green"))
-    else:
-        print(colored(f"  ⚠ Return dict keys mismatch", "yellow"))
-        print(f"    Expected: {expected_keys}")
-        print(f"    Actual: {actual_keys}")
-        
+    from torch.nn import functional as F_test
+
+    V_target = V_tr.squeeze(0)  # [pred_len, N, 4]
+    last_obs_loss = obs_traj.squeeze(0)[:, :2, -1]
+
+    pred_pos = torch.cumsum(V_pred, dim=0) + last_obs_loss.unsqueeze(0)
+    gt_pos   = torch.cumsum(V_target[:, :, :2], dim=0) + last_obs_loss.unsqueeze(0)
+
+    pos_loss = F_test.huber_loss(pred_pos, gt_pos)
+    vel_loss = F_test.huber_loss(V_pred, V_target[:, :, :2])
+    total_loss = 10.0 * pos_loss + 0.1 * vel_loss
+
+    print(colored("  ✓ Loss function successful", "green"))
+    print(f"    pos_loss:   {pos_loss.item():.6f}")
+    print(f"    vel_loss:   {vel_loss.item():.6f}")
+    print(f"    total_loss: {total_loss.item():.6f}")
+
 except Exception as e:
-    print(colored(f"  ✗ Best-of-K evaluation failed: {e}", "red"))
+    print(colored(f"  ✗ Loss function failed: {e}", "red"))
     import traceback
     traceback.print_exc()
     exit(1)
@@ -201,48 +201,27 @@ except Exception as e:
 print(colored("\n5️⃣ Shape Consistency Summary...", "yellow"))
 
 shape_checks = {
-    "V_obs (input)": V_obs.shape,
-    "V_tr (ground truth)": V_tr.shape,
+    "V_obs (input)":        V_obs.shape,
+    "V_tr (ground truth)":  V_tr.shape,
     "V_pred (model output)": V_pred.shape,
-    "V_target (LON, LAT)": V_target.shape,
-    "samples (Gaussian)": samples.shape,
-    "best_sample": results['best_sample'].shape,
 }
 
 print(colored("  All shapes:", "cyan"))
 for name, shape in shape_checks.items():
     print(f"    {name:25s}: {list(shape)}")
 
-# Final checks
 all_passed = True
 
-# Check V_pred has 5 Gaussian parameters
-if V_pred.shape[-1] == 5:
-    print(colored("\n  ✓ V_pred has 5 Gaussian parameters (μx, μy, log(σx), log(σy), ρ)", "green"))
+if V_pred.shape[-1] == 2:
+    print(colored("\n  ✓ V_pred has 2 outputs (lon_vel, lat_vel) — deterministic", "green"))
 else:
-    print(colored(f"\n  ✗ V_pred should have 5 parameters, got {V_pred.shape[-1]}", "red"))
+    print(colored(f"\n  ✗ V_pred should have 2 outputs, got {V_pred.shape[-1]}", "red"))
     all_passed = False
 
-# Check V_target has 2 coordinates
-if V_target.shape[-1] == 2:
-    print(colored("  ✓ V_target has 2 coordinates (LON, LAT)", "green"))
+if V_obs.shape[-1] == 6:
+    print(colored("  ✓ V_obs has 6 features (LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel)", "green"))
 else:
-    print(colored(f"  ✗ V_target should have 2 coordinates, got {V_target.shape[-1]}", "red"))
-    all_passed = False
-
-# Check samples dimensions
-if samples.shape[0] == num_samples and samples.shape[-1] == 2:
-    print(colored(f"  ✓ Samples: K={num_samples} trajectories with 2D positions", "green"))
-else:
-    print(colored("  ✗ Samples shape incorrect", "red"))
-    all_passed = False
-
-# Check best_sample matches V_target shape
-if results['best_sample'].shape == V_target.shape:
-    print(colored("  ✓ Best sample shape matches V_target", "green"))
-else:
-    print(colored("  ✗ Best sample shape mismatch", "red"))
-    all_passed = False
+    print(colored(f"  ⚠ V_obs has {V_obs.shape[-1]} features (expected 6)", "yellow"))
 
 # ============================================================================
 # Final Summary
