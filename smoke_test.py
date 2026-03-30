@@ -83,7 +83,7 @@ try:
         dropout=0.0,
         obs_len=obs_len,
         pred_len=pred_len,
-        out_dims=5,  # Gaussian parameters
+        out_dims=2,  # Direct (lon, lat) velocity prediction
         num_heads=num_heads
     ).to(device)
     
@@ -111,10 +111,10 @@ try:
     print(colored("  ✓ Forward pass successful", "green"))
     print(f"    Input:  V_obs {list(V_obs.shape)}")
     print(f"    Output: V_pred {list(V_pred.shape)}")
-    print(f"    Expected: [pred_len={pred_len}, N={N}, 5]")
+    print(f"    Expected: [pred_len={pred_len}, N={N}, 2]")
     
     # Check shape
-    expected_shape = (pred_len, N, 5)
+    expected_shape = (pred_len, N, 2)
     actual_shape = tuple(V_pred.shape) if V_pred.dim() == 3 else tuple(V_pred.squeeze(0).shape)
     
     if actual_shape == expected_shape:

@@ -101,10 +101,17 @@ def setup_args():
 
 
 def evaluate_model(model, loader, device, num_samples=20):
+    """
+    Evaluate deterministic SMCHN model (out_dims=2).
+
+    Model predicts velocity (lon_vel, lat_vel) directly.
+    ADE/FDE computed in real-world degrees using METO-S2S denormalization.
+    """
     model.eval()
 
     all_ade = []
     all_fde = []
+    step_ade = [[] for _ in range(5)]
     total   = 0
 
     with torch.no_grad():
@@ -120,35 +127,38 @@ def evaluate_model(model, loader, device, num_samples=20):
             identity_temporal = torch.ones((N, T, T), device=device) * torch.eye(T, device=device)
             identity = [identity_spatial, identity_temporal]
 
-            # Forward pass → velocities in norm space [pred_len, N, 5]
+            # Forward pass → [pred_len, N, 2] velocities (deterministic)
             V_pred = model(V_obs, identity)
             V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
 
             # Last observed absolute position (norm space): [N, 2]
-            last_obs = obs_traj.squeeze(0)[:, :2, -1]  # [N, 2]
+            last_obs = obs_traj.squeeze(0)[:, :2, -1]
 
             # Cumsum of predicted velocities → absolute positions in norm space
-            mu_vel = V_pred[:, :, :2]                                       # [pred_len, N, 2]
-            mu_abs = torch.cumsum(mu_vel, dim=0) + last_obs.unsqueeze(0)   # [pred_len, N, 2]
-
-            V_pred_abs = V_pred.clone()
-            V_pred_abs[:, :, :2] = mu_abs
+            pred_abs = torch.cumsum(V_pred, dim=0) + last_obs.unsqueeze(0)  # [pred_len, N, 2]
 
             # Ground truth absolute positions (norm space): [pred_len, N, 2]
-            V_target = pred_traj_gt.squeeze(0).permute(2, 0, 1)[:, :, :2]
+            gt_abs = pred_traj_gt.squeeze(0).permute(2, 0, 1)[:, :, :2]
 
-            # Denormalize both to real-world degrees
-            V_pred_deg  = denormalize_predictions(V_pred_abs)
-            V_target_deg = denormalize_target(V_target)
+            # Denormalize both to degrees
+            pred_lon = pred_abs[:, :, 0] * LON_RANGE + LON_MIN
+            pred_lat = pred_abs[:, :, 1] * LAT_RANGE + LAT_MIN
+            gt_lon   = gt_abs[:, :, 0]   * LON_RANGE + LON_MIN
+            gt_lat   = gt_abs[:, :, 1]   * LAT_RANGE + LAT_MIN
 
-            results = evaluate_best_of_k(V_pred_deg, V_target_deg, num_samples=num_samples)
-            all_ade.append(results['minADE'])
-            all_fde.append(results['FDE'])
+            # Displacement per step: [pred_len, N]
+            disp = torch.sqrt((pred_lon - gt_lon)**2 + (pred_lat - gt_lat)**2)
+
+            all_ade.append(disp.mean().item())
+            all_fde.append(disp[-1].mean().item())
+            for t in range(min(5, disp.shape[0])):
+                step_ade[t].append(disp[t].mean().item())
             total += 1
 
     return {
         'minADE':          float(np.mean(all_ade)),
         'FDE':             float(np.mean(all_fde)),
+        'step_ade':        [float(np.mean(s)) for s in step_ade],
         'total_sequences': total,
     }
 
@@ -171,7 +181,7 @@ def main():
     print(f"  LAT: min={LAT_MIN}, range={LAT_RANGE}  → [{LAT_MIN:.2f}, {LAT_MIN+LAT_RANGE:.2f}]°")
     print(f"  LON: min={LON_MIN}, range={LON_RANGE} → [{LON_MIN:.2f}, {LON_MIN+LON_RANGE:.2f}]°")
 
-    # Initialize model
+    # Initialize model (deterministic, out_dims=2)
     model = TrajectoryModel(
         number_asymmetric_conv_layer=2,
         embedding_dims=args.embedding_dims,
@@ -179,7 +189,7 @@ def main():
         dropout=0.0,
         obs_len=args.obs_len,
         pred_len=args.pred_len,
-        out_dims=5,
+        out_dims=2,
         num_heads=args.num_heads
     ).to(device)
 
@@ -200,22 +210,34 @@ def main():
     fde_d   = dualstma['FDE'].get(horizon)
 
     print(f"\n{'='*70}")
-    print(f"EVALUATION RESULTS (Best-of-{args.num_samples}) — DualSTMA COMPARISON")
+    print(f"EVALUATION RESULTS — DualSTMA COMPARISON")
     print(f"{'='*70}")
     print(f"Dataset:   {args.dataset} ({args.split})")
     print(f"Sequences: {results['total_sequences']}")
-    print(f"Horizon:   {args.pred_len} steps × 10min = {horizon}min")
+    print(f"Model:     deterministic (out_dims=2, Huber position loss)")
     print()
-    print(f"  {'Metric':>6} | {'SMCHN (ours)':>14} | {'DualSTMA':>12} | {'Ratio':>8}")
+    print(f"  {'Horizon':>8} | {'SMCHN (ours)':>14} | {'DualSTMA':>12} | {'Ratio':>8}")
     print(f"  {'-'*52}")
 
-    for metric, val, ref in [('ADE', results['minADE'], ade_d), ('FDE', results['FDE'], fde_d)]:
-        ratio = f"{val/ref:.2f}x" if ref else "N/A"
-        ref_s = f"{ref}" if ref else "N/A"
-        print(f"  {metric:>6} | {val:>13.6f}° | {ref_s:>12} | {ratio:>8}")
+    dualstma_ade = {10: 0.000609, 20: 0.000853, 30: 0.001157, 40: 0.001522, 50: 0.002436}
+    dualstma_fde = {10: 0.000807, 20: 0.001164, 30: 0.001771, 40: 0.002378, 50: 0.003946}
 
-    print()
-    print(f"Note: DualSTMA is deterministic; SMCHN uses best-of-{args.num_samples} sampling.")
+    for t, step_val in enumerate(results['step_ade']):
+        horizon = (t + 1) * 10
+        ref = dualstma_ade.get(horizon, None)
+        ratio = f"{step_val/ref:.2f}x" if ref else "N/A"
+        ref_s = f"{ref}" if ref else "N/A"
+        label = f"ADE {horizon}min"
+        print(f"  {label:>8} | {step_val:>13.6f}° | {ref_s:>12} | {ratio:>8}")
+
+    print(f"  {'-'*52}")
+    horizon = args.pred_len * 10
+    ade_d = dualstma_ade.get(horizon)
+    fde_d = dualstma_fde.get(horizon)
+    ade_ratio = f"{results['minADE']/ade_d:.2f}x" if ade_d else "N/A"
+    fde_ratio = f"{results['FDE']/fde_d:.2f}x" if fde_d else "N/A"
+    print(f"  {'ADE':>8} | {results['minADE']:>13.6f}° | {ade_d if ade_d else 'N/A':>12} | {ade_ratio:>8}")
+    print(f"  {'FDE':>8} | {results['FDE']:>13.6f}° | {fde_d if fde_d else 'N/A':>12} | {fde_ratio:>8}")
     print(f"{'='*70}")
 
     # Save

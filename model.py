@@ -410,7 +410,7 @@ class TrajectoryModel(nn.Module):
 
     def __init__(self,
                  number_asymmetric_conv_layer=2, embedding_dims=64, number_gcn_layers=1,
-                 dropout=0, obs_len=10, pred_len=5, out_dims=5, num_heads=4):
+                 dropout=0, obs_len=10, pred_len=5, out_dims=2, num_heads=4):
         super(TrajectoryModel, self).__init__()
 
         self.obs_len = obs_len
@@ -480,8 +480,8 @@ class TrajectoryModel(nn.Module):
         b, l, _, _ = features.shape
         features = features.contiguous().view(b, self.pred_len, -1)  # [N, pred_len, embedding_dims]
 
-        # Output projection: [N, pred_len, out_dims=5]
+        # Output projection: [N, pred_len, out_dims=2]
         prediction = self.output(features)
 
-        # Return: [pred_len, N, 5]
+        # Return: [pred_len, N, 2]
         return prediction.permute(1, 0, 2).contiguous()

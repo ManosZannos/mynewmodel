@@ -39,6 +39,7 @@ from torch.utils.tensorboard import SummaryWriter
 from metrics import *
 from model import *
 from utils import *
+from torch.nn import functional as F
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -61,8 +62,51 @@ class Logger(object):
         pass
 
 
-def graph_loss(V_pred, V_target):
-    return bivariate_loss(V_pred, V_target)
+def huber_loss(pred, target, delta=1.0):
+    """Huber loss — robust to outliers, used by DualSTMA."""
+    return F.huber_loss(pred, target, delta=delta, reduction='mean')
+
+
+def graph_loss(V_pred, V_target, last_obs):
+    """
+    DualSTMA-aligned loss (Section 3.4):
+      L = 10 * L_position + 0.1 * L_velocity
+
+    L_position: short-term weighted Huber loss on absolute positions.
+      Cumsum of predicted velocities gives absolute positions.
+      Earlier steps weighted more (critical for collision avoidance).
+
+    L_velocity: Huber loss on predicted vs GT velocities.
+      Auxiliary task to keep velocity predictions physically consistent.
+
+    Args:
+        V_pred:   [pred_len, N, 2] — predicted (lon_vel, lat_vel)
+        V_target: [pred_len, N, 4] — GT velocities (first 2 = lon_vel, lat_vel)
+        last_obs: [N, 2]           — last observed absolute position (norm space)
+    """
+    pred_len = V_pred.shape[0]
+
+    # Velocity loss
+    vel_loss = huber_loss(V_pred, V_target[:, :, :2])
+
+    # Position loss: cumsum of velocities → absolute positions
+    pred_pos = torch.cumsum(V_pred, dim=0) + last_obs.unsqueeze(0)   # [pred_len, N, 2]
+    gt_pos   = torch.cumsum(V_target[:, :, :2], dim=0) + last_obs.unsqueeze(0)
+
+    # Short-term weighting: step t gets weight (pred_len - t) / sum
+    # Step 0 (10min) → highest weight, step 4 (50min) → lowest
+    weights = torch.tensor(
+        [(pred_len - t) for t in range(pred_len)],
+        dtype=torch.float32, device=V_pred.device
+    )
+    weights = weights / weights.sum()  # normalize
+
+    pos_loss = sum(
+        weights[t] * huber_loss(pred_pos[t], gt_pos[t])
+        for t in range(pred_len)
+    )
+
+    return 10.0 * pos_loss + 0.1 * vel_loss
 
 
 def make_identity(T, N, device):
@@ -105,15 +149,17 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
         identity = make_identity(T, N, device)
 
         V_pred = model(V_obs, identity)
-        V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 5]
+        V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 2]
 
-        # Target: V_tr contains velocities — matches original repo
-        # V_tr shape: [1, pred_len, N, 4] → squeeze → [pred_len, N, 4]
-        V_target = V_tr.squeeze(0)  # [pred_len, N, 4]
+        # Target: GT velocities [pred_len, N, 4]
+        V_target = V_tr.squeeze(0)
+
+        # Last observed absolute position for position loss
+        last_obs = obs_traj.squeeze(0)[:, :2, -1]  # [N, 2]
 
         # Gradient accumulation (original repo style)
         if batch_count % args.batch_size != 0 and cnt != turn_point:
-            l = graph_loss(V_pred, V_target)
+            l = graph_loss(V_pred, V_target, last_obs)
             if is_fst_loss:
                 loss = l
                 is_fst_loss = False
@@ -169,14 +215,13 @@ def vald(epoch, model, checkpoint_dir, loader_val):
             identity = make_identity(T, N, device)
 
             V_pred = model(V_obs, identity)
-            V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 5]
+            V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 2]
 
-            # Target: V_tr contains velocities — matches original repo
-            # V_tr shape: [1, pred_len, N, 4] → squeeze → [pred_len, N, 4]
             V_target = V_tr.squeeze(0)  # [pred_len, N, 4]
+            last_obs = obs_traj.squeeze(0)[:, :2, -1]  # [N, 2]
 
             if batch_count % args.batch_size != 0 and cnt != turn_point:
-                l = graph_loss(V_pred, V_target)
+                l = graph_loss(V_pred, V_target, last_obs)
                 if is_fst_loss:
                     loss = l
                     is_fst_loss = False
@@ -259,7 +304,7 @@ def main(args):
         dropout=0,
         obs_len=args.obs_len,
         pred_len=args.pred_len,
-        out_dims=5
+        out_dims=2   # deterministic (lon_vel, lat_vel) — no Gaussian parameters
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)

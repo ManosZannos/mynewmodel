@@ -354,35 +354,38 @@ def loc_pos(seq_):
 
 def seq_to_graph(seq_, seq_rel, pos_enc=False):
     """
-    Builds node feature tensor V from RELATIVE features (velocities).
+    Builds node feature tensor V combining absolute positions AND velocities.
 
-    Original repo (paper-faithful):
-      - V always contains seq_rel (velocities), NOT absolute positions
-      - When pos_enc=True, prepends a positional index as extra feature
-        → output shape: (seq_len, N, 5) with [pos_idx, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-      - When pos_enc=False:
-        → output shape: (seq_len, N, 4) with [LON_rel, LAT_rel, SOG_rel, Heading_rel]
+    Updated from original repo (DualSTMA ablation shows absolute position
+    gives +23% ADE improvement when combined with displacement):
+
+    When pos_enc=True (V_obs):
+      Output: (seq_len, N, 6) = [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
+      Replaces original [pos_idx, LON_rel, LAT_rel, SOG_rel, Heading_rel]
+
+    When pos_enc=False (V_pred/V_tr):
+      Output: (seq_len, N, 4) = [LON_rel, LAT_rel, SOG_rel, Heading_rel]
+      Unchanged from original.
 
     Args:
-        seq_:    (N, 4, seq_len) — absolute positions (used only for shape reference)
+        seq_:    (N, 4, seq_len) — absolute positions [LON, LAT, SOG, Heading]
         seq_rel: (N, 4, seq_len) — velocities (differences between consecutive steps)
-        pos_enc: if True, prepend positional index [1, 2, ..., seq_len]
+        pos_enc: if True, prepend absolute LON/LAT as extra features
 
     Returns:
-        V: torch.FloatTensor of shape (seq_len, N, 5) if pos_enc else (seq_len, N, 4)
+        V: torch.FloatTensor of shape (seq_len, N, 6) if pos_enc else (seq_len, N, 4)
     """
     assert seq_rel.dim() == 3, f"Expected seq_rel (N, F, T), got {seq_rel.shape}"
 
-    # Use all 4 features: LON_rel, LAT_rel, SOG_rel, Heading_rel
-    # seq_rel shape: (N, 4, seq_len) → permute → (seq_len, N, 4)
+    # Velocities: (N, 4, seq_len) → (seq_len, N, 4)
     V = seq_rel.permute(2, 0, 1).contiguous()  # (seq_len, N, 4)
 
     if pos_enc:
-        # Add positional index as first feature → (seq_len, N, 5)
-        # [pos_idx, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-        V_np = V.cpu().numpy()
-        V_np = loc_pos(V_np)  # (seq_len, N, 5)
-        return torch.from_numpy(V_np).float()
+        # Absolute positions: (N, 4, seq_len) → (seq_len, N, 2) — only LON, LAT
+        abs_pos = seq_.permute(2, 0, 1)[:, :, :2].contiguous()  # (seq_len, N, 2)
+        # Concatenate: [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
+        V = torch.cat([abs_pos, V], dim=-1)  # (seq_len, N, 6)
+        return V.float()
 
     return V.float()
 
