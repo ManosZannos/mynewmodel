@@ -31,7 +31,7 @@ print(f"  Device: {device}")
 print(colored("\n1️⃣ Testing Dataset Loading...", "yellow"))
 
 # Check if preprocessed data exists
-dataset_path = './dataset/noaa_dec2021/train'
+dataset_path = os.path.join('./dataset', 'marinecadastre_2021', 'train')
 if os.path.exists(dataset_path):
     try:
         dataset = TrajectoryDataset(
