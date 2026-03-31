@@ -157,7 +157,7 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
         # Last observed absolute position for position loss
         last_obs = obs_traj.squeeze(0)[:, :2, -1]  # [N, 2]
 
-        # Gradient accumulation (original repo style)
+        # Gradient accumulation — include current sample in loss before backward
         if batch_count % args.batch_size != 0 and cnt != turn_point:
             l = graph_loss(V_pred, V_target, last_obs)
             if is_fst_loss:
@@ -166,6 +166,11 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
             else:
                 loss += l
         else:
+            l = graph_loss(V_pred, V_target, last_obs)  # include last sample
+            if is_fst_loss:
+                loss = l
+            else:
+                loss += l
             loss = loss / args.batch_size
             is_fst_loss = True
 
@@ -228,6 +233,11 @@ def vald(epoch, model, checkpoint_dir, loader_val):
                 else:
                     loss += l
             else:
+                l = graph_loss(V_pred, V_target, last_obs)  # include last sample
+                if is_fst_loss:
+                    loss = l
+                else:
+                    loss += l
                 loss = loss / args.batch_size
                 is_fst_loss = True
                 loss_batch += loss.item()
@@ -278,7 +288,7 @@ def main(args):
         dset_train,
         batch_size=1,
         shuffle=True,
-        num_workers=0)
+        num_workers=4)
 
     dset_val = TrajectoryDataset(
         os.path.join(data_set, 'val'),
@@ -290,7 +300,7 @@ def main(args):
         dset_val,
         batch_size=1,
         shuffle=False,
-        num_workers=0)
+        num_workers=4)
 
     print('Training started ...')
     print(f'Using device: {device}')

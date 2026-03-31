@@ -18,12 +18,11 @@ Usage:
   python evaluate.py \\
     --dataset marinecadastre_2021 \\
     --checkpoint checkpoints/SMCHN_dualstma/marinecadastre_2021/val_best.pth \\
-    --split test --num_samples 20
+    --split test
 """
 
 import argparse
 import os
-import json
 import torch
 import numpy as np
 from torch.utils.data import DataLoader
@@ -31,7 +30,6 @@ from tqdm import tqdm
 
 from model import TrajectoryModel
 from utils import TrajectoryDataset
-from metrics import evaluate_best_of_k
 
 
 # ── METO-S2S normalization constants (from max_min.json) ──────────────────
@@ -45,43 +43,6 @@ LON_RANGE =  72.60811   # lon_max - lon_min = -60.68892 - (-133.29703)
 # LAT col (index 1 in features) = lat_norm  → denorm with LAT constants
 
 
-def denormalize_predictions(V_pred):
-    """
-    Denormalize predicted Gaussian parameters to real-world degrees.
-
-    V_pred: [pred_len, N, 5]  — (lon_norm_mu, lat_norm_mu, log_sx, log_sy, rho)
-
-    For min-max normalization x = x_norm * range + min:
-      mu_denorm = mu_norm * range + min
-      sigma_denorm = sigma_norm * range  →  log(sigma_denorm) = log(sigma_norm) + log(range)
-    """
-    V = V_pred.clone()
-    device = V.device
-
-    # μ LON (index 0)
-    V[:, :, 0] = V_pred[:, :, 0] * LON_RANGE + LON_MIN
-    # μ LAT (index 1)
-    V[:, :, 1] = V_pred[:, :, 1] * LAT_RANGE + LAT_MIN
-    # log(σ_lon)
-    V[:, :, 2] = V_pred[:, :, 2] + torch.log(torch.tensor(LON_RANGE, device=device))
-    # log(σ_lat)
-    V[:, :, 3] = V_pred[:, :, 3] + torch.log(torch.tensor(LAT_RANGE, device=device))
-    # ρ unchanged
-    return V
-
-
-def denormalize_target(V_target):
-    """
-    Denormalize ground truth positions to real-world degrees.
-
-    V_target: [pred_len, N, 2]  — (lon_norm, lat_norm)
-    """
-    V = V_target.clone()
-    V[:, :, 0] = V_target[:, :, 0] * LON_RANGE + LON_MIN
-    V[:, :, 1] = V_target[:, :, 1] * LAT_RANGE + LAT_MIN
-    return V
-
-
 def setup_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset',        type=str, default='marinecadastre_2021')
@@ -90,7 +51,6 @@ def setup_args():
     parser.add_argument('--checkpoint',     type=str, required=True)
     parser.add_argument('--obs_len',        type=int, default=10)
     parser.add_argument('--pred_len',       type=int, default=5)
-    parser.add_argument('--num_samples',    type=int, default=20)
     parser.add_argument('--batch_size',     type=int, default=1)
     parser.add_argument('--device',         type=str, default='cuda',
                         choices=['cuda', 'cpu'])
@@ -100,7 +60,7 @@ def setup_args():
     return parser.parse_args()
 
 
-def evaluate_model(model, loader, device, num_samples=20):
+def evaluate_model(model, loader, device):
     """
     Evaluate deterministic SMCHN model (out_dims=2).
 
@@ -156,7 +116,7 @@ def evaluate_model(model, loader, device, num_samples=20):
             total += 1
 
     return {
-        'minADE':          float(np.mean(all_ade)),
+        'ADE':             float(np.mean(all_ade)),
         'FDE':             float(np.mean(all_fde)),
         'step_ade':        [float(np.mean(s)) for s in step_ade],
         'total_sequences': total,
@@ -174,7 +134,9 @@ def main():
     dataset = TrajectoryDataset(
         data_path, obs_len=args.obs_len, pred_len=args.pred_len, skip=1
     )
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=False, num_workers=4
+    )
     print(f"Sequences: {len(dataset)}")
 
     print(f"\nNormalization (METO-S2S max_min.json):")
@@ -198,16 +160,15 @@ def main():
     print(f"\nCheckpoint loaded: {args.checkpoint}")
 
     # Evaluate
-    results = evaluate_model(model, loader, device, num_samples=args.num_samples)
+    results = evaluate_model(model, loader, device)
 
     # DualSTMA baseline (Huang et al., 2024, Table 2)
-    dualstma = {
-        'ADE': {10: 0.000609, 20: 0.000853, 30: 0.001157, 40: 0.001522, 50: 0.002436},
-        'FDE': {10: 0.000807, 20: 0.001164, 30: 0.001771, 40: 0.002378, 50: 0.003946},
-    }
+    dualstma_ade = {10: 0.000609, 20: 0.000853, 30: 0.001157, 40: 0.001522, 50: 0.002436}
+    dualstma_fde = {10: 0.000807, 20: 0.001164, 30: 0.001771, 40: 0.002378, 50: 0.003946}
+
     horizon = args.pred_len * 10
-    ade_d   = dualstma['ADE'].get(horizon)
-    fde_d   = dualstma['FDE'].get(horizon)
+    ade_d   = dualstma_ade.get(horizon)
+    fde_d   = dualstma_fde.get(horizon)
 
     print(f"\n{'='*70}")
     print(f"EVALUATION RESULTS — DualSTMA COMPARISON")
@@ -219,35 +180,28 @@ def main():
     print(f"  {'Horizon':>8} | {'SMCHN (ours)':>14} | {'DualSTMA':>12} | {'Ratio':>8}")
     print(f"  {'-'*52}")
 
-    dualstma_ade = {10: 0.000609, 20: 0.000853, 30: 0.001157, 40: 0.001522, 50: 0.002436}
-    dualstma_fde = {10: 0.000807, 20: 0.001164, 30: 0.001771, 40: 0.002378, 50: 0.003946}
-
     for t, step_val in enumerate(results['step_ade']):
-        horizon = (t + 1) * 10
-        ref = dualstma_ade.get(horizon, None)
+        h   = (t + 1) * 10
+        ref = dualstma_ade.get(h)
         ratio = f"{step_val/ref:.2f}x" if ref else "N/A"
         ref_s = f"{ref}" if ref else "N/A"
-        label = f"ADE {horizon}min"
-        print(f"  {label:>8} | {step_val:>13.6f}° | {ref_s:>12} | {ratio:>8}")
+        print(f"  {'ADE '+str(h)+'min':>8} | {step_val:>13.6f}° | {ref_s:>12} | {ratio:>8}")
 
     print(f"  {'-'*52}")
-    horizon = args.pred_len * 10
-    ade_d = dualstma_ade.get(horizon)
-    fde_d = dualstma_fde.get(horizon)
-    ade_ratio = f"{results['minADE']/ade_d:.2f}x" if ade_d else "N/A"
+    ade_ratio = f"{results['ADE']/ade_d:.2f}x" if ade_d else "N/A"
     fde_ratio = f"{results['FDE']/fde_d:.2f}x" if fde_d else "N/A"
-    print(f"  {'ADE':>8} | {results['minADE']:>13.6f}° | {ade_d if ade_d else 'N/A':>12} | {ade_ratio:>8}")
+    print(f"  {'ADE':>8} | {results['ADE']:>13.6f}° | {ade_d if ade_d else 'N/A':>12} | {ade_ratio:>8}")
     print(f"  {'FDE':>8} | {results['FDE']:>13.6f}° | {fde_d if fde_d else 'N/A':>12} | {fde_ratio:>8}")
     print(f"{'='*70}")
 
-    # Save
+    # Save results
     out_dir  = os.path.dirname(args.checkpoint)
-    out_file = os.path.join(out_dir, f'eval_{args.split}_K{args.num_samples}.txt')
+    out_file = os.path.join(out_dir, f'eval_{args.split}.txt')
     with open(out_file, 'w') as f:
-        f.write(f"SMCHN vs DualSTMA — {args.split}, best-of-{args.num_samples}\n")
+        f.write(f"SMCHN vs DualSTMA — {args.split}\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")
         f.write(f"Horizon: {horizon}min\n\n")
-        f.write(f"ADE: {results['minADE']:.6f}° (DualSTMA: {ade_d})\n")
+        f.write(f"ADE: {results['ADE']:.6f}° (DualSTMA: {ade_d})\n")
         f.write(f"FDE: {results['FDE']:.6f}° (DualSTMA: {fde_d})\n")
     print(f"Saved: {out_file}")
 

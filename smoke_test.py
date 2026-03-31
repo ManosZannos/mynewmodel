@@ -17,7 +17,7 @@ print(f"  CUDA available: {torch.cuda.is_available()}")
 
 # Test parameters
 obs_len = 10
-pred_len = 10
+pred_len = 5
 embedding_dims = 64
 num_gcn_layers = 1
 num_heads = 4
@@ -30,7 +30,10 @@ print(f"  Device: {device}")
 # ============================================================================
 print(colored("\n1️⃣ Testing Dataset Loading...", "yellow"))
 
-# Check if preprocessed data exists
+obs_traj = None
+pred_traj_gt = None
+dataset = None
+
 dataset_path = os.path.join('./dataset', 'marinecadastre_2021', 'train')
 if os.path.exists(dataset_path):
     try:
@@ -40,35 +43,34 @@ if os.path.exists(dataset_path):
             pred_len=pred_len,
             skip=1
         )
-        
+
         loader = DataLoader(
             dataset,
             batch_size=1,
             shuffle=False,
             num_workers=0
         )
-        
+
         # Get one batch
         batch = next(iter(loader))
         obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, \
         loss_mask, V_obs, V_tr = batch
-        
+
         print(colored("  ✓ Dataset loaded successfully", "green"))
         print(f"    Total sequences: {len(dataset)}")
-        print(f"    V_obs shape: {V_obs.shape}")  # [batch_size, obs_len, N, 4]
-        print(f"    V_tr shape:  {V_tr.shape}")   # [batch_size, pred_len, N, 4]
-        
+        print(f"    V_obs shape: {V_obs.shape}")  # [1, obs_len, N, 6]
+        print(f"    V_tr shape:  {V_tr.shape}")   # [1, pred_len, N, 4]
+
         # Move to device
         V_obs = V_obs.to(device)
         V_tr = V_tr.to(device)
-        
+
     except Exception as e:
         print(colored(f"  ✗ Dataset loading failed: {e}", "red"))
         dataset = None
 else:
     print(colored(f"  ⚠ Dataset not found at: {dataset_path}", "yellow"))
     print("    Skipping dataset tests (preprocessing not yet done)")
-    dataset = None
 
 # ============================================================================
 # 2️⃣ Model Forward Pass Test
@@ -86,46 +88,49 @@ try:
         out_dims=2,  # deterministic: (lon_vel, lat_vel)
         num_heads=num_heads
     ).to(device)
-    
+
     print(colored("  ✓ Model initialized", "green"))
-    
+
     # Test with dummy data if no dataset
     if dataset is None:
         batch_size = 1
         N = 20  # dummy number of vessels
-        # V_obs: [batch, obs_len, N, 5] = [pos_enc, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-        V_obs = torch.randn(batch_size, obs_len, N, 5).to(device)
-        V_tr = torch.randn(batch_size, pred_len, N, 4).to(device)
+        # V_obs: [batch, obs_len, N, 6] = [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
+        V_obs = torch.randn(batch_size, obs_len, N, 6).to(device)
+        V_tr  = torch.randn(batch_size, pred_len, N, 4).to(device)
+        # Dummy obs_traj / pred_traj_gt for downstream tests
+        obs_traj     = torch.zeros(batch_size, N, 4, obs_len)
+        pred_traj_gt = torch.zeros(batch_size, N, 4, pred_len)
         print(f"    Using dummy data: V_obs {V_obs.shape}")
-    
-    # Create identity matrices (original repo)
+
+    # Create identity matrices
     T = V_obs.shape[1]  # obs_len
     N = V_obs.shape[2]  # num vessels
     identity_spatial  = torch.ones((T, N, N), device=device) * torch.eye(N, device=device)
     identity_temporal = torch.ones((N, T, T), device=device) * torch.eye(T, device=device)
     identity = [identity_spatial, identity_temporal]
-    
+
     # Forward pass
     V_pred = model(V_obs, identity)
-    
+
     print(colored("  ✓ Forward pass successful", "green"))
     print(f"    Input:  V_obs {list(V_obs.shape)}")
     print(f"    Output: V_pred {list(V_pred.shape)}")
-    print(f"    Expected: [pred_len={pred_len}, N={N}, 5]")
-    
+    print(f"    Expected: [pred_len={pred_len}, N={N}, 2]")
+
     # Check shape
-    expected_shape = (pred_len, N, 5)
+    expected_shape = (pred_len, N, 2)
     actual_shape = tuple(V_pred.shape) if V_pred.dim() == 3 else tuple(V_pred.squeeze(0).shape)
-    
+
     if actual_shape == expected_shape:
         print(colored("  ✓ Output shape correct", "green"))
     else:
         print(colored(f"  ⚠ Output shape mismatch: {actual_shape} vs {expected_shape}", "yellow"))
-    
+
     # Ensure correct shape for next tests
     if V_pred.dim() == 4:
         V_pred = V_pred.squeeze(0)
-    
+
 except Exception as e:
     print(colored(f"  ✗ Model forward pass failed: {e}", "red"))
     import traceback
@@ -141,13 +146,13 @@ try:
     LAT_MIN, LAT_RANGE = 20.90883, 28.32044
     LON_MIN, LON_RANGE = -133.29703, 72.60811
 
-    last_obs = obs_traj.squeeze(0)[:, :2, -1]  # [N, 2]
+    last_obs = obs_traj.squeeze(0)[:, :2, -1].to(device)  # [N, 2]
     pred_abs = torch.cumsum(V_pred, dim=0) + last_obs.unsqueeze(0)  # [pred_len, N, 2]
 
     pred_lon = pred_abs[:, :, 0] * LON_RANGE + LON_MIN
     pred_lat = pred_abs[:, :, 1] * LAT_RANGE + LAT_MIN
 
-    gt_abs = pred_traj_gt.squeeze(0).permute(2, 0, 1)[:, :, :2]
+    gt_abs = pred_traj_gt.squeeze(0).permute(2, 0, 1)[:, :, :2].to(device)
     gt_lon = gt_abs[:, :, 0] * LON_RANGE + LON_MIN
     gt_lat = gt_abs[:, :, 1] * LAT_RANGE + LAT_MIN
 
@@ -157,8 +162,8 @@ try:
 
     print(colored("  ✓ Deterministic evaluation successful", "green"))
     print(f"    V_pred shape: {list(V_pred.shape)}  (deterministic, out_dims=2)")
-    print(f"    ADE (dummy data): {ade:.4f}°")
-    print(f"    FDE (dummy data): {fde:.4f}°")
+    print(f"    ADE: {ade:.4f}°")
+    print(f"    FDE: {fde:.4f}°")
 
 except Exception as e:
     print(colored(f"  ✗ Deterministic evaluation failed: {e}", "red"))
@@ -175,7 +180,7 @@ try:
     from torch.nn import functional as F_test
 
     V_target = V_tr.squeeze(0)  # [pred_len, N, 4]
-    last_obs_loss = obs_traj.squeeze(0)[:, :2, -1]
+    last_obs_loss = obs_traj.squeeze(0)[:, :2, -1].to(device)
 
     pred_pos = torch.cumsum(V_pred, dim=0) + last_obs_loss.unsqueeze(0)
     gt_pos   = torch.cumsum(V_target[:, :, :2], dim=0) + last_obs_loss.unsqueeze(0)
@@ -201,8 +206,8 @@ except Exception as e:
 print(colored("\n5️⃣ Shape Consistency Summary...", "yellow"))
 
 shape_checks = {
-    "V_obs (input)":        V_obs.shape,
-    "V_tr (ground truth)":  V_tr.shape,
+    "V_obs (input)":         V_obs.shape,
+    "V_tr (ground truth)":   V_tr.shape,
     "V_pred (model output)": V_pred.shape,
 }
 
@@ -222,6 +227,7 @@ if V_obs.shape[-1] == 6:
     print(colored("  ✓ V_obs has 6 features (LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel)", "green"))
 else:
     print(colored(f"  ⚠ V_obs has {V_obs.shape[-1]} features (expected 6)", "yellow"))
+    all_passed = False
 
 # ============================================================================
 # Final Summary
@@ -235,7 +241,7 @@ else:
     print(colored("  Review the errors above", "yellow"))
 
 if dataset is None:
-    print(colored("\n⚠ Note: Dataset not found. Run preprocessing first:", "yellow"))
-    print(colored("  python preprocess_ais.py", "cyan"))
-    
+    print(colored("\n⚠ Note: Dataset not found — ran with dummy data.", "yellow"))
+    print(colored("  Run: python convert_json_to_csv.py", "cyan"))
+
 print("="*80)

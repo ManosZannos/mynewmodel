@@ -163,8 +163,8 @@ class SpatialTemporalFusion(nn.Module):
         self.shortcut = nn.Sequential()
 
     def forward(self, x):
-        x = self.conv(x) + self.shortcut(x)
-        return x.squeeze()
+        # No squeeze — input (num_heads, T, N, N), all dims >= 2 in normal operation
+        return self.conv(x) + self.shortcut(x)
 
 
 class SparseWeightedAdjacency(nn.Module):
