@@ -25,6 +25,8 @@ parser.add_argument('--milestones', type=int, default=[0, 100],
 parser.add_argument('--use_lrschd', action="store_true", default=False,
                     help='Use lr rate scheduler')
 parser.add_argument('--tag', default='AddGCN_10_10', help='personal tag for the model')
+parser.add_argument('--resume', action="store_true", default=False,
+                    help='Resume training from last checkpoint')
 
 # Parse early to set CUDA device before importing torch
 args_early, _ = parser.parse_known_args()
@@ -35,6 +37,7 @@ import torch
 from torch import optim
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
 
 from metrics import *
 from model import *
@@ -72,13 +75,6 @@ def graph_loss(V_pred, V_target, last_obs):
     DualSTMA-aligned loss (Section 3.4):
       L = 10 * L_position + 0.1 * L_velocity
 
-    L_position: short-term weighted Huber loss on absolute positions.
-      Cumsum of predicted velocities gives absolute positions.
-      Earlier steps weighted more (critical for collision avoidance).
-
-    L_velocity: Huber loss on predicted vs GT velocities.
-      Auxiliary task to keep velocity predictions physically consistent.
-
     Args:
         V_pred:   [pred_len, N, 2] — predicted (lon_vel, lat_vel)
         V_target: [pred_len, N, 4] — GT velocities (first 2 = lon_vel, lat_vel)
@@ -90,16 +86,15 @@ def graph_loss(V_pred, V_target, last_obs):
     vel_loss = huber_loss(V_pred, V_target[:, :, :2])
 
     # Position loss: cumsum of velocities → absolute positions
-    pred_pos = torch.cumsum(V_pred, dim=0) + last_obs.unsqueeze(0)   # [pred_len, N, 2]
+    pred_pos = torch.cumsum(V_pred, dim=0) + last_obs.unsqueeze(0)
     gt_pos   = torch.cumsum(V_target[:, :, :2], dim=0) + last_obs.unsqueeze(0)
 
-    # Short-term weighting: step t gets weight (pred_len - t) / sum
-    # Step 0 (10min) → highest weight, step 4 (50min) → lowest
+    # Short-term weighting: step 0 (10min) → highest weight
     weights = torch.tensor(
         [(pred_len - t) for t in range(pred_len)],
         dtype=torch.float32, device=V_pred.device
     )
-    weights = weights / weights.sum()  # normalize
+    weights = weights / weights.sum()
 
     pos_loss = sum(
         weights[t] * huber_loss(pred_pos[t], gt_pos[t])
@@ -110,11 +105,6 @@ def graph_loss(V_pred, V_target, last_obs):
 
 
 def make_identity(T, N, device):
-    """
-    Identity matrices for self-connection (original repo).
-    spatial:  (T, N, N) — diagonal matrices stacked over T timesteps
-    temporal: (N, T, T) — diagonal matrices stacked over N vessels
-    """
     identity_spatial  = torch.ones((T, N, N), device=device) * torch.eye(N, device=device)
     identity_temporal = torch.ones((N, T, T), device=device) * torch.eye(T, device=device)
     return [identity_spatial, identity_temporal]
@@ -127,12 +117,13 @@ constant_metrics = {
 }
 
 
-def train(epoch, model, optimizer, checkpoint_dir, loader_train):
+def train(epoch, model, optimizer, checkpoint_dir, loader_train, scaler):
     global metrics, constant_metrics
     model.train()
 
     loss_batch = 0
     batch_count = 0
+    backward_count = 0
     is_fst_loss = True
     loader_len = len(loader_train)
     turn_point = int(loader_len / args.batch_size) * args.batch_size + \
@@ -148,25 +139,22 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
         N = V_obs.shape[2]
         identity = make_identity(T, N, device)
 
-        V_pred = model(V_obs, identity)
-        V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 2]
+        with autocast():
+            V_pred = model(V_obs, identity)
+            V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
 
-        # Target: GT velocities [pred_len, N, 4]
-        V_target = V_tr.squeeze(0)
+            V_target = V_tr.squeeze(0)
+            last_obs = obs_traj.squeeze(0)[:, :2, -1]
 
-        # Last observed absolute position for position loss
-        last_obs = obs_traj.squeeze(0)[:, :2, -1]  # [N, 2]
-
-        # Gradient accumulation — include current sample in loss before backward
-        if batch_count % args.batch_size != 0 and cnt != turn_point:
             l = graph_loss(V_pred, V_target, last_obs)
+
+        if batch_count % args.batch_size != 0 and cnt != turn_point:
             if is_fst_loss:
                 loss = l
                 is_fst_loss = False
             else:
                 loss += l
         else:
-            l = graph_loss(V_pred, V_target, last_obs)  # include last sample
             if is_fst_loss:
                 loss = l
             else:
@@ -175,34 +163,39 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train):
             is_fst_loss = True
 
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
 
             if args.clip_grad is not None:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
 
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
+            backward_count += 1
             loss_batch += loss.item()
-            print('TRAIN:', '\t Epoch:', epoch, '\t Loss:', loss_batch / batch_count)
+            print('TRAIN:', '\t Epoch:', epoch, '\t Loss:', loss_batch / backward_count)
 
-    metrics['train_loss'].append(loss_batch / max(1, batch_count))
+    metrics['train_loss'].append(loss_batch / max(1, backward_count))
 
     if metrics['train_loss'][-1] < constant_metrics['min_train_loss']:
         constant_metrics['min_train_loss'] = metrics['train_loss'][-1]
         constant_metrics['min_train_epoch'] = epoch
         torch.save(model.state_dict(), checkpoint_dir + 'train_best.pth')
 
+    # Save last checkpoint for resume support
+    torch.save(model.state_dict(), checkpoint_dir + 'last.pth')
+    with open(checkpoint_dir + 'last_epoch.txt', 'w') as f:
+        f.write(str(epoch))
+
 
 def vald(epoch, model, checkpoint_dir, loader_val):
-    """
-    Validation loop.
-    NOTE: For paper-aligned evaluation (minADE-20, minFDE-20), use evaluate.py.
-    """
     global metrics, constant_metrics
     model.eval()
 
     loss_batch = 0
     batch_count = 0
+    backward_count = 0
     is_fst_loss = True
     loader_len = len(loader_val)
     turn_point = int(loader_len / args.batch_size) * args.batch_size + \
@@ -219,31 +212,33 @@ def vald(epoch, model, checkpoint_dir, loader_val):
             N = V_obs.shape[2]
             identity = make_identity(T, N, device)
 
-            V_pred = model(V_obs, identity)
-            V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred  # [pred_len, N, 2]
+            with autocast():
+                V_pred = model(V_obs, identity)
+                V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
 
-            V_target = V_tr.squeeze(0)  # [pred_len, N, 4]
-            last_obs = obs_traj.squeeze(0)[:, :2, -1]  # [N, 2]
+                V_target = V_tr.squeeze(0)
+                last_obs = obs_traj.squeeze(0)[:, :2, -1]
+
+                l = graph_loss(V_pred, V_target, last_obs)
 
             if batch_count % args.batch_size != 0 and cnt != turn_point:
-                l = graph_loss(V_pred, V_target, last_obs)
                 if is_fst_loss:
                     loss = l
                     is_fst_loss = False
                 else:
                     loss += l
             else:
-                l = graph_loss(V_pred, V_target, last_obs)  # include last sample
                 if is_fst_loss:
                     loss = l
                 else:
                     loss += l
                 loss = loss / args.batch_size
                 is_fst_loss = True
+                backward_count += 1
                 loss_batch += loss.item()
-                print('VALD:', '\t Epoch:', epoch, '\t Loss:', loss_batch / batch_count)
+                print('VALD:', '\t Epoch:', epoch, '\t Loss:', loss_batch / backward_count)
 
-    avg_loss = loss_batch / max(1, batch_count)
+    avg_loss = loss_batch / max(1, backward_count)
     metrics['val_loss'].append(avg_loss)
     print('VALD:', '\t Epoch:', epoch, '\t Loss:', avg_loss)
 
@@ -314,19 +309,37 @@ def main(args):
         dropout=0,
         obs_len=args.obs_len,
         pred_len=args.pred_len,
-        out_dims=2   # deterministic (lon_vel, lat_vel) — no Gaussian parameters
+        out_dims=2
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scaler = GradScaler()
+
+    checkpoint_dir = './checkpoints/' + args.tag + '/' + args.dataset + '/'
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+
+    # Resume support
+    start_epoch = 0
+    if args.resume:
+        last_ckpt = checkpoint_dir + 'last.pth'
+        last_epoch_file = checkpoint_dir + 'last_epoch.txt'
+        constant_metrics_file = checkpoint_dir + 'constant_metrics.pkl'
+        if os.path.exists(last_ckpt) and os.path.exists(last_epoch_file):
+            model.load_state_dict(torch.load(last_ckpt, map_location=device))
+            with open(last_epoch_file) as f:
+                start_epoch = int(f.read()) + 1
+            if os.path.exists(constant_metrics_file):
+                with open(constant_metrics_file, 'rb') as fp:
+                    constant_metrics.update(pickle.load(fp))
+            print(f'Resumed from epoch {start_epoch}')
+        else:
+            print('No checkpoint found, starting from scratch')
 
     if args.use_lrschd:
         scheduler = optim.lr_scheduler.MultiStepLR(
             optimizer, milestones=[0, 100], gamma=0.1
         )
-
-    checkpoint_dir = './checkpoints/' + args.tag + '/' + args.dataset + '/'
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
 
     with open(checkpoint_dir + 'args.pkl', 'wb') as fp:
         pickle.dump(args, fp)
@@ -334,12 +347,12 @@ def main(args):
     print('Data and model loaded')
     print('Checkpoint dir:', checkpoint_dir)
 
-    for epoch in range(args.num_epochs):
-        train(epoch, model, optimizer, checkpoint_dir, loader_train)
+    for epoch in range(start_epoch, args.num_epochs):
+        train(epoch, model, optimizer, checkpoint_dir, loader_train, scaler)
         vald(epoch, model, checkpoint_dir, loader_val)
 
-        writer.add_scalar('trainloss', np.array(metrics['train_loss'])[epoch], epoch)
-        writer.add_scalar('valloss', np.array(metrics['val_loss'])[epoch], epoch)
+        writer.add_scalar('trainloss', np.array(metrics['train_loss'])[-1], epoch)
+        writer.add_scalar('valloss', np.array(metrics['val_loss'])[-1], epoch)
 
         if args.use_lrschd:
             scheduler.step()
