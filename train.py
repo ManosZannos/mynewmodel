@@ -38,6 +38,7 @@ from torch import optim
 from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp import autocast, GradScaler
+import numpy as np
 
 from metrics import *
 from model import *
@@ -62,7 +63,7 @@ class Logger(object):
         self.log.write(message)
 
     def flush(self):
-        pass
+        self.log.flush()  # FIX: flush ώστε τα logs να γράφονται αμέσως στο αρχείο
 
 
 def huber_loss(pred, target, delta=1.0):
@@ -121,13 +122,14 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train, scaler):
     global metrics, constant_metrics
     model.train()
 
-    loss_batch = 0
-    batch_count = 0
+    loss_batch    = 0
+    batch_count   = 0
     backward_count = 0
-    is_fst_loss = True
-    loader_len = len(loader_train)
-    turn_point = int(loader_len / args.batch_size) * args.batch_size + \
-                 loader_len % args.batch_size - 1
+    is_fst_loss   = True
+    loss          = None   # FIX: ρητή αρχικοποίηση σε None
+    loader_len    = len(loader_train)
+    turn_point    = int(loader_len / args.batch_size) * args.batch_size + \
+                    loader_len % args.batch_size - 1
 
     for cnt, batch in enumerate(loader_train):
         batch_count += 1
@@ -140,25 +142,31 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train, scaler):
         identity = make_identity(T, N, device)
 
         with autocast():
-            V_pred = model(V_obs, identity)
-            V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
-
+            V_pred   = model(V_obs, identity)
+            V_pred   = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
             V_target = V_tr.squeeze(0)
             last_obs = obs_traj.squeeze(0)[:, :2, -1]
 
             l = graph_loss(V_pred, V_target, last_obs)
 
         if batch_count % args.batch_size != 0 and cnt != turn_point:
+            # Accumulation phase: συσσωρεύουμε loss
             if is_fst_loss:
                 loss = l
                 is_fst_loss = False
             else:
-                loss += l
+                loss = loss + l
+            # FIX: διαγράφουμε το l αμέσως — δεν χρειάζεται πλέον
+            del l
+
         else:
+            # Backward phase: κάνουμε το backward pass
             if is_fst_loss:
                 loss = l
             else:
-                loss += l
+                loss = loss + l
+            del l  # FIX: διαγράφουμε το l
+
             loss = loss / args.batch_size
             is_fst_loss = True
 
@@ -175,6 +183,11 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train, scaler):
             backward_count += 1
             loss_batch += loss.item()
             print('TRAIN:', '\t Epoch:', epoch, '\t Loss:', loss_batch / backward_count)
+
+            # FIX: καθαρισμός GPU memory μετά από κάθε backward pass
+            del loss, V_pred, V_target, last_obs, identity
+            loss = None  # reset για τον επόμενο accumulation κύκλο
+            torch.cuda.empty_cache()
 
     metrics['train_loss'].append(loss_batch / max(1, backward_count))
 
@@ -193,13 +206,14 @@ def vald(epoch, model, checkpoint_dir, loader_val):
     global metrics, constant_metrics
     model.eval()
 
-    loss_batch = 0
-    batch_count = 0
+    loss_batch     = 0
+    batch_count    = 0
     backward_count = 0
-    is_fst_loss = True
-    loader_len = len(loader_val)
-    turn_point = int(loader_len / args.batch_size) * args.batch_size + \
-                 loader_len % args.batch_size - 1
+    is_fst_loss    = True
+    loss           = None  # FIX: ρητή αρχικοποίηση σε None
+    loader_len     = len(loader_val)
+    turn_point     = int(loader_len / args.batch_size) * args.batch_size + \
+                     loader_len % args.batch_size - 1
 
     for cnt, batch in enumerate(loader_val):
         batch_count += 1
@@ -213,9 +227,8 @@ def vald(epoch, model, checkpoint_dir, loader_val):
             identity = make_identity(T, N, device)
 
             with autocast():
-                V_pred = model(V_obs, identity)
-                V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
-
+                V_pred   = model(V_obs, identity)
+                V_pred   = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
                 V_target = V_tr.squeeze(0)
                 last_obs = obs_traj.squeeze(0)[:, :2, -1]
 
@@ -226,17 +239,27 @@ def vald(epoch, model, checkpoint_dir, loader_val):
                     loss = l
                     is_fst_loss = False
                 else:
-                    loss += l
+                    loss = loss + l
+                del l  # FIX: αποδέσμευση αμέσως
+
             else:
                 if is_fst_loss:
                     loss = l
                 else:
-                    loss += l
+                    loss = loss + l
+                del l  # FIX: αποδέσμευση αμέσως
+
                 loss = loss / args.batch_size
                 is_fst_loss = True
                 backward_count += 1
                 loss_batch += loss.item()
                 print('VALD:', '\t Epoch:', epoch, '\t Loss:', loss_batch / backward_count)
+
+                # FIX: καθαρισμός GPU memory — στο val δεν έχουμε gradients
+                # αλλά τα tensors κρατούν GPU memory ακόμα
+                del loss, V_pred, V_target, last_obs, identity
+                loss = None  # reset για τον επόμενο accumulation κύκλο
+                torch.cuda.empty_cache()
 
     avg_loss = loss_batch / max(1, backward_count)
     metrics['val_loss'].append(avg_loss)
@@ -249,7 +272,7 @@ def vald(epoch, model, checkpoint_dir, loader_val):
 
 
 def main(args):
-    obs_seq_len = args.obs_len
+    obs_seq_len  = args.obs_len
     pred_seq_len = args.pred_len
 
     data_set = os.path.join('./dataset', args.dataset)
@@ -283,7 +306,7 @@ def main(args):
         dset_train,
         batch_size=1,
         shuffle=True,
-        num_workers=4)
+        num_workers=0)  # FIX: 0 workers — αποφεύγει shared memory exhaustion στον DGX
 
     dset_val = TrajectoryDataset(
         os.path.join(data_set, 'val'),
@@ -295,7 +318,7 @@ def main(args):
         dset_val,
         batch_size=1,
         shuffle=False,
-        num_workers=4)
+        num_workers=0)  # FIX: 0 workers — αποφεύγει shared memory exhaustion στον DGX
 
     print('Training started ...')
     print(f'Using device: {device}')
@@ -313,7 +336,7 @@ def main(args):
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scaler = GradScaler()
+    scaler    = GradScaler()
 
     checkpoint_dir = './checkpoints/' + args.tag + '/' + args.dataset + '/'
     if not os.path.exists(checkpoint_dir):
@@ -322,8 +345,8 @@ def main(args):
     # Resume support
     start_epoch = 0
     if args.resume:
-        last_ckpt = checkpoint_dir + 'last.pth'
-        last_epoch_file = checkpoint_dir + 'last_epoch.txt'
+        last_ckpt          = checkpoint_dir + 'last.pth'
+        last_epoch_file    = checkpoint_dir + 'last_epoch.txt'
         constant_metrics_file = checkpoint_dir + 'constant_metrics.pkl'
         if os.path.exists(last_ckpt) and os.path.exists(last_epoch_file):
             model.load_state_dict(torch.load(last_ckpt, map_location=device))
@@ -352,7 +375,7 @@ def main(args):
         vald(epoch, model, checkpoint_dir, loader_val)
 
         writer.add_scalar('trainloss', np.array(metrics['train_loss'])[-1], epoch)
-        writer.add_scalar('valloss', np.array(metrics['val_loss'])[-1], epoch)
+        writer.add_scalar('valloss',   np.array(metrics['val_loss'])[-1],   epoch)
 
         if args.use_lrschd:
             scheduler.step()
