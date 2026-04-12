@@ -182,8 +182,6 @@ class SparseWeightedAdjacency(nn.Module):
                  dropout=0, number_asymmetric_conv_layer=2, num_heads=4):
         super(SparseWeightedAdjacency, self).__init__()
 
-        # spa_in_dims=5: [LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel] after slicing LON_abs
-        # tem_in_dims=6: full features [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
         self.spatial_attention = SelfAttention(spa_in_dims, embedding_dims, num_heads=num_heads)
         self.temporal_attention = SelfAttention(tem_in_dims, embedding_dims, num_heads=num_heads)
 
@@ -260,13 +258,67 @@ class GraphConvolution(nn.Module):
         return gcn_features
 
 
-class SparseGraphConvolution(nn.Module):
+class HybridNetwork(nn.Module):
     """
-    Two-path sparse GCN with simple addition fusion.
-    Paper Section 3.2.3, Eq. 16-19.
+    Hybrid Network for fusing spatial and temporal GCN features.
+    Paper Section 3.2.3, Eq. 18-19.
+
+    Learns dynamic weights w=[w1, w2] via a 2-layer MLP:
+      w = softmax(W_hy * tanh(W_hid * [Hs ⊕ Ht] + b_hid) + b_hy)
+      H = w1 * Hs + w2 * Ht
+
+    Args:
+        feature_dim: dimensionality of each feature vector (gcn_hidden * num_heads)
+        hidden_dim:  hidden state dimension of MLP (paper sets to 64)
     """
 
-    def __init__(self, in_dims=5, embedding_dims=16, dropout=0):
+    def __init__(self, feature_dim, hidden_dim=64):
+        super(HybridNetwork, self).__init__()
+
+        # 2-layer MLP: input = concat(Hs, Ht) → 2*feature_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * feature_dim, hidden_dim),   # W_hid, b_hid
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 2),                  # W_hy, b_hy
+        )
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, Hs, Ht):
+        """
+        Args:
+            Hs: [N, T, num_heads, emb] — spatial-temporal GCN output (Eq. 16)
+            Ht: [N, T, num_heads, emb] — temporal-spatial GCN output (Eq. 17)
+
+        Returns:
+            H: [N, T, num_heads, emb] — fused deep feature representation (Eq. 19)
+        """
+        # Concatenate along feature dim for MLP input: [N, T, num_heads, 2*emb]
+        combined = torch.cat([Hs, Ht], dim=-1)
+
+        # Compute weights: [N, T, num_heads, 2]
+        w = self.softmax(self.mlp(combined))
+
+        w1 = w[..., 0:1]  # [N, T, num_heads, 1]
+        w2 = w[..., 1:2]  # [N, T, num_heads, 1]
+
+        # Weighted fusion: H = w1*Hs + w2*Ht  (Eq. 19)
+        H = w1 * Hs + w2 * Ht
+
+        return H
+
+
+class SparseGraphConvolution(nn.Module):
+    """
+    Two-path sparse GCN with Hybrid Network fusion.
+    Paper Section 3.2.3, Eq. 16-19.
+
+    FIX from original repo:
+    - Uses layer2 outputs (gcn_spatial_temporal_features, gcn_temporal_spatial_features)
+      as Hs and Ht — not layer1 outputs as in the original repo.
+    - Replaces simple addition with HybridNetwork weighted fusion (Eq. 18-19).
+    """
+
+    def __init__(self, in_dims=5, embedding_dims=16, dropout=0, num_heads=4):
         super(SparseGraphConvolution, self).__init__()
 
         self.dropout = dropout
@@ -280,12 +332,22 @@ class SparseGraphConvolution(nn.Module):
         self.temporal_spatial_sparse_gcn.append(GraphConvolution(in_dims, embedding_dims))
         self.temporal_spatial_sparse_gcn.append(GraphConvolution(embedding_dims, embedding_dims))
 
+        # FIX: Hybrid Network for weighted fusion of Hs and Ht (paper Eq. 18-19)
+        # feature_dim = embedding_dims (per head), hidden_dim = 64 (paper Section 4.1.2)
+        self.hybrid_network = HybridNetwork(
+            feature_dim=embedding_dims,
+            hidden_dim=64
+        )
+
     def forward(self, graph, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix):
         """
         Args:
             graph: [1, T, N, 6] — full graph with absolute + relative features
             normalized_spatial_adjacency_matrix:  [T, num_heads, N, N]
             normalized_temporal_adjacency_matrix: [N, num_heads, T, T]
+
+        Returns:
+            H: [N, T, num_heads, emb] — deep feature representation of vessel trajectories
         """
         # Skip LON_abs (first feature), use remaining 5 features
         graph = graph[:, :, :, 1:]              # [1, T, N, 5]
@@ -293,29 +355,35 @@ class SparseGraphConvolution(nn.Module):
         spa_graph = graph.permute(1, 0, 2, 3)   # [T, 1, N, 5]
         tem_graph = spa_graph.permute(2, 1, 0, 3)  # [N, 1, T, 5]
 
+        # ── Spatial path (paper Eq. 16) ──────────────────────────────────────
+        # Layer 1: spatial adjacency on spatial graph
         gcn_spatial_layer1 = self.spatial_temporal_sparse_gcn[0](
             spa_graph, normalized_spatial_adjacency_matrix
-        )
+        )  # [T, num_heads, N, emb]
 
-        gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)
-
-        gcn_spatial_temporal_features = self.spatial_temporal_sparse_gcn[1](
+        # Layer 2: temporal adjacency on spatially-encoded features
+        gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)  # [N, num_heads, T, emb]
+        Hs = self.spatial_temporal_sparse_gcn[1](
             gcn_spatial_layer1_perm, normalized_temporal_adjacency_matrix
-        )
+        )  # [N, num_heads, T, emb]
+        Hs = Hs.permute(0, 2, 1, 3)  # [N, T, num_heads, emb]
 
+        # ── Temporal path (paper Eq. 17) ─────────────────────────────────────
+        # Layer 1: temporal adjacency on temporal graph
         gcn_temporal_layer1 = self.temporal_spatial_sparse_gcn[0](
             tem_graph, normalized_temporal_adjacency_matrix
-        )
+        )  # [N, num_heads, T, emb]
 
-        gcn_temporal_layer1_perm = gcn_temporal_layer1.permute(2, 1, 0, 3)
-
-        gcn_temporal_spatial_features = self.temporal_spatial_sparse_gcn[1](
+        # Layer 2: spatial adjacency on temporally-encoded features
+        gcn_temporal_layer1_perm = gcn_temporal_layer1.permute(2, 1, 0, 3)  # [T, num_heads, N, emb]
+        Ht = self.temporal_spatial_sparse_gcn[1](
             gcn_temporal_layer1_perm, normalized_spatial_adjacency_matrix
-        )
+        )  # [T, num_heads, N, emb]
+        Ht = Ht.permute(2, 0, 1, 3)  # [N, T, num_heads, emb]
 
-        x = gcn_spatial_layer1 + gcn_temporal_layer1_perm  # [T, num_heads, N, emb]
-
-        H = x.permute(2, 0, 1, 3)  # [N, T, num_heads, emb]
+        # ── Hybrid Network fusion (paper Eq. 18-19) ───────────────────────────
+        # FIX: replaces simple addition of layer1 outputs from original repo
+        H = self.hybrid_network(Hs, Ht)  # [N, T, num_heads, emb]
 
         return H
 
@@ -378,6 +446,10 @@ class TrajectoryModel(nn.Module):
     - Input features: 5 → 6 (added absolute position LON_abs, LAT_abs)
     - spa_in_dims: 4 → 5, tem_in_dims: 5 → 6, GCN in_dims: 4 → 5
     - Loss: NLL → Huber position loss (DualSTMA-aligned)
+
+    Fix vs original repo:
+    - HybridNetwork (paper Eq. 18-19) replaces simple addition fusion
+    - GCN layer2 outputs (Hs, Ht) correctly used as HybridNetwork inputs
     """
 
     def __init__(self,
@@ -393,9 +465,6 @@ class TrajectoryModel(nn.Module):
 
         gcn_hidden = embedding_dims // num_heads  # 16
 
-        # Input: V_obs = [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel] (6 features)
-        # spa_in_dims=5: after slicing first feature → [LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-        # tem_in_dims=6: full 6-feature vector
         self.sparse_weighted_adjacency_matrices = SparseWeightedAdjacency(
             spa_in_dims=5,
             tem_in_dims=6,
@@ -406,11 +475,12 @@ class TrajectoryModel(nn.Module):
             num_heads=num_heads
         )
 
-        # GCN: in_dims=5 (after slicing first feature of 6)
+        # FIX: num_heads passed to SparseGraphConvolution for HybridNetwork
         self.stsgcn = SparseGraphConvolution(
             in_dims=5,
             embedding_dims=gcn_hidden,
-            dropout=dropout
+            dropout=dropout,
+            num_heads=num_heads
         )
 
         self.encoder = Encoder(fin=obs_len, fout=pred_len)
@@ -435,12 +505,12 @@ class TrajectoryModel(nn.Module):
             graph,
             normalized_spatial_adjacency_matrix,
             normalized_temporal_adjacency_matrix
-        )
+        )  # [N, T, num_heads, gcn_hidden]
 
         features = self.encoder(H)  # [N, pred_len, num_heads, gcn_hidden]
 
         b, l, _, _ = features.shape
-        features = features.contiguous().view(b, self.pred_len, -1)
+        features = features.contiguous().view(b, self.pred_len, -1)  # [N, pred_len, embedding_dims]
 
         prediction = self.output(features)  # [N, pred_len, 2]
 
