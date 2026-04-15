@@ -262,8 +262,21 @@ class GraphConvolution(nn.Module):
 
 class SparseGraphConvolution(nn.Module):
     """
-    Two-path sparse GCN with simple addition fusion.
+    Two-path sparse GCN with Layer 2 outputs used in fusion (v4).
     Paper Section 3.2.3, Eq. 16-19.
+
+    v4 change: fusion now uses GCN layer 2 outputs instead of layer 1.
+    In the original repo, layer 2 outputs (gcn_spatial_temporal_features,
+    gcn_temporal_spatial_features) were computed but discarded. Here we use
+    them directly in the addition fusion, giving the encoder a more refined
+    representation after two rounds of message passing.
+
+    Shape flow:
+      gcn_spatial_temporal_features: [N, num_heads, T, emb]
+      gcn_temporal_spatial_features: [T, num_heads, N, emb]
+        → permute(2,1,0,3) → [N, num_heads, T, emb]
+      x = sum: [N, num_heads, T, emb]
+      H = x.permute(0,2,1,3): [N, T, num_heads, emb]  ← same as v2 output shape
     """
 
     def __init__(self, in_dims=5, embedding_dims=16, dropout=0):
@@ -293,29 +306,37 @@ class SparseGraphConvolution(nn.Module):
         spa_graph = graph.permute(1, 0, 2, 3)   # [T, 1, N, 5]
         tem_graph = spa_graph.permute(2, 1, 0, 3)  # [N, 1, T, 5]
 
+        # --- Spatial path ---
         gcn_spatial_layer1 = self.spatial_temporal_sparse_gcn[0](
             spa_graph, normalized_spatial_adjacency_matrix
-        )
+        )  # [T, num_heads, N, emb]
 
-        gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)
+        # Permute for GCN layer 2 (temporal adjacency)
+        gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)  # [N, num_heads, T, emb]
 
         gcn_spatial_temporal_features = self.spatial_temporal_sparse_gcn[1](
             gcn_spatial_layer1_perm, normalized_temporal_adjacency_matrix
-        )
+        )  # [N, num_heads, T, emb]
 
+        # --- Temporal path ---
         gcn_temporal_layer1 = self.temporal_spatial_sparse_gcn[0](
             tem_graph, normalized_temporal_adjacency_matrix
-        )
+        )  # [N, num_heads, T, emb]
 
-        gcn_temporal_layer1_perm = gcn_temporal_layer1.permute(2, 1, 0, 3)
+        # Permute for GCN layer 2 (spatial adjacency)
+        gcn_temporal_layer1_perm = gcn_temporal_layer1.permute(2, 1, 0, 3)  # [T, num_heads, N, emb]
 
         gcn_temporal_spatial_features = self.temporal_spatial_sparse_gcn[1](
             gcn_temporal_layer1_perm, normalized_spatial_adjacency_matrix
-        )
+        )  # [T, num_heads, N, emb]
 
-        x = gcn_spatial_layer1 + gcn_temporal_layer1_perm  # [T, num_heads, N, emb]
+        # --- Fusion: Layer 2 outputs (v4 change from v2) ---
+        # gcn_spatial_temporal_features: [N, num_heads, T, emb]
+        # gcn_temporal_spatial_features: [T, num_heads, N, emb] → permute → [N, num_heads, T, emb]
+        gcn_temporal_spatial_perm = gcn_temporal_spatial_features.permute(2, 1, 0, 3)
+        x = gcn_spatial_temporal_features + gcn_temporal_spatial_perm  # [N, num_heads, T, emb]
 
-        H = x.permute(2, 0, 1, 3)  # [N, T, num_heads, emb]
+        H = x.permute(0, 2, 1, 3)  # [N, T, num_heads, emb]
 
         return H
 
@@ -370,14 +391,21 @@ class Encoder(nn.Module):
 
 class TrajectoryModel(nn.Module):
     """
-    SMCHN: Spatial-Multi-Channel Heterogeneous Network
+    SMCHN v4: Spatial-Multi-Channel Heterogeneous Network
     Adapted from Wang et al. (Ocean Engineering 2023) for vessel trajectory prediction.
 
-    Changes from v1:
-    - out_dims: 5 → 2 (deterministic velocity prediction, no Gaussian parameters)
-    - Input features: 5 → 6 (added absolute position LON_abs, LAT_abs)
-    - spa_in_dims: 4 → 5, tem_in_dims: 5 → 6, GCN in_dims: 4 → 5
-    - Loss: NLL → Huber position loss (DualSTMA-aligned)
+    Changes from v2:
+    - Fusion now uses GCN layer 2 outputs (gcn_spatial_temporal_features,
+      gcn_temporal_spatial_features) instead of layer 1 outputs.
+      Layer 2 has performed an additional round of message passing across
+      the complementary adjacency (spatial→temporal, temporal→spatial),
+      producing a richer cross-path representation before the encoder.
+
+    Unchanged from v2:
+    - out_dims=2 (deterministic velocity prediction)
+    - 6-feature input [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
+    - Loss: 10×Huber(position) + 0.1×Huber(velocity)
+    - Encoder, output layer, training setup
     """
 
     def __init__(self,
