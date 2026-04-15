@@ -8,7 +8,7 @@ from model import *
 from utils import *
 
 print("="*80)
-print(colored("SMOKE TEST - Trajectory Prediction Pipeline", "cyan", attrs=["bold"]))
+print(colored("SMOKE TEST - Trajectory Prediction Pipeline (True Baseline, 4 features)", "cyan", attrs=["bold"]))
 print("="*80)
 
 print(colored("\n✓ Imports loaded", "green"))
@@ -51,17 +51,15 @@ if os.path.exists(dataset_path):
             num_workers=0
         )
 
-        # Get one batch
         batch = next(iter(loader))
         obs_traj, pred_traj_gt, obs_traj_rel, pred_traj_gt_rel, non_linear_ped, \
         loss_mask, V_obs, V_tr = batch
 
         print(colored("  ✓ Dataset loaded successfully", "green"))
         print(f"    Total sequences: {len(dataset)}")
-        print(f"    V_obs shape: {V_obs.shape}")  # [1, obs_len, N, 6]
+        print(f"    V_obs shape: {V_obs.shape}")  # [1, obs_len, N, 4]
         print(f"    V_tr shape:  {V_tr.shape}")   # [1, pred_len, N, 4]
 
-        # Move to device
         V_obs = V_obs.to(device)
         V_tr = V_tr.to(device)
 
@@ -91,26 +89,22 @@ try:
 
     print(colored("  ✓ Model initialized", "green"))
 
-    # Test with dummy data if no dataset
     if dataset is None:
         batch_size = 1
-        N = 20  # dummy number of vessels
-        # V_obs: [batch, obs_len, N, 6] = [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-        V_obs = torch.randn(batch_size, obs_len, N, 6).to(device)
+        N = 20
+        # V_obs: [batch, obs_len, N, 4] — true baseline: 4 features only
+        V_obs = torch.randn(batch_size, obs_len, N, 4).to(device)
         V_tr  = torch.randn(batch_size, pred_len, N, 4).to(device)
-        # Dummy obs_traj / pred_traj_gt for downstream tests
         obs_traj     = torch.zeros(batch_size, N, 4, obs_len)
         pred_traj_gt = torch.zeros(batch_size, N, 4, pred_len)
         print(f"    Using dummy data: V_obs {V_obs.shape}")
 
-    # Create identity matrices
-    T = V_obs.shape[1]  # obs_len
-    N = V_obs.shape[2]  # num vessels
+    T = V_obs.shape[1]
+    N = V_obs.shape[2]
     identity_spatial  = torch.ones((T, N, N), device=device) * torch.eye(N, device=device)
     identity_temporal = torch.ones((N, T, T), device=device) * torch.eye(T, device=device)
     identity = [identity_spatial, identity_temporal]
 
-    # Forward pass
     V_pred = model(V_obs, identity)
 
     print(colored("  ✓ Forward pass successful", "green"))
@@ -118,7 +112,6 @@ try:
     print(f"    Output: V_pred {list(V_pred.shape)}")
     print(f"    Expected: [pred_len={pred_len}, N={N}, 2]")
 
-    # Check shape
     expected_shape = (pred_len, N, 2)
     actual_shape = tuple(V_pred.shape) if V_pred.dim() == 3 else tuple(V_pred.squeeze(0).shape)
 
@@ -127,7 +120,6 @@ try:
     else:
         print(colored(f"  ⚠ Output shape mismatch: {actual_shape} vs {expected_shape}", "yellow"))
 
-    # Ensure correct shape for next tests
     if V_pred.dim() == 4:
         V_pred = V_pred.squeeze(0)
 
@@ -147,7 +139,7 @@ try:
     LON_MIN, LON_RANGE = -133.29703, 72.60811
 
     last_obs = obs_traj.squeeze(0)[:, :2, -1].to(device)  # [N, 2]
-    pred_abs = torch.cumsum(V_pred, dim=0) + last_obs.unsqueeze(0)  # [pred_len, N, 2]
+    pred_abs = torch.cumsum(V_pred, dim=0) + last_obs.unsqueeze(0)
 
     pred_lon = pred_abs[:, :, 0] * LON_RANGE + LON_MIN
     pred_lat = pred_abs[:, :, 1] * LAT_RANGE + LAT_MIN
@@ -223,10 +215,10 @@ else:
     print(colored(f"\n  ✗ V_pred should have 2 outputs, got {V_pred.shape[-1]}", "red"))
     all_passed = False
 
-if V_obs.shape[-1] == 6:
-    print(colored("  ✓ V_obs has 6 features (LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel)", "green"))
+if V_obs.shape[-1] == 4:
+    print(colored("  ✓ V_obs has 4 features (LON_rel, LAT_rel, SOG_rel, Heading_rel) — true baseline", "green"))
 else:
-    print(colored(f"  ⚠ V_obs has {V_obs.shape[-1]} features (expected 6)", "yellow"))
+    print(colored(f"  ✗ V_obs has {V_obs.shape[-1]} features (expected 4 for true baseline)", "red"))
     all_passed = False
 
 # ============================================================================

@@ -32,10 +32,6 @@ class InteractionMask(nn.Module):
     """
     Generates sparse interaction masks via asymmetric convolutions.
     Paper Section 3.2.2: threshold ξ=0.5, values < threshold set to 0.
-
-    NOTE: Original repo uses soft masking (keeps sigmoid values above threshold).
-    This differs from paper Eq. 11-12 which describes binary masks.
-    We follow the original repo implementation here.
     """
 
     def __init__(self, number_asymmetric_conv_layer=2, spatial_channels=4, temporal_channels=4):
@@ -59,8 +55,8 @@ class InteractionMask(nn.Module):
 
     def forward(self, dense_spatial_interaction, dense_temporal_interaction, threshold=0.5):
 
-        assert len(dense_temporal_interaction.shape) == 4   # (T, num_heads, N, N)
-        assert len(dense_spatial_interaction.shape) == 4    # (N, num_heads, T, T)
+        assert len(dense_temporal_interaction.shape) == 4
+        assert len(dense_spatial_interaction.shape) == 4
 
         for j in range(self.number_asymmetric_conv_layer):
             dense_spatial_interaction = self.spatial_asymmetric_convolutions[j](dense_spatial_interaction)
@@ -87,9 +83,7 @@ class InteractionMask(nn.Module):
 
 
 class ZeroSoftmax(nn.Module):
-    """
-    Zero-preserving softmax (Paper Eq. 14).
-    """
+    """Zero-preserving softmax (Paper Eq. 14)."""
 
     def __init__(self):
         super(ZeroSoftmax, self).__init__()
@@ -163,7 +157,6 @@ class SpatialTemporalFusion(nn.Module):
         self.shortcut = nn.Sequential()
 
     def forward(self, x):
-        # No squeeze — input (num_heads, T, N, N), all dims >= 2 in normal operation
         return self.conv(x) + self.shortcut(x)
 
 
@@ -172,18 +165,16 @@ class SparseWeightedAdjacency(nn.Module):
     Generates normalized sparse spatial and temporal adjacency matrices.
     Paper Section 3.2.2: Eq. 2-15.
 
-    Input graph shape: (T, N, 6) with features:
-      [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-    - spatial_graph uses graph[:, :, 1:] → (T, N, 5)
-    - temporal_graph uses full graph     → (N, T, 6)
+    TRUE BASELINE: 4 features [LON_rel, LAT_rel, SOG_rel, Heading_rel]
+    - spa_in_dims=4: full 4-feature vector for spatial attention
+    - tem_in_dims=4: full 4-feature vector for temporal attention
+    No feature slicing needed (unlike v2 which skipped LON_abs).
     """
 
-    def __init__(self, spa_in_dims=5, tem_in_dims=6, embedding_dims=64, obs_len=10,
+    def __init__(self, spa_in_dims=4, tem_in_dims=4, embedding_dims=64, obs_len=10,
                  dropout=0, number_asymmetric_conv_layer=2, num_heads=4):
         super(SparseWeightedAdjacency, self).__init__()
 
-        # spa_in_dims=5: [LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel] after slicing LON_abs
-        # tem_in_dims=6: full features [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
         self.spatial_attention = SelfAttention(spa_in_dims, embedding_dims, num_heads=num_heads)
         self.temporal_attention = SelfAttention(tem_in_dims, embedding_dims, num_heads=num_heads)
 
@@ -201,15 +192,15 @@ class SparseWeightedAdjacency(nn.Module):
     def forward(self, graph, identity):
         """
         Args:
-            graph: (T, N, 6) — [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
+            graph: (T, N, 4) — [LON_rel, LAT_rel, SOG_rel, Heading_rel]
             identity: [spatial_identity (T,N,N), temporal_identity (N,T,T)]
         """
         assert len(graph.shape) == 3
 
-        # Spatial graph: skip LON_abs → (T, N, 5)
-        spatial_graph = graph[:, :, 1:]
+        # Spatial graph: full 4 features → (T, N, 4)
+        spatial_graph = graph
 
-        # Temporal graph: full features → (N, T, 6)
+        # Temporal graph: full 4 features → (N, T, 4)
         temporal_graph = graph.permute(1, 0, 2)
 
         dense_spatial_interaction, spatial_embeddings = self.spatial_attention(
@@ -262,24 +253,15 @@ class GraphConvolution(nn.Module):
 
 class SparseGraphConvolution(nn.Module):
     """
-    Two-path sparse GCN with Layer 2 outputs used in fusion (v4).
+    Two-path sparse GCN with simple addition fusion.
     Paper Section 3.2.3, Eq. 16-19.
 
-    v4 change: fusion now uses GCN layer 2 outputs instead of layer 1.
-    In the original repo, layer 2 outputs (gcn_spatial_temporal_features,
-    gcn_temporal_spatial_features) were computed but discarded. Here we use
-    them directly in the addition fusion, giving the encoder a more refined
-    representation after two rounds of message passing.
-
-    Shape flow:
-      gcn_spatial_temporal_features: [N, num_heads, T, emb]
-      gcn_temporal_spatial_features: [T, num_heads, N, emb]
-        → permute(2,1,0,3) → [N, num_heads, T, emb]
-      x = sum: [N, num_heads, T, emb]
-      H = x.permute(0,2,1,3): [N, T, num_heads, emb]  ← same as v2 output shape
+    TRUE BASELINE: in_dims=4, uses all 4 features directly.
+    No feature slicing (unlike v2 which sliced LON_abs from 6 features).
+    Layer 2 outputs computed but not used in fusion — matches original repo.
     """
 
-    def __init__(self, in_dims=5, embedding_dims=16, dropout=0):
+    def __init__(self, in_dims=4, embedding_dims=16, dropout=0):
         super(SparseGraphConvolution, self).__init__()
 
         self.dropout = dropout
@@ -296,47 +278,44 @@ class SparseGraphConvolution(nn.Module):
     def forward(self, graph, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix):
         """
         Args:
-            graph: [1, T, N, 6] — full graph with absolute + relative features
+            graph: [1, T, N, 4] — full 4-feature graph
             normalized_spatial_adjacency_matrix:  [T, num_heads, N, N]
             normalized_temporal_adjacency_matrix: [N, num_heads, T, T]
         """
-        # Skip LON_abs (first feature), use remaining 5 features
-        graph = graph[:, :, :, 1:]              # [1, T, N, 5]
+        # Use all 4 features directly — no slicing needed
+        graph = graph  # [1, T, N, 4]
 
-        spa_graph = graph.permute(1, 0, 2, 3)   # [T, 1, N, 5]
-        tem_graph = spa_graph.permute(2, 1, 0, 3)  # [N, 1, T, 5]
+        spa_graph = graph.permute(1, 0, 2, 3)      # [T, 1, N, 4]
+        tem_graph = spa_graph.permute(2, 1, 0, 3)  # [N, 1, T, 4]
 
         # --- Spatial path ---
         gcn_spatial_layer1 = self.spatial_temporal_sparse_gcn[0](
             spa_graph, normalized_spatial_adjacency_matrix
         )  # [T, num_heads, N, emb]
 
-        # Permute for GCN layer 2 (temporal adjacency)
         gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)  # [N, num_heads, T, emb]
 
+        # Layer 2 — computed but not used in fusion (matches original repo)
         gcn_spatial_temporal_features = self.spatial_temporal_sparse_gcn[1](
             gcn_spatial_layer1_perm, normalized_temporal_adjacency_matrix
-        )  # [N, num_heads, T, emb]
+        )  # [N, num_heads, T, emb] — not used in fusion
 
         # --- Temporal path ---
         gcn_temporal_layer1 = self.temporal_spatial_sparse_gcn[0](
             tem_graph, normalized_temporal_adjacency_matrix
         )  # [N, num_heads, T, emb]
 
-        # Permute for GCN layer 2 (spatial adjacency)
         gcn_temporal_layer1_perm = gcn_temporal_layer1.permute(2, 1, 0, 3)  # [T, num_heads, N, emb]
 
+        # Layer 2 — computed but not used in fusion (matches original repo)
         gcn_temporal_spatial_features = self.temporal_spatial_sparse_gcn[1](
             gcn_temporal_layer1_perm, normalized_spatial_adjacency_matrix
-        )  # [T, num_heads, N, emb]
+        )  # [T, num_heads, N, emb] — not used in fusion
 
-        # --- Fusion: Layer 2 outputs (v4 change from v2) ---
-        # gcn_spatial_temporal_features: [N, num_heads, T, emb]
-        # gcn_temporal_spatial_features: [T, num_heads, N, emb] → permute → [N, num_heads, T, emb]
-        gcn_temporal_spatial_perm = gcn_temporal_spatial_features.permute(2, 1, 0, 3)
-        x = gcn_spatial_temporal_features + gcn_temporal_spatial_perm  # [N, num_heads, T, emb]
+        # --- Fusion: Layer 1 outputs only (original repo, addition) ---
+        x = gcn_spatial_layer1 + gcn_temporal_layer1_perm  # [T, num_heads, N, emb]
 
-        H = x.permute(0, 2, 1, 3)  # [N, T, num_heads, emb]
+        H = x.permute(2, 0, 1, 3)  # [N, T, num_heads, emb]
 
         return H
 
@@ -365,8 +344,6 @@ class Encoder(nn.Module):
     """
     Gated TCN encoder (Paper Eq. 20):
     H(l+1) = residual + sigmoid(Wf * H) ⊗ tanh(Wg * H)
-
-    When fin != fout, a projection Conv2d maps residual to correct output shape.
     """
 
     def __init__(self, fin, fout, layers=3, ksize=3):
@@ -391,21 +368,19 @@ class Encoder(nn.Module):
 
 class TrajectoryModel(nn.Module):
     """
-    SMCHN v4: Spatial-Multi-Channel Heterogeneous Network
+    SMCHN True Baseline: Spatial-Multi-Channel Heterogeneous Network
     Adapted from Wang et al. (Ocean Engineering 2023) for vessel trajectory prediction.
 
-    Changes from v2:
-    - Fusion now uses GCN layer 2 outputs (gcn_spatial_temporal_features,
-      gcn_temporal_spatial_features) instead of layer 1 outputs.
-      Layer 2 has performed an additional round of message passing across
-      the complementary adjacency (spatial→temporal, temporal→spatial),
-      producing a richer cross-path representation before the encoder.
+    This is the TRUE BASELINE — minimal adaptation from original SMCHN:
+    - out_dims=2: deterministic output (necessary for fair comparison with DualSTMA)
+    - Loss: Huber (necessary consequence of deterministic output)
+    - 4 features: [LON_rel, LAT_rel, SOG_rel, Heading_rel] — original SMCHN feature set
+    - Layer 1 fusion (addition) — original repo
+    - spa_in_dims=4, tem_in_dims=4, GCN in_dims=4 — original dims
 
-    Unchanged from v2:
-    - out_dims=2 (deterministic velocity prediction)
-    - 6-feature input [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-    - Loss: 10×Huber(position) + 0.1×Huber(velocity)
-    - Encoder, output layer, training setup
+    Unlike v2, this does NOT include absolute positions (LON_abs, LAT_abs).
+    The 6-feature input of v2 was an improvement borrowed from DualSTMA ablation G9,
+    not a requirement for fair comparison.
     """
 
     def __init__(self,
@@ -421,12 +396,11 @@ class TrajectoryModel(nn.Module):
 
         gcn_hidden = embedding_dims // num_heads  # 16
 
-        # Input: V_obs = [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel] (6 features)
-        # spa_in_dims=5: after slicing first feature → [LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-        # tem_in_dims=6: full 6-feature vector
+        # Input: 4 features [LON_rel, LAT_rel, SOG_rel, Heading_rel]
+        # spa_in_dims=4, tem_in_dims=4 — original SMCHN dims
         self.sparse_weighted_adjacency_matrices = SparseWeightedAdjacency(
-            spa_in_dims=5,
-            tem_in_dims=6,
+            spa_in_dims=4,
+            tem_in_dims=4,
             embedding_dims=embedding_dims,
             obs_len=obs_len,
             dropout=dropout,
@@ -434,9 +408,9 @@ class TrajectoryModel(nn.Module):
             num_heads=num_heads
         )
 
-        # GCN: in_dims=5 (after slicing first feature of 6)
+        # GCN: in_dims=4 — original SMCHN dims
         self.stsgcn = SparseGraphConvolution(
-            in_dims=5,
+            in_dims=4,
             embedding_dims=gcn_hidden,
             dropout=dropout
         )
@@ -448,8 +422,8 @@ class TrajectoryModel(nn.Module):
     def forward(self, graph, identity):
         """
         Args:
-            graph:    [1, obs_len, N, 6] — V_obs:
-                      [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
+            graph:    [1, obs_len, N, 4] — V_obs:
+                      [LON_rel, LAT_rel, SOG_rel, Heading_rel]
             identity: [spatial (T,N,N), temporal (N,T,T)]
 
         Returns:

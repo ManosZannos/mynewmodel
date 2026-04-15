@@ -102,27 +102,6 @@ def resample_interpolate_1min(
 ) -> pd.DataFrame:
     """
     Paper Step 2: Data interpolation (gap-aware).
-
-    Quote from paper:
-    "For data with a time interval of more than one minute between consecutive
-    trajectory points, the missing value of LON and LAT is supplemented by the
-    linear interpolation method."
-
-    KEY FIX: before resampling, each vessel's trajectory is split into segments
-    at gaps > max_gap_minutes. Only genuine short gaps (≤ max_gap_minutes) are
-    interpolated. Large gaps (e.g. vessel left area for hours) are NOT bridged
-    with fake linear stretches.
-
-    Example without fix:
-      10:00, 10:03, 15:40  →  340 artificial points across a 5.5-hour gap
-
-    Example with fix (max_gap_minutes=10):
-      Segment 1: 10:00, 10:01, 10:02, 10:03  (3 real + 1 interpolated point)
-      Segment 2: 15:40                         (1 point, too short for windows)
-
-    Each segment is resampled independently. The MMSI column is preserved so
-    the downstream filter_timestamps_min_vessels() and TrajectoryDataset work
-    correctly.
     """
     initial_count = len(df)
     print(f"\n[Step 2/5] Data interpolation and resampling (max_gap={max_gap_minutes}min)...")
@@ -144,20 +123,14 @@ def resample_interpolate_1min(
         if len(g) == 0:
             continue
 
-        # ----------------------------------------------------------------
-        # Split into continuous segments at large gaps
-        # ----------------------------------------------------------------
         time_diffs = g.index.to_series().diff()
-        # First row has NaT diff → treat as start of first segment
         gap_mask = time_diffs > max_gap
-        segment_ids = gap_mask.cumsum()  # 0, 0, 0, 1, 1, 2, ...
+        segment_ids = gap_mask.cumsum()
 
         for _, seg in g.groupby(segment_ids):
             if len(seg) < 2:
-                # Single isolated point — cannot interpolate or form windows
                 continue
 
-            # Resample only within this segment's time range
             time_range = pd.date_range(
                 start=seg.index.min(),
                 end=seg.index.max(),
@@ -166,11 +139,9 @@ def resample_interpolate_1min(
             r = seg.reindex(time_range)
             r.index.name = "BaseDateTime"
 
-            # LON/LAT: time-based linear interpolation
             r["LON"] = r["LON"].interpolate(method="time")
             r["LAT"] = r["LAT"].interpolate(method="time")
 
-            # SOG/Heading: rolling average (paper: "average value is used")
             for c in ["SOG", "Heading"]:
                 s = r[c]
                 s = s.fillna(
@@ -247,13 +218,7 @@ def zscore_normalize_global(df: pd.DataFrame, cols=("LON", "LAT", "SOG", "Headin
 def to_frame_format(df: pd.DataFrame) -> pd.DataFrame:
     """
     Paper Step 5: Convert to frame format.
-
     Output columns: frame_id, vessel_id, LON, LAT, SOG, Heading
-
-    frame_id is a global minute index from the day's minimum timestamp.
-    This is used by TrajectoryDataset to:
-      1. Find all vessels present at a given frame (for interaction graph)
-      2. Slide windows per vessel trajectory (paper-faithful)
     """
     print(f"\n[Step 5/5] Converting to frame format...")
 
@@ -288,12 +253,6 @@ def preprocess_noaa_to_frames(
 ):
     """
     Complete AIS preprocessing pipeline (paper-aligned).
-    Steps 1-5 as described in the paper.
-
-    Args:
-        max_gap_minutes: gaps larger than this break a vessel trajectory into
-                         separate segments before resampling (default: 10 min).
-                         Prevents fake linear interpolation across hour-long gaps.
     """
     print("=" * 70)
     print("AIS DATA PREPROCESSING PIPELINE (Paper-Aligned)")
@@ -341,38 +300,28 @@ def anorm(p1, p2):
 
 def seq_to_graph(seq_, seq_rel, pos_enc=False):
     """
-    Builds node feature tensor V combining absolute positions AND velocities.
+    Builds node feature tensor V from relative features only.
 
-    Updated from original repo (DualSTMA ablation shows absolute position
-    gives +23% ADE improvement when combined with displacement):
-
-    When pos_enc=True (V_obs):
-      Output: (seq_len, N, 6) = [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-      Replaces original [pos_idx, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-
-    When pos_enc=False (V_pred/V_tr):
+    TRUE BASELINE (original SMCHN, 4 features):
       Output: (seq_len, N, 4) = [LON_rel, LAT_rel, SOG_rel, Heading_rel]
-      Unchanged from original.
+      pos_enc parameter is kept for API compatibility but ignored.
+
+    This matches the original Wang et al. (2023) feature set exactly.
+    Absolute positions are NOT included (unlike v2 which used 6 features
+    following DualSTMA ablation G9).
 
     Args:
         seq_:    (N, 4, seq_len) — absolute positions [LON, LAT, SOG, Heading]
         seq_rel: (N, 4, seq_len) — velocities (differences between consecutive steps)
-        pos_enc: if True, prepend absolute LON/LAT as extra features
+        pos_enc: ignored (kept for API compatibility)
 
     Returns:
-        V: torch.FloatTensor of shape (seq_len, N, 6) if pos_enc else (seq_len, N, 4)
+        V: torch.FloatTensor of shape (seq_len, N, 4)
     """
     assert seq_rel.dim() == 3, f"Expected seq_rel (N, F, T), got {seq_rel.shape}"
 
-    # Velocities: (N, 4, seq_len) → (seq_len, N, 4)
+    # Relative features only: (N, 4, seq_len) → (seq_len, N, 4)
     V = seq_rel.permute(2, 0, 1).contiguous()  # (seq_len, N, 4)
-
-    if pos_enc:
-        # Absolute positions: (N, 4, seq_len) → (seq_len, N, 2) — only LON, LAT
-        abs_pos = seq_.permute(2, 0, 1)[:, :, :2].contiguous()  # (seq_len, N, 2)
-        # Concatenate: [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-        V = torch.cat([abs_pos, V], dim=-1)  # (seq_len, N, 6)
-        return V.float()
 
     return V.float()
 
@@ -397,18 +346,6 @@ class TrajectoryDataset(Dataset):
     """
     Dataloader for AIS trajectory datasets in frame format:
       frame_id, vessel_id, LON, LAT, SOG, Heading
-
-    PAPER-ALIGNED APPROACH (Section 3.2.1):
-      "All vessels in the sea area are constructed as the graph at each time step"
-
-    For each day CSV:
-      1. Build list of unique frame_ids (minutes of the day)
-      2. Slide a window of seq_len frames over the day
-      3. For each window, keep only vessels present in ALL seq_len frames
-      4. Require at least min_ped vessels per window
-
-    This is fast (vectorized numpy) and matches the paper's scene-level graph:
-    all co-present vessels form the spatial graph at each timestep.
     """
 
     def __init__(
@@ -444,14 +381,12 @@ class TrajectoryDataset(Dataset):
         non_linear_ped_list = []
 
         for path in all_files:
-            # Load CSV: frame_id, vessel_id, LON, LAT, SOG, Heading
             data = pd.read_csv(path)
             data_np = data[["frame_id", "vessel_id", "LON", "LAT", "SOG", "Heading"]].values.astype(np.float32)
 
             frames = np.unique(data_np[:, 0]).tolist()
             n_frames = len(frames)
 
-            # Build frame_id → index map and frame_data list
             frame_to_idx = {frame: i for i, frame in enumerate(frames)}
             frame_data = []
             for frame in frames:
@@ -466,10 +401,7 @@ class TrajectoryDataset(Dataset):
                 if idx + self.seq_len > n_frames:
                     break
 
-                # All rows in this window
                 curr_seq_data = np.concatenate(frame_data[idx: idx + self.seq_len], axis=0)
-
-                # Vessels that appear in this window
                 peds_in_curr_seq = np.unique(curr_seq_data[:, 1])
                 self.max_peds_in_frame = max(self.max_peds_in_frame, len(peds_in_curr_seq))
 
@@ -487,7 +419,6 @@ class TrajectoryDataset(Dataset):
                     pad_front = frame_to_idx[curr_ped_seq[0, 0]] - idx
                     pad_end   = frame_to_idx[curr_ped_seq[-1, 0]] - idx + 1
 
-                    # Vessel must be present in ALL frames of the window
                     if pad_end - pad_front != self.seq_len:
                         continue
                     if curr_ped_seq.shape[0] != self.seq_len:
@@ -544,8 +475,8 @@ class TrajectoryDataset(Dataset):
         for ss in range(len(self.seq_start_end)):
             pbar.update(1)
             start, end = self.seq_start_end[ss]
-            # V_obs: absolute + relative features → (obs_len, N, 6)
-            # [LON_abs, LAT_abs, LON_rel, LAT_rel, SOG_rel, Heading_rel]
+            # V_obs: relative features only → (obs_len, N, 4)
+            # [LON_rel, LAT_rel, SOG_rel, Heading_rel] — original SMCHN feature set
             v_ = seq_to_graph(self.obs_traj[start:end, :], self.obs_traj_rel[start:end, :], True)
             self.v_obs.append(v_.clone())
             # V_pred: relative features → (pred_len, N, 4) used as loss target
@@ -571,21 +502,11 @@ class TrajectoryDataset(Dataset):
 
 # ============================================================================
 # METO-S2S JSON UTILITIES
-# JSON field indices (verified against max_min.json):
-#   JSON[1] = LAT_norm, JSON[2] = LON_norm  (lat comes first!)
-#
-# Normalization constants (from max_min.json):
-#   LAT: min=20.90883, range=28.32044
-#   LON: min=-133.29703, range=72.60811
-#   actual = norm * range + min
-#
-# NOTE: global_stats.json is generated by convert_json_to_csv.py
-#       using the above min-max constants — NOT z-score.
 # ============================================================================
 
 _J_TIMESTAMP  = 0
-_J_LAT_NORM   = 1   # JSON[1] = lat_norm
-_J_LON_NORM   = 2   # JSON[2] = lon_norm
+_J_LAT_NORM   = 1
+_J_LON_NORM   = 2
 _J_SOG_NORM   = 3
 _J_HEAD_NORM  = 4
 _J_LON_RAW    = 10
