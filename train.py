@@ -306,7 +306,7 @@ def main(args):
         dset_train,
         batch_size=1,
         shuffle=True,
-        num_workers=0)  # FIX: 0 workers — αποφεύγει shared memory exhaustion στον DGX
+        num_workers=4)  # FIX: 0 workers — αποφεύγει shared memory exhaustion στον DGX
 
     dset_val = TrajectoryDataset(
         os.path.join(data_set, 'val'),
@@ -318,7 +318,7 @@ def main(args):
         dset_val,
         batch_size=1,
         shuffle=False,
-        num_workers=0)  # FIX: 0 workers — αποφεύγει shared memory exhaustion στον DGX
+        num_workers=4)  # FIX: 0 workers — αποφεύγει shared memory exhaustion στον DGX
 
     print('Training started ...')
     print(f'Using device: {device}')
@@ -332,7 +332,9 @@ def main(args):
         dropout=0,
         obs_len=args.obs_len,
         pred_len=args.pred_len,
-        out_dims=2
+        out_dims=2,
+        lstm_hidden=64
+
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
