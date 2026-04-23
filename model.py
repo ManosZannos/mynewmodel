@@ -163,12 +163,7 @@ class SpatialTemporalFusion(nn.Module):
 class SparseWeightedAdjacency(nn.Module):
     """
     Generates normalized sparse spatial and temporal adjacency matrices.
-    Paper Section 3.2.2: Eq. 2-15.
-
-    TRUE BASELINE: 4 features [LON_rel, LAT_rel, SOG_rel, Heading_rel]
-    - spa_in_dims=4: full 4-feature vector for spatial attention
-    - tem_in_dims=4: full 4-feature vector for temporal attention
-    No feature slicing needed (unlike v2 which skipped LON_abs).
+    4 features [LON_rel, LAT_rel, SOG_rel, Heading_rel]
     """
 
     def __init__(self, spa_in_dims=4, tem_in_dims=4, embedding_dims=64, obs_len=10,
@@ -190,17 +185,9 @@ class SparseWeightedAdjacency(nn.Module):
         self.zero_softmax = ZeroSoftmax()
 
     def forward(self, graph, identity):
-        """
-        Args:
-            graph: (T, N, 4) — [LON_rel, LAT_rel, SOG_rel, Heading_rel]
-            identity: [spatial_identity (T,N,N), temporal_identity (N,T,T)]
-        """
         assert len(graph.shape) == 3
 
-        # Spatial graph: full 4 features → (T, N, 4)
         spatial_graph = graph
-
-        # Temporal graph: full 4 features → (N, T, 4)
         temporal_graph = graph.permute(1, 0, 2)
 
         dense_spatial_interaction, spatial_embeddings = self.spatial_attention(
@@ -233,10 +220,7 @@ class SparseWeightedAdjacency(nn.Module):
 
 
 class GraphConvolution(nn.Module):
-    """
-    Single graph convolution layer: H' = σ(A · H · W)
-    Paper Section 3.2.3.
-    """
+    """Single graph convolution layer: H' = σ(A · H · W)"""
 
     def __init__(self, in_dims=2, embedding_dims=16, dropout=0):
         super(GraphConvolution, self).__init__()
@@ -253,12 +237,18 @@ class GraphConvolution(nn.Module):
 
 class SparseGraphConvolution(nn.Module):
     """
-    Two-path sparse GCN with simple addition fusion.
-    Paper Section 3.2.3, Eq. 16-19.
+    Two-path sparse GCN.
 
-    TRUE BASELINE: in_dims=4, uses all 4 features directly.
-    No feature slicing (unlike v2 which sliced LON_abs from 6 features).
-    Layer 2 outputs computed but not used in fusion — matches original repo.
+    V6 change: fusion now uses GCN layer 2 outputs instead of layer 1.
+    Layer 2 has performed an additional round of cross-path message passing
+    (spatial→temporal, temporal→spatial), producing a richer representation.
+
+    Shape flow:
+      gcn_spatial_temporal_features: [N, num_heads, T, emb]
+      gcn_temporal_spatial_features: [T, num_heads, N, emb]
+        → permute(2,1,0,3) → [N, num_heads, T, emb]
+      x = sum: [N, num_heads, T, emb]
+      H = x.permute(0,2,1,3): [N, T, num_heads, emb]
     """
 
     def __init__(self, in_dims=4, embedding_dims=16, dropout=0):
@@ -276,14 +266,6 @@ class SparseGraphConvolution(nn.Module):
         self.temporal_spatial_sparse_gcn.append(GraphConvolution(embedding_dims, embedding_dims))
 
     def forward(self, graph, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix):
-        """
-        Args:
-            graph: [1, T, N, 4] — full 4-feature graph
-            normalized_spatial_adjacency_matrix:  [T, num_heads, N, N]
-            normalized_temporal_adjacency_matrix: [N, num_heads, T, T]
-        """
-        # Use all 4 features directly — no slicing needed
-        graph = graph  # [1, T, N, 4]
 
         spa_graph = graph.permute(1, 0, 2, 3)      # [T, 1, N, 4]
         tem_graph = spa_graph.permute(2, 1, 0, 3)  # [N, 1, T, 4]
@@ -295,10 +277,9 @@ class SparseGraphConvolution(nn.Module):
 
         gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)  # [N, num_heads, T, emb]
 
-        # Layer 2 — computed but not used in fusion (matches original repo)
         gcn_spatial_temporal_features = self.spatial_temporal_sparse_gcn[1](
             gcn_spatial_layer1_perm, normalized_temporal_adjacency_matrix
-        )  # [N, num_heads, T, emb] — not used in fusion
+        )  # [N, num_heads, T, emb]
 
         # --- Temporal path ---
         gcn_temporal_layer1 = self.temporal_spatial_sparse_gcn[0](
@@ -307,21 +288,29 @@ class SparseGraphConvolution(nn.Module):
 
         gcn_temporal_layer1_perm = gcn_temporal_layer1.permute(2, 1, 0, 3)  # [T, num_heads, N, emb]
 
-        # Layer 2 — computed but not used in fusion (matches original repo)
         gcn_temporal_spatial_features = self.temporal_spatial_sparse_gcn[1](
             gcn_temporal_layer1_perm, normalized_spatial_adjacency_matrix
-        )  # [T, num_heads, N, emb] — not used in fusion
+        )  # [T, num_heads, N, emb]
 
-        # --- Fusion: Layer 1 outputs only (original repo, addition) ---
-        x = gcn_spatial_layer1 + gcn_temporal_layer1_perm  # [T, num_heads, N, emb]
+        # --- V6: Fusion using Layer 2 outputs ---
+        # gcn_spatial_temporal_features: [N, num_heads, T, emb]
+        # gcn_temporal_spatial_features: [T, num_heads, N, emb] → permute → [N, num_heads, T, emb]
+        gcn_temporal_spatial_perm = gcn_temporal_spatial_features.permute(2, 1, 0, 3)
+        x = gcn_spatial_temporal_features + gcn_temporal_spatial_perm  # [N, num_heads, T, emb]
 
-        H = x.permute(2, 0, 1, 3)  # [N, T, num_heads, emb]
+        H = x.permute(0, 2, 1, 3)  # [N, T, num_heads, emb]
 
         return H
 
 
 class TCN(nn.Module):
-    def __init__(self, fin, fout, layers=3, ksize=3):
+    """
+    V7 change: layers=3 → layers=4
+    Motivated by DAA-SGCN ablation (Table 3): optimal RT-CNN configuration
+    is 1 GCN layer + 4 CNN layers, consistent with our 1 GCN + 4 TCN setup.
+    """
+
+    def __init__(self, fin, fout, layers=4, ksize=3):
         super(TCN, self).__init__()
         self.fin = fin
         self.fout = fout
@@ -346,7 +335,7 @@ class Encoder(nn.Module):
     H(l+1) = residual + sigmoid(Wf * H) ⊗ tanh(Wg * H)
     """
 
-    def __init__(self, fin, fout, layers=3, ksize=3):
+    def __init__(self, fin, fout, layers=4, ksize=3):
         super(Encoder, self).__init__()
         self.tcnf = TCN(fin, fout, layers, ksize)
         self.tcng = TCN(fin, fout, layers, ksize)
@@ -368,19 +357,19 @@ class Encoder(nn.Module):
 
 class TrajectoryModel(nn.Module):
     """
-    SMCHN True Baseline: Spatial-Multi-Channel Heterogeneous Network
-    Adapted from Wang et al. (Ocean Engineering 2023) for vessel trajectory prediction.
+    SMCHN V6+V7:
+    Baseline: True Baseline (4 features, Linear output)
 
-    This is the TRUE BASELINE — minimal adaptation from original SMCHN:
-    - out_dims=2: deterministic output (necessary for fair comparison with DualSTMA)
-    - Loss: Huber (necessary consequence of deterministic output)
-    - 4 features: [LON_rel, LAT_rel, SOG_rel, Heading_rel] — original SMCHN feature set
-    - Layer 1 fusion (addition) — original repo
-    - spa_in_dims=4, tem_in_dims=4, GCN in_dims=4 — original dims
+    V6 change: GCN fusion uses layer 2 outputs instead of layer 1.
+      Layer 2 outputs have performed cross-path message passing
+      (spatial→temporal path and temporal→spatial path), giving
+      a richer representation before the TCN encoder.
 
-    Unlike v2, this does NOT include absolute positions (LON_abs, LAT_abs).
-    The 6-feature input of v2 was an improvement borrowed from DualSTMA ablation G9,
-    not a requirement for fair comparison.
+    V7 change: TCN layers 3 → 4.
+      Motivated by DAA-SGCN ablation (maritime, Table 3) showing
+      optimal performance at 1 GCN + 4 CNN layers.
+
+    All other components unchanged from true baseline.
     """
 
     def __init__(self,
@@ -396,8 +385,6 @@ class TrajectoryModel(nn.Module):
 
         gcn_hidden = embedding_dims // num_heads  # 16
 
-        # Input: 4 features [LON_rel, LAT_rel, SOG_rel, Heading_rel]
-        # spa_in_dims=4, tem_in_dims=4 — original SMCHN dims
         self.sparse_weighted_adjacency_matrices = SparseWeightedAdjacency(
             spa_in_dims=4,
             tem_in_dims=4,
@@ -408,22 +395,21 @@ class TrajectoryModel(nn.Module):
             num_heads=num_heads
         )
 
-        # GCN: in_dims=4 — original SMCHN dims
         self.stsgcn = SparseGraphConvolution(
             in_dims=4,
             embedding_dims=gcn_hidden,
             dropout=dropout
         )
 
-        self.encoder = Encoder(fin=obs_len, fout=pred_len)
+        # V7: layers=4 (from 3)
+        self.encoder = Encoder(fin=obs_len, fout=pred_len, layers=4)
 
         self.output = nn.Linear(embedding_dims, out_dims)
 
     def forward(self, graph, identity):
         """
         Args:
-            graph:    [1, obs_len, N, 4] — V_obs:
-                      [LON_rel, LAT_rel, SOG_rel, Heading_rel]
+            graph:    [1, obs_len, N, 4]
             identity: [spatial (T,N,N), temporal (N,T,T)]
 
         Returns:
