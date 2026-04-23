@@ -333,8 +333,6 @@ def main(args):
         obs_len=args.obs_len,
         pred_len=args.pred_len,
         out_dims=2,
-        lstm_hidden=64
-
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
