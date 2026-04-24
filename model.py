@@ -237,18 +237,8 @@ class GraphConvolution(nn.Module):
 
 class SparseGraphConvolution(nn.Module):
     """
-    Two-path sparse GCN.
-
-    V6 change: fusion now uses GCN layer 2 outputs instead of layer 1.
-    Layer 2 has performed an additional round of cross-path message passing
-    (spatial→temporal, temporal→spatial), producing a richer representation.
-
-    Shape flow:
-      gcn_spatial_temporal_features: [N, num_heads, T, emb]
-      gcn_temporal_spatial_features: [T, num_heads, N, emb]
-        → permute(2,1,0,3) → [N, num_heads, T, emb]
-      x = sum: [N, num_heads, T, emb]
-      H = x.permute(0,2,1,3): [N, T, num_heads, emb]
+    Two-path sparse GCN with simple addition fusion (layer 1).
+    Unchanged from true baseline.
     """
 
     def __init__(self, in_dims=4, embedding_dims=16, dropout=0):
@@ -270,18 +260,16 @@ class SparseGraphConvolution(nn.Module):
         spa_graph = graph.permute(1, 0, 2, 3)      # [T, 1, N, 4]
         tem_graph = spa_graph.permute(2, 1, 0, 3)  # [N, 1, T, 4]
 
-        # --- Spatial path ---
         gcn_spatial_layer1 = self.spatial_temporal_sparse_gcn[0](
             spa_graph, normalized_spatial_adjacency_matrix
         )  # [T, num_heads, N, emb]
 
-        gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)  # [N, num_heads, T, emb]
+        gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)
 
         gcn_spatial_temporal_features = self.spatial_temporal_sparse_gcn[1](
             gcn_spatial_layer1_perm, normalized_temporal_adjacency_matrix
-        )  # [N, num_heads, T, emb]
+        )  # not used in fusion
 
-        # --- Temporal path ---
         gcn_temporal_layer1 = self.temporal_spatial_sparse_gcn[0](
             tem_graph, normalized_temporal_adjacency_matrix
         )  # [N, num_heads, T, emb]
@@ -290,27 +278,17 @@ class SparseGraphConvolution(nn.Module):
 
         gcn_temporal_spatial_features = self.temporal_spatial_sparse_gcn[1](
             gcn_temporal_layer1_perm, normalized_spatial_adjacency_matrix
-        )  # [T, num_heads, N, emb]
+        )  # not used in fusion
 
-        # --- V6: Fusion using Layer 2 outputs ---
-        # gcn_spatial_temporal_features: [N, num_heads, T, emb]
-        # gcn_temporal_spatial_features: [T, num_heads, N, emb] → permute → [N, num_heads, T, emb]
-        gcn_temporal_spatial_perm = gcn_temporal_spatial_features.permute(2, 1, 0, 3)
-        x = gcn_spatial_temporal_features + gcn_temporal_spatial_perm  # [N, num_heads, T, emb]
-
-        H = x.permute(0, 2, 1, 3)  # [N, T, num_heads, emb]
+        # Layer 1 fusion (unchanged from baseline)
+        x = gcn_spatial_layer1 + gcn_temporal_layer1_perm  # [T, num_heads, N, emb]
+        H = x.permute(2, 0, 1, 3)                          # [N, T, num_heads, emb]
 
         return H
 
 
 class TCN(nn.Module):
-    """
-    V7 change: layers=3 → layers=4
-    Motivated by DAA-SGCN ablation (Table 3): optimal RT-CNN configuration
-    is 1 GCN layer + 4 CNN layers, consistent with our 1 GCN + 4 TCN setup.
-    """
-
-    def __init__(self, fin, fout, layers=4, ksize=3):
+    def __init__(self, fin, fout, layers=3, ksize=3):
         super(TCN, self).__init__()
         self.fin = fin
         self.fout = fout
@@ -329,14 +307,33 @@ class TCN(nn.Module):
         return x
 
 
-class Encoder(nn.Module):
+class PMEncoder(nn.Module):
     """
-    Gated TCN encoder (Paper Eq. 20):
-    H(l+1) = residual + sigmoid(Wf * H) ⊗ tanh(Wg * H)
+    Gated TCN encoder with Polymorphic Mapping (PM) activation.
+
+    V8 change (inspired by STBiNet-PMDA, Table 8):
+    The original Encoder uses a single tanh in the gate branch:
+        g = tanh(tcng(x))
+
+    PM replaces this with a learned weighted sum of three activations:
+        g = w_tanh * tanh(z) + w_sigmoid * sigmoid(z) + w_relu * relu(z)
+    where z = tcng(x) and w_tanh, w_sigmoid, w_relu are learnable scalars.
+
+    Motivation: Different activation functions capture different motion regimes:
+    - tanh:    suppresses fluctuations, good for smooth motion
+    - sigmoid: models continuous, stationary changes
+    - relu:    enhances sensitivity to abrupt dynamic changes
+
+    The model learns to weight these adaptively per training.
+    Initialized with w_tanh=1.0, w_sigmoid=0.0, w_relu=0.0 so that
+    at initialization PM behaves identically to the original tanh gate.
+
+    STBiNet-PMDA ablation shows PM alone gives ~70% MAE reduction
+    over baseline BiGRU. Applied here to the tanh gate of the Gated TCN.
     """
 
-    def __init__(self, fin, fout, layers=4, ksize=3):
-        super(Encoder, self).__init__()
+    def __init__(self, fin, fout, layers=3, ksize=3):
+        super(PMEncoder, self).__init__()
         self.tcnf = TCN(fin, fout, layers, ksize)
         self.tcng = TCN(fin, fout, layers, ksize)
 
@@ -345,29 +342,40 @@ class Encoder(nn.Module):
         else:
             self.residual_proj = None
 
+        # Learnable PM weights — initialized so PM ≡ tanh at start
+        self.w_tanh    = nn.Parameter(torch.tensor(1.0))
+        self.w_sigmoid = nn.Parameter(torch.tensor(0.0))
+        self.w_relu    = nn.Parameter(torch.tensor(0.0))
+
     def forward(self, x):
         if self.residual_proj is not None:
             residual = self.residual_proj(x)
         else:
             residual = x
+
         f = torch.sigmoid(self.tcnf(x))
-        g = torch.tanh(self.tcng(x))
+
+        # PM gate: weighted combination of tanh, sigmoid, relu
+        z = self.tcng(x)
+        g = (self.w_tanh    * torch.tanh(z) +
+             self.w_sigmoid * torch.sigmoid(z) +
+             self.w_relu    * F.relu(z))
+
         return residual + f * g
 
 
 class TrajectoryModel(nn.Module):
     """
-    SMCHN V6+V7:
-    Baseline: True Baseline (4 features, Linear output)
+    SMCHN V8: Polymorphic Mapping (PM) activation in Gated TCN Encoder.
+    Baseline: True Baseline (4 features, layer 1 GCN fusion, Linear output)
 
-    V6 change: GCN fusion uses layer 2 outputs instead of layer 1.
-      Layer 2 outputs have performed cross-path message passing
-      (spatial→temporal path and temporal→spatial path), giving
-      a richer representation before the TCN encoder.
+    V8 change: PMEncoder replaces Encoder.
+      The tanh gate in the Gated TCN is replaced with a learned weighted
+      sum of tanh, sigmoid, and relu (PM activation), allowing the model
+      to adaptively respond to different vessel motion regimes.
 
-    V7 change: TCN layers 3 → 4.
-      Motivated by DAA-SGCN ablation (maritime, Table 3) showing
-      optimal performance at 1 GCN + 4 CNN layers.
+    Motivated by STBiNet-PMDA (Table 8): PM alone gives ~70% MAE reduction.
+    Adapted from GRU context to Gated TCN gate branch.
 
     All other components unchanged from true baseline.
     """
@@ -401,8 +409,8 @@ class TrajectoryModel(nn.Module):
             dropout=dropout
         )
 
-        # V7: layers=4 (from 3)
-        self.encoder = Encoder(fin=obs_len, fout=pred_len, layers=4)
+        # V8: PMEncoder replaces Encoder
+        self.encoder = PMEncoder(fin=obs_len, fout=pred_len)
 
         self.output = nn.Linear(embedding_dims, out_dims)
 
