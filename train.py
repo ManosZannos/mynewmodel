@@ -28,7 +28,6 @@ parser.add_argument('--tag', default='AddGCN_10_10', help='personal tag for the 
 parser.add_argument('--resume', action="store_true", default=False,
                     help='Resume training from last checkpoint')
 
-# Parse early to set CUDA device before importing torch
 args_early, _ = parser.parse_known_args()
 os.environ["CUDA_VISIBLE_DEVICES"] = args_early.gpu_num
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -63,32 +62,44 @@ class Logger(object):
         self.log.write(message)
 
     def flush(self):
-        self.log.flush()  # FIX: flush ώστε τα logs να γράφονται αμέσως στο αρχείο
+        self.log.flush()
 
 
 def huber_loss(pred, target, delta=1.0):
-    """Huber loss — robust to outliers, used by DualSTMA."""
+    """Huber loss — robust to outliers."""
     return F.huber_loss(pred, target, delta=delta, reduction='mean')
 
 
-def graph_loss(V_pred, V_target, last_obs):
+def graph_loss(V_pred, V_target, last_obs, last_vel):
     """
-    DualSTMA-aligned loss (Section 3.4):
-      L = 10 * L_position + 0.1 * L_velocity
+    V10 Motion-Inspired Loss.
+
+    V_pred is interpreted as accelerations (LON_acc, LAT_acc).
+    Kinematic double integration:
+      vel[t] = last_vel + cumsum(acc)[t]
+      pos[t] = last_obs + cumsum(vel)[t]
+
+    Loss: position only (Huber) with short-term weighting.
+    No velocity loss term — the model focuses purely on dynamic characteristics.
+
+    Motivated by MSTFormer ablation (Table 5): acceleration-based prediction
+    with kinematic integration reduces errors vs direct velocity prediction.
 
     Args:
-        V_pred:   [pred_len, N, 2] — predicted (lon_vel, lat_vel)
+        V_pred:   [pred_len, N, 2] — predicted (LON_acc, LAT_acc)
         V_target: [pred_len, N, 4] — GT velocities (first 2 = lon_vel, lat_vel)
         last_obs: [N, 2]           — last observed absolute position (norm space)
+        last_vel: [N, 2]           — last observed velocity (norm space)
     """
     pred_len = V_pred.shape[0]
 
-    # Velocity loss
-    vel_loss = huber_loss(V_pred, V_target[:, :, :2])
+    # Kinematic integration: acc → vel → pos
+    pred_vel = torch.cumsum(V_pred, dim=0) + last_vel.unsqueeze(0)   # [pred_len, N, 2]
+    pred_pos = torch.cumsum(pred_vel, dim=0) + last_obs.unsqueeze(0) # [pred_len, N, 2]
 
-    # Position loss: cumsum of velocities → absolute positions
-    pred_pos = torch.cumsum(V_pred, dim=0) + last_obs.unsqueeze(0)
-    gt_pos   = torch.cumsum(V_target[:, :, :2], dim=0) + last_obs.unsqueeze(0)
+    # GT positions from cumsum of GT velocities
+    gt_vel = V_target[:, :, :2]                                        # [pred_len, N, 2]
+    gt_pos = torch.cumsum(gt_vel, dim=0) + last_obs.unsqueeze(0)      # [pred_len, N, 2]
 
     # Short-term weighting: step 0 (10min) → highest weight
     weights = torch.tensor(
@@ -102,7 +113,7 @@ def graph_loss(V_pred, V_target, last_obs):
         for t in range(pred_len)
     )
 
-    return 10.0 * pos_loss + 0.1 * vel_loss
+    return 10.0 * pos_loss
 
 
 def make_identity(T, N, device):
@@ -126,7 +137,7 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train, scaler):
     batch_count   = 0
     backward_count = 0
     is_fst_loss   = True
-    loss          = None   # FIX: ρητή αρχικοποίηση σε None
+    loss          = None
     loader_len    = len(loader_train)
     turn_point    = int(loader_len / args.batch_size) * args.batch_size + \
                     loader_len % args.batch_size - 1
@@ -145,27 +156,25 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train, scaler):
             V_pred   = model(V_obs, identity)
             V_pred   = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
             V_target = V_tr.squeeze(0)
-            last_obs = obs_traj.squeeze(0)[:, :2, -1]
+            last_obs = obs_traj.squeeze(0)[:, :2, -1]      # [N, 2] last position
+            last_vel = obs_traj_rel.squeeze(0)[:, :2, -1]  # [N, 2] last velocity
 
-            l = graph_loss(V_pred, V_target, last_obs)
+            l = graph_loss(V_pred, V_target, last_obs, last_vel)
 
         if batch_count % args.batch_size != 0 and cnt != turn_point:
-            # Accumulation phase: συσσωρεύουμε loss
             if is_fst_loss:
                 loss = l
                 is_fst_loss = False
             else:
                 loss = loss + l
-            # FIX: διαγράφουμε το l αμέσως — δεν χρειάζεται πλέον
             del l
 
         else:
-            # Backward phase: κάνουμε το backward pass
             if is_fst_loss:
                 loss = l
             else:
                 loss = loss + l
-            del l  # FIX: διαγράφουμε το l
+            del l
 
             loss = loss / args.batch_size
             is_fst_loss = True
@@ -184,9 +193,8 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train, scaler):
             loss_batch += loss.item()
             print('TRAIN:', '\t Epoch:', epoch, '\t Loss:', loss_batch / backward_count)
 
-            # FIX: καθαρισμός GPU memory μετά από κάθε backward pass
-            del loss, V_pred, V_target, last_obs, identity
-            loss = None  # reset για τον επόμενο accumulation κύκλο
+            del loss, V_pred, V_target, last_obs, last_vel, identity
+            loss = None
             torch.cuda.empty_cache()
 
     metrics['train_loss'].append(loss_batch / max(1, backward_count))
@@ -196,7 +204,6 @@ def train(epoch, model, optimizer, checkpoint_dir, loader_train, scaler):
         constant_metrics['min_train_epoch'] = epoch
         torch.save(model.state_dict(), checkpoint_dir + 'train_best.pth')
 
-    # Save last checkpoint for resume support
     torch.save(model.state_dict(), checkpoint_dir + 'last.pth')
     with open(checkpoint_dir + 'last_epoch.txt', 'w') as f:
         f.write(str(epoch))
@@ -210,7 +217,7 @@ def vald(epoch, model, checkpoint_dir, loader_val):
     batch_count    = 0
     backward_count = 0
     is_fst_loss    = True
-    loss           = None  # FIX: ρητή αρχικοποίηση σε None
+    loss           = None
     loader_len     = len(loader_val)
     turn_point     = int(loader_len / args.batch_size) * args.batch_size + \
                      loader_len % args.batch_size - 1
@@ -231,8 +238,9 @@ def vald(epoch, model, checkpoint_dir, loader_val):
                 V_pred   = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
                 V_target = V_tr.squeeze(0)
                 last_obs = obs_traj.squeeze(0)[:, :2, -1]
+                last_vel = obs_traj_rel.squeeze(0)[:, :2, -1]
 
-                l = graph_loss(V_pred, V_target, last_obs)
+                l = graph_loss(V_pred, V_target, last_obs, last_vel)
 
             if batch_count % args.batch_size != 0 and cnt != turn_point:
                 if is_fst_loss:
@@ -240,14 +248,13 @@ def vald(epoch, model, checkpoint_dir, loader_val):
                     is_fst_loss = False
                 else:
                     loss = loss + l
-                del l  # FIX: αποδέσμευση αμέσως
-
+                del l
             else:
                 if is_fst_loss:
                     loss = l
                 else:
                     loss = loss + l
-                del l  # FIX: αποδέσμευση αμέσως
+                del l
 
                 loss = loss / args.batch_size
                 is_fst_loss = True
@@ -255,10 +262,8 @@ def vald(epoch, model, checkpoint_dir, loader_val):
                 loss_batch += loss.item()
                 print('VALD:', '\t Epoch:', epoch, '\t Loss:', loss_batch / backward_count)
 
-                # FIX: καθαρισμός GPU memory — στο val δεν έχουμε gradients
-                # αλλά τα tensors κρατούν GPU memory ακόμα
-                del loss, V_pred, V_target, last_obs, identity
-                loss = None  # reset για τον επόμενο accumulation κύκλο
+                del loss, V_pred, V_target, last_obs, last_vel, identity
+                loss = None
                 torch.cuda.empty_cache()
 
     avg_loss = loss_batch / max(1, backward_count)
@@ -284,17 +289,11 @@ def main(args):
 
     train_dir, train_csv_files = _get_split_csv_files('train')
     if not train_csv_files:
-        raise RuntimeError(
-            f"No CSV files found in {train_dir}. "
-            f"Run: python convert_json_to_csv.py"
-        )
+        raise RuntimeError(f"No CSV files found in {train_dir}.")
 
     val_dir, val_csv_files = _get_split_csv_files('val')
     if not val_csv_files:
-        raise RuntimeError(
-            f"No CSV files found in {val_dir}. "
-            f"Run: python convert_json_to_csv.py"
-        )
+        raise RuntimeError(f"No CSV files found in {val_dir}.")
 
     dset_train = TrajectoryDataset(
         os.path.join(data_set, 'train'),
@@ -306,7 +305,7 @@ def main(args):
         dset_train,
         batch_size=1,
         shuffle=True,
-        num_workers=4)  # FIX: 0 workers — αποφεύγει shared memory exhaustion στον DGX
+        num_workers=4)
 
     dset_val = TrajectoryDataset(
         os.path.join(data_set, 'val'),
@@ -318,7 +317,7 @@ def main(args):
         dset_val,
         batch_size=1,
         shuffle=False,
-        num_workers=4)  # FIX: 0 workers — αποφεύγει shared memory exhaustion στον DGX
+        num_workers=4)
 
     print('Training started ...')
     print(f'Using device: {device}')
@@ -332,7 +331,7 @@ def main(args):
         dropout=0,
         obs_len=args.obs_len,
         pred_len=args.pred_len,
-        out_dims=2,
+        out_dims=2
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -342,11 +341,10 @@ def main(args):
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir)
 
-    # Resume support
     start_epoch = 0
     if args.resume:
-        last_ckpt          = checkpoint_dir + 'last.pth'
-        last_epoch_file    = checkpoint_dir + 'last_epoch.txt'
+        last_ckpt       = checkpoint_dir + 'last.pth'
+        last_epoch_file = checkpoint_dir + 'last_epoch.txt'
         constant_metrics_file = checkpoint_dir + 'constant_metrics.pkl'
         if os.path.exists(last_ckpt) and os.path.exists(last_epoch_file):
             model.load_state_dict(torch.load(last_ckpt, map_location=device))

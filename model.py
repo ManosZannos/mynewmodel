@@ -256,31 +256,27 @@ class SparseGraphConvolution(nn.Module):
 
     def forward(self, graph, normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix):
 
-        spa_graph = graph.permute(1, 0, 2, 3)      # [T, 1, N, 4]
-        tem_graph = spa_graph.permute(2, 1, 0, 3)  # [N, 1, T, 4]
+        spa_graph = graph.permute(1, 0, 2, 3)
+        tem_graph = spa_graph.permute(2, 1, 0, 3)
 
         gcn_spatial_layer1 = self.spatial_temporal_sparse_gcn[0](
             spa_graph, normalized_spatial_adjacency_matrix
-        )  # [T, num_heads, N, emb]
-
+        )
         gcn_spatial_layer1_perm = gcn_spatial_layer1.permute(2, 1, 0, 3)
-
         gcn_spatial_temporal_features = self.spatial_temporal_sparse_gcn[1](
             gcn_spatial_layer1_perm, normalized_temporal_adjacency_matrix
         )  # not used in fusion
 
         gcn_temporal_layer1 = self.temporal_spatial_sparse_gcn[0](
             tem_graph, normalized_temporal_adjacency_matrix
-        )  # [N, num_heads, T, emb]
-
+        )
         gcn_temporal_layer1_perm = gcn_temporal_layer1.permute(2, 1, 0, 3)
-
         gcn_temporal_spatial_features = self.temporal_spatial_sparse_gcn[1](
             gcn_temporal_layer1_perm, normalized_spatial_adjacency_matrix
         )  # not used in fusion
 
-        x = gcn_spatial_layer1 + gcn_temporal_layer1_perm  # [T, num_heads, N, emb]
-        H = x.permute(2, 0, 1, 3)                          # [N, T, num_heads, emb]
+        x = gcn_spatial_layer1 + gcn_temporal_layer1_perm
+        H = x.permute(2, 0, 1, 3)
 
         return H
 
@@ -331,108 +327,31 @@ class Encoder(nn.Module):
         return residual + f * g
 
 
-class TemporalSelfAttention(nn.Module):
-    """
-    Lightweight self-attention over the prediction horizon (pred_len steps).
-
-    V9 change: applied AFTER the TCN Encoder and BEFORE the Linear output.
-    The TCN acts as a feature extractor (embedding), and self-attention
-    captures dependencies across pred_len steps — each predicted timestep
-    can attend to all others.
-
-    Motivated by:
-    - EmbTCN-Transformer: TCN as input embedding + Transformer backbone
-    - DualSTMA ablation: temporal attention > spatial for long-term prediction
-    - GATransformer ablation: Temporal Encoder contributes 5-45% improvement
-    - SGAformer: Skip-PAM attention improves mid-to-long term prediction
-
-    Architecture:
-      Input:  [N, pred_len, embedding_dims]
-      Q, K, V projections over pred_len dimension
-      Output: [N, pred_len, embedding_dims]  (same shape, residual connection)
-
-    Uses causal masking (upper-triangular) so step t only attends to steps ≤ t.
-    This is physically motivated: prediction at step t should not depend on
-    future predicted steps t+1, t+2, ...
-
-    num_heads=4, d_model=embedding_dims=64 — consistent with rest of model.
-    """
-
-    def __init__(self, embedding_dims=64, num_heads=4, dropout=0.0):
-        super(TemporalSelfAttention, self).__init__()
-
-        assert embedding_dims % num_heads == 0
-        self.num_heads = num_heads
-        self.d_model = embedding_dims
-        self.head_dim = embedding_dims // num_heads
-
-        self.q_proj = nn.Linear(embedding_dims, embedding_dims)
-        self.k_proj = nn.Linear(embedding_dims, embedding_dims)
-        self.v_proj = nn.Linear(embedding_dims, embedding_dims)
-        self.out_proj = nn.Linear(embedding_dims, embedding_dims)
-
-        self.register_buffer('scale', torch.sqrt(torch.tensor(float(self.head_dim))))
-
-        self.norm = nn.LayerNorm(embedding_dims)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        """
-        Args:
-            x: [N, pred_len, embedding_dims]
-        Returns:
-            [N, pred_len, embedding_dims]
-        """
-        N, L, D = x.shape  # L = pred_len = 5
-
-        # Multi-head projections
-        Q = self.q_proj(x).reshape(N, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        K = self.k_proj(x).reshape(N, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        V = self.v_proj(x).reshape(N, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        # All: [N, num_heads, L, head_dim]
-
-        # Scaled dot-product attention
-        attn = torch.matmul(Q, K.permute(0, 1, 3, 2)) / self.scale  # [N, num_heads, L, L]
-
-        # Causal mask: step t attends only to steps 0..t
-        causal_mask = torch.tril(torch.ones(L, L, device=x.device)).unsqueeze(0).unsqueeze(0)
-        attn = attn.masked_fill(causal_mask == 0, float('-inf'))
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-
-        # Weighted sum of values
-        out = torch.matmul(attn, V)                             # [N, num_heads, L, head_dim]
-        out = out.permute(0, 2, 1, 3).reshape(N, L, D)         # [N, L, D]
-        out = self.out_proj(out)                                # [N, L, D]
-
-        # Residual + LayerNorm
-        return self.norm(x + out)                               # [N, pred_len, embedding_dims]
-
-
 class TrajectoryModel(nn.Module):
     """
-    SMCHN V9: TCN Encoder + Temporal Self-Attention before Linear output.
+    SMCHN V10: Motion-Inspired acceleration output.
     Baseline: True Baseline (4 features, layer 1 GCN fusion, Gated TCN encoder)
 
-    V9 change: TemporalSelfAttention module inserted between Encoder and output.
+    V10 change: output interpreted as accelerations (LON_acc, LAT_acc)
+    instead of velocities (LON_vel, LAT_vel).
 
-    Pipeline:
-      GCN → Gated TCN Encoder → TemporalSelfAttention → Linear → predictions
+    Architecture is IDENTICAL to true baseline — only the loss function
+    and output interpretation change (in train.py and evaluate.py).
 
-    The TCN acts as a local feature extractor (EmbTCN-Transformer role),
-    and the self-attention captures global temporal dependencies across the
-    pred_len prediction steps, allowing each step to condition on all others.
+    Kinematic integration (in train.py / evaluate.py):
+      vel[t] = vel[t-1] + acc[t]          (cumsum of accelerations + last_obs_vel)
+      pos[t] = pos[t-1] + vel[t]          (cumsum of velocities + last_obs_pos)
 
-    Motivated by 4 papers:
-    - EmbTCN-Transformer: TCN as embedding + Transformer = best combination
-    - DualSTMA ablation (M3 vs M2): temporal-first attention > spatial-first
-    - GATransformer: Temporal Encoder contributes 5-45% across horizons
-    - SGAformer: attention improves mid-to-long term prediction most
+    Motivation (MSTFormer ablation, Table 5):
+      Predicting accelerations and integrating via kinematic equations allows
+      the model to focus on dynamic characteristics (changes in motion) rather
+      than absolute motion values. This reduces prediction errors by ~52%
+      vs direct position prediction in the MSTFormer paper.
 
-    Causal masking ensures step t only attends to steps ≤ t (physically sound).
-    Residual + LayerNorm for training stability.
+    The physics-informed integration also acts as a natural smoothing mechanism,
+      reducing the impact of short-term prediction noise on long-term accuracy.
 
-    All other components unchanged from true baseline.
+    All components unchanged from true baseline.
     """
 
     def __init__(self,
@@ -464,15 +383,7 @@ class TrajectoryModel(nn.Module):
             dropout=dropout
         )
 
-        # Unchanged from baseline
         self.encoder = Encoder(fin=obs_len, fout=pred_len)
-
-        # V9: Temporal Self-Attention after encoder
-        self.temporal_attention = TemporalSelfAttention(
-            embedding_dims=embedding_dims,
-            num_heads=num_heads,
-            dropout=0.0
-        )
 
         self.output = nn.Linear(embedding_dims, out_dims)
 
@@ -483,7 +394,8 @@ class TrajectoryModel(nn.Module):
             identity: [spatial (T,N,N), temporal (N,T,T)]
 
         Returns:
-            [pred_len, N, 2] — predicted (LON_vel, LAT_vel)
+            [pred_len, N, 2] — predicted (LON_acc, LAT_acc)
+            Interpreted as accelerations — kinematic integration in train/evaluate.
         """
         normalized_spatial_adjacency_matrix, normalized_temporal_adjacency_matrix, \
             spatial_embeddings, temporal_embeddings = \
@@ -495,16 +407,11 @@ class TrajectoryModel(nn.Module):
             normalized_temporal_adjacency_matrix
         )
 
-        features = self.encoder(H)       # [N, pred_len, num_heads, gcn_hidden]
+        features = self.encoder(H)
 
-        N = features.shape[0]
-        features = features.contiguous().view(N, self.pred_len, -1)
-        # [N, pred_len, embedding_dims]
+        b, l, _, _ = features.shape
+        features = features.contiguous().view(b, self.pred_len, -1)
 
-        # V9: Temporal Self-Attention over pred_len steps
-        features = self.temporal_attention(features)
-        # [N, pred_len, embedding_dims]
+        prediction = self.output(features)  # [N, pred_len, 2]
 
-        prediction = self.output(features)              # [N, pred_len, 2]
-
-        return prediction.permute(1, 0, 2).contiguous() # [pred_len, N, 2]
+        return prediction.permute(1, 0, 2).contiguous()  # [pred_len, N, 2]

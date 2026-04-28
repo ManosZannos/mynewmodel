@@ -1,23 +1,19 @@
 """
-evaluate.py — Paper-aligned evaluation for SMCHN vs DualSTMA
+evaluate.py — V10 Motion-Inspired evaluation for SMCHN
+
+V10 change: model outputs accelerations (LON_acc, LAT_acc).
+Kinematic double integration:
+  vel[t] = last_vel + cumsum(acc)[t]
+  pos[t] = last_obs + cumsum(vel)[t]
 
 Normalization (METO-S2S, from max_min.json):
-  JSON field order: [timestamp, lat_norm, lon_norm, sog_norm, heading_norm, ...]
   lat_norm = (lat - 20.90883) / 28.32044
   lon_norm = (lon - (-133.29703)) / 72.60811
-
-  Denormalization:
-    lat = lat_norm * 28.32044 + 20.90883
-    lon = lon_norm * 72.60811 + (-133.29703)
-
-CSV field order (from convert_json_to_csv.py):
-  frame_id, vessel_id, LON, LAT, SOG, Heading
-  where LON = JSON[2] = lon_norm, LAT = JSON[1] = lat_norm
 
 Usage:
   python evaluate.py \\
     --dataset marinecadastre_2021 \\
-    --checkpoint checkpoints/SMCHN_dualstma/marinecadastre_2021/val_best.pth \\
+    --checkpoint checkpoints/SMCHN_v10/marinecadastre_2021/val_best.pth \\
     --split test
 """
 
@@ -32,15 +28,11 @@ from model import TrajectoryModel
 from utils import TrajectoryDataset
 
 
-# ── METO-S2S normalization constants (from max_min.json) ──────────────────
+# ── METO-S2S normalization constants ──────────────────────────────────────
 LAT_MIN   =  20.90883
-LAT_RANGE =  28.32044   # lat_max - lat_min = 49.22927 - 20.90883
+LAT_RANGE =  28.32044
 LON_MIN   = -133.29703
-LON_RANGE =  72.60811   # lon_max - lon_min = -60.68892 - (-133.29703)
-
-# CSV column order: frame_id, vessel_id, LON, LAT, SOG, Heading
-# LON col (index 0 in features) = lon_norm  → denorm with LON constants
-# LAT col (index 1 in features) = lat_norm  → denorm with LAT constants
+LON_RANGE =  72.60811
 
 
 def setup_args():
@@ -62,10 +54,11 @@ def setup_args():
 
 def evaluate_model(model, loader, device):
     """
-    Evaluate deterministic SMCHN model (out_dims=2).
+    Evaluate V10 SMCHN model (acceleration output).
 
-    Model predicts velocity (lon_vel, lat_vel) directly.
-    ADE/FDE computed in real-world degrees using METO-S2S denormalization.
+    Model predicts accelerations (LON_acc, LAT_acc).
+    Double kinematic integration → absolute positions.
+    ADE/FDE computed in real-world degrees.
     """
     model.eval()
 
@@ -87,15 +80,21 @@ def evaluate_model(model, loader, device):
             identity_temporal = torch.ones((N, T, T), device=device) * torch.eye(T, device=device)
             identity = [identity_spatial, identity_temporal]
 
-            # Forward pass → [pred_len, N, 2] velocities (deterministic)
+            # Forward pass → [pred_len, N, 2] accelerations
             V_pred = model(V_obs, identity)
             V_pred = V_pred.squeeze(0) if V_pred.dim() == 4 else V_pred
 
             # Last observed absolute position (norm space): [N, 2]
             last_obs = obs_traj.squeeze(0)[:, :2, -1]
 
-            # Cumsum of predicted velocities → absolute positions in norm space
-            pred_abs = torch.cumsum(V_pred, dim=0) + last_obs.unsqueeze(0)  # [pred_len, N, 2]
+            # Last observed velocity (norm space): [N, 2]
+            last_vel = obs_traj_rel.squeeze(0)[:, :2, -1]
+
+            # V10: Double kinematic integration
+            # acc → vel: cumsum of predicted accelerations + last observed velocity
+            pred_vel = torch.cumsum(V_pred, dim=0) + last_vel.unsqueeze(0)  # [pred_len, N, 2]
+            # vel → pos: cumsum of velocities + last observed position
+            pred_abs = torch.cumsum(pred_vel, dim=0) + last_obs.unsqueeze(0)  # [pred_len, N, 2]
 
             # Ground truth absolute positions (norm space): [pred_len, N, 2]
             gt_abs = pred_traj_gt.squeeze(0).permute(2, 0, 1)[:, :, :2]
@@ -128,7 +127,6 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Load CSV dataset
     data_path = os.path.join('./dataset', args.dataset, args.split)
     print(f"\nLoading dataset from: {data_path}")
     dataset = TrajectoryDataset(
@@ -139,11 +137,6 @@ def main():
     )
     print(f"Sequences: {len(dataset)}")
 
-    print(f"\nNormalization (METO-S2S max_min.json):")
-    print(f"  LAT: min={LAT_MIN}, range={LAT_RANGE}  → [{LAT_MIN:.2f}, {LAT_MIN+LAT_RANGE:.2f}]°")
-    print(f"  LON: min={LON_MIN}, range={LON_RANGE} → [{LON_MIN:.2f}, {LON_MIN+LON_RANGE:.2f}]°")
-
-    # Initialize model (deterministic, out_dims=2)
     model = TrajectoryModel(
         number_asymmetric_conv_layer=2,
         embedding_dims=args.embedding_dims,
@@ -159,10 +152,9 @@ def main():
     model.load_state_dict(ckpt)
     print(f"\nCheckpoint loaded: {args.checkpoint}")
 
-    # Evaluate
     results = evaluate_model(model, loader, device)
 
-    # DualSTMA baseline (Huang et al., 2024, Table 2)
+    # DualSTMA baseline
     dualstma_ade = {10: 0.000609, 20: 0.000853, 30: 0.001157, 40: 0.001522, 50: 0.002436}
     dualstma_fde = {10: 0.000807, 20: 0.001164, 30: 0.001771, 40: 0.002378, 50: 0.003946}
 
@@ -171,11 +163,11 @@ def main():
     fde_d   = dualstma_fde.get(horizon)
 
     print(f"\n{'='*70}")
-    print(f"EVALUATION RESULTS — DualSTMA COMPARISON")
+    print(f"EVALUATION RESULTS — DualSTMA COMPARISON (V10 Motion-Inspired)")
     print(f"{'='*70}")
     print(f"Dataset:   {args.dataset} ({args.split})")
     print(f"Sequences: {results['total_sequences']}")
-    print(f"Model:     deterministic (out_dims=2, Huber position loss)")
+    print(f"Model:     V10 acceleration output + kinematic double integration")
     print()
     print(f"  {'Horizon':>8} | {'SMCHN (ours)':>14} | {'DualSTMA':>12} | {'Ratio':>8}")
     print(f"  {'-'*52}")
@@ -194,11 +186,10 @@ def main():
     print(f"  {'FDE':>8} | {results['FDE']:>13.6f}° | {fde_d if fde_d else 'N/A':>12} | {fde_ratio:>8}")
     print(f"{'='*70}")
 
-    # Save results
     out_dir  = os.path.dirname(args.checkpoint)
     out_file = os.path.join(out_dir, f'eval_{args.split}.txt')
     with open(out_file, 'w') as f:
-        f.write(f"SMCHN vs DualSTMA — {args.split}\n")
+        f.write(f"SMCHN V10 vs DualSTMA — {args.split}\n")
         f.write(f"Checkpoint: {args.checkpoint}\n")
         f.write(f"Horizon: {horizon}min\n\n")
         f.write(f"ADE: {results['ADE']:.6f}° (DualSTMA: {ade_d})\n")
