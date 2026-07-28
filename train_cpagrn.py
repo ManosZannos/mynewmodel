@@ -26,6 +26,7 @@ def get_args():
     p.add_argument('--pred_len',       type=int,   default=5)
     p.add_argument('--d_model',        type=int,   default=64)
     p.add_argument('--gru_layers',     type=int,   default=1)
+    p.add_argument('--top_k',          type=int,   default=10)
     p.add_argument('--epochs',         type=int,   default=200)
     p.add_argument('--batch_size',     type=int,   default=32)
     p.add_argument('--lr',             type=float, default=1e-3)
@@ -112,6 +113,7 @@ def main():
         d_model      = args.d_model,
         gru_layers   = args.gru_layers,
         pred_len     = args.pred_len,
+        top_k        = args.top_k,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
