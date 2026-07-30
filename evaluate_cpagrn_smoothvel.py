@@ -1,8 +1,20 @@
 """
-evaluate_cpagrn.py — Evaluation for CPA-GRN (v3: distance threshold).
+evaluate_cpagrn_smoothvel.py — Evaluation for CPA-GRN v4 + smoothed velocity.
 
-Reports ADE/FDE in degrees per prediction horizon,
-matching SMCHN Table 2 format for direct comparison.
+Mirrors evaluate_cpagrn.py, but imports model_cpagrn_smoothvel.py instead
+of model_cpagrn.py (needed for the same reason as the multihead evaluate
+script: the class comes from a different module, so evaluate_cpagrn.py
+can't be reused even though shapes match).
+
+Also includes the top_k fix: passes saved['top_k'] to the model constructor
+instead of silently falling back to the default (10). See experiment_log.md,
+30/7/2026 — evaluate_cpagrn.py was found to be missing this, which means
+any past evaluation of a non-default top_k checkpoint (e.g. top_k=15) via
+the original script may have silently evaluated with top_k=10 instead.
+
+Usage:
+    python evaluate_cpagrn_smoothvel.py --tag CPAGRN_smoothvel_obs20_pred20_s42 \
+        --obs_len 20 --pred_len 20 --split test --gpu_num 0
 """
 
 from __future__ import annotations
@@ -12,12 +24,12 @@ import numpy as np
 
 import torch
 from dataset import get_dataloaders, denorm
-from model_cpagrn import CPAGRN
+from model_cpagrn_smoothvel import CPAGRN
 
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--tag',            type=str,   default='CPAGRN_obs5_pred5_s42')
+    p.add_argument('--tag',            type=str,   default='CPAGRN_smoothvel_obs5_pred5_s42')
     p.add_argument('--split',          type=str,   default='test',
                    choices=['val', 'test'])
     p.add_argument('--data_dir',       type=str,   default='dataset/noaa_dec2021_1min')
@@ -50,7 +62,7 @@ def main():
         d_model      = saved.get('d_model',    64),
         gru_layers   = saved.get('gru_layers', 1),
         pred_len     = saved.get('pred_len',   args.pred_len),
-        top_k        = saved.get('top_k',      10),
+        top_k        = saved.get('top_k',      10),   # ← fix: honor the trained top_k
     ).to(device)
     model.load_state_dict(ckpt['model'])
     model.eval()
@@ -105,19 +117,13 @@ def main():
     fde   = np.mean(fde_list)
 
     print(f'\n{"="*55}')
-    print(f'  CPA-GRN | {args.tag} | {args.split}')
+    print(f'  CPA-GRN (smoothvel) | {args.tag} | {args.split}')
     print('='*55)
     for t, a in enumerate(ade_h, 1):
         print(f'  ADE {t:>2}min : {a:.6f}°  ({a*60:.5f} nm)')
     print('-'*55)
     print(f'  ADE (avg) : {ade:.6f}°  ({ade*60:.5f} nm)')
     print(f'  FDE       : {fde:.6f}°  ({fde*60:.5f} nm)')
-    print('='*55)
-    print(f'\n  SMCHN Table 2 reference (same dataset):')
-    print(f'  Vanilla LSTM {args.pred_len}min ADE = '
-          f'{"0.0019°" if args.pred_len==5 else "0.0031°"}')
-    print(f'  SMCHN        {args.pred_len}min ADE = '
-          f'{"0.0013°" if args.pred_len==5 else "0.0010°"}')
     print('='*55)
 
 
