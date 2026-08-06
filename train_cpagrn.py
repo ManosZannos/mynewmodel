@@ -59,9 +59,10 @@ def run_epoch(loader, model, optimizer, device, args, stats, train: bool):
         last_obs    = obs[:, :, -1, :2]
         target_disp = pred_gt - last_obs.unsqueeze(2)
 
-        pred_disp = model(obs, mask=mask, stats=stats)
 
-        loss = cpagrn_loss(pred_disp, target_disp, mask)
+        with torch.set_grad_enabled(train):
+            pred_disp = model(obs, mask=mask, stats=stats)
+            loss = cpagrn_loss(pred_disp, target_disp, mask)
 
         if train:
             optimizer.zero_grad()
