@@ -30,6 +30,8 @@ def get_args():
     p.add_argument('--epochs',         type=int,   default=200)
     p.add_argument('--batch_size',     type=int,   default=32)
     p.add_argument('--lr',             type=float, default=1e-3)
+    p.add_argument('--weight_decay',   type=float, default=0.0)
+    p.add_argument('--optimizer',      type=str,   default='adam', choices=['adam', 'adamw'])
     p.add_argument('--clip_grad',      type=float, default=1.0)
     p.add_argument('--gpu_num',        type=int,   default=0)
     p.add_argument('--tag',            type=str,   default='CPAGRN_obs5_pred5')
@@ -59,10 +61,9 @@ def run_epoch(loader, model, optimizer, device, args, stats, train: bool):
         last_obs    = obs[:, :, -1, :2]
         target_disp = pred_gt - last_obs.unsqueeze(2)
 
+        pred_disp = model(obs, mask=mask, stats=stats)
 
-        with torch.set_grad_enabled(train):
-            pred_disp = model(obs, mask=mask, stats=stats)
-            loss = cpagrn_loss(pred_disp, target_disp, mask)
+        loss = cpagrn_loss(pred_disp, target_disp, mask)
 
         if train:
             optimizer.zero_grad()
@@ -120,7 +121,10 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f'Parameters: {n_params:,}')
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    if args.optimizer == 'adamw':
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_val   = float('inf')
     best_epoch = 0
