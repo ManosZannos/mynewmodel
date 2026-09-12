@@ -54,10 +54,31 @@ def build_uniontopk(args):
     return model, cpagrn_loss
 
 
+def build_auxrisk(args):
+    from model_cpagrn_auxrisk import CPAGRNAuxRisk, cpagrn_loss
+    model = CPAGRNAuxRisk(
+        feature_size=4, d_model=args.d_model, gru_layers=args.gru_layers,
+        pred_len=args.pred_len, top_k=args.top_k,
+    )
+    # This model's forward returns (pred_disp, aux_pred) instead of just
+    # pred_disp. The generic harness below only has target_disp (not the raw
+    # future positions needed for compute_true_future_dcpa), so this overfit
+    # check only exercises the MAIN displacement loss — it still catches
+    # wiring bugs in the shared encoder/decoder path. The aux_head will show
+    # a ZERO-gradient warning below; that is EXPECTED here, not a bug — the
+    # aux branch itself is only exercised by the full training script
+    # (train_cpagrn_auxrisk.py), which has access to pred_gt.
+    def wrapped_loss(pred_out, target_disp, mask):
+        pred_disp, _aux_pred = pred_out
+        return cpagrn_loss(pred_disp, target_disp, mask)
+    return model, wrapped_loss
+
+
 MODEL_REGISTRY = {
     'gru2':        build_gru2,
     'decodercond': build_decodercond,
     'uniontopk':   build_uniontopk,
+    'auxrisk':     build_auxrisk,
 }
 
 

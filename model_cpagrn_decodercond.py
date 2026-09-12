@@ -187,19 +187,25 @@ class CPAGRNDecoderCond(nn.Module):
         edges_last = self.cpa_features(pos_last, vel_last, hdg_last)
         h = h + self.final_spatial(h, edges_last, mask)
 
-        # 5. Decoder conditioning (NEW)
+        # 5. Decoder conditioning (NEW) — vectorized over all pred_len steps at
+        # once (nn.Linear broadcasts over any leading dims; no Python loop
+        # needed — a per-step loop here was a costly, unnecessary mistake in
+        # an earlier draft, causing ~10x sequential small-kernel overhead).
         tcpa_ctx, dcpa_ctx = nearest_approaching_cpa(edges_last, mask)  # [B, N] each
-        h_feat = self.step_feat(h)  # [B, N, d_model], computed once, shared across steps
+        h_feat = self.step_feat(h)  # [B, N, d_model]
 
-        outputs = []
-        for k in range(self.pred_len):
-            t_frac = torch.full_like(tcpa_ctx, (k + 1) / self.pred_len)  # [B, N]
-            cond_in = torch.stack([tcpa_ctx, dcpa_ctx, t_frac], dim=-1)  # [B, N, 3]
-            cond_k  = self.cond_mlp(cond_in)                             # [B, N, cond_dim]
-            out_k   = self.out_proj(torch.cat([h_feat, cond_k], dim=-1)) # [B, N, 2]
-            outputs.append(out_k)
+        t_idx = torch.arange(
+            1, self.pred_len + 1, device=obs.device, dtype=h_feat.dtype
+        ) / self.pred_len                                        # [pred_len]
+        t_frac   = t_idx.view(1, 1, -1).expand(B, N, self.pred_len)          # [B,N,P]
+        tcpa_exp = tcpa_ctx.unsqueeze(-1).expand(B, N, self.pred_len)        # [B,N,P]
+        dcpa_exp = dcpa_ctx.unsqueeze(-1).expand(B, N, self.pred_len)        # [B,N,P]
 
-        out = torch.stack(outputs, dim=2)  # [B, N, pred_len, 2]
+        cond_in  = torch.stack([tcpa_exp, dcpa_exp, t_frac], dim=-1)  # [B,N,P,3]
+        cond_all = self.cond_mlp(cond_in)                            # [B,N,P,cond_dim]
+
+        h_exp = h_feat.unsqueeze(2).expand(B, N, self.pred_len, self.d_model)  # [B,N,P,d_model]
+        out   = self.out_proj(torch.cat([h_exp, cond_all], dim=-1))  # [B,N,P,2]
 
         if mask is not None:
             out = out * mask.float().unsqueeze(-1).unsqueeze(-1)
