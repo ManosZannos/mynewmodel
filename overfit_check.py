@@ -19,6 +19,7 @@ Add new variants by extending MODEL_REGISTRY below.
 """
 
 from __future__ import annotations
+import os
 import argparse
 import torch
 import torch.nn as nn
@@ -111,8 +112,9 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    device = torch.device(f'cuda:{args.gpu_num}' if torch.cuda.is_available() else 'cpu')
-    print(f'Using device: {device}')
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_num)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Using device: {device} (physical GPU {args.gpu_num})')
     print(f'Overfit check for model="{args.model}", n_samples={args.n_samples}, '
           f'epochs={args.epochs}')
 
