@@ -127,17 +127,29 @@ class CPAGRNDecoderCond(nn.Module):
 
         self.final_spatial = NeighborAggregation(d_model, edge_dim=7, top_k=top_k)
 
-        # ── Decoder conditioning (NEW — everything above is identical to gru2) ──
+        # ── Decoder conditioning (NEW — additive residual correction on top
+        # of the full per-step decoder, NOT a replacement of it). The delta
+        # projection is zero-initialized so at the start of training this
+        # model behaves EXACTLY like the plain gru2 decoder; the conditioning
+        # can only learn a correction, never destroy the base decoder's
+        # already-good per-step differentiation. An earlier draft tied the
+        # output projection across all pred_len steps, which collapsed the
+        # decoder's per-step capacity into the tiny cond_dim pathway and
+        # caused severe degradation especially at short horizons (near-term
+        # prediction needs precise, largely-independent-per-step weights,
+        # exactly what the base decoder already provides) — this fixes that. ──
+        self.decoder = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Linear(d_model, pred_len * 2),
+        )
         self.cond_mlp = nn.Sequential(
             nn.Linear(3, cond_dim),      # [TCPA, DCPA, k/pred_len]
             nn.ReLU(),
             nn.Linear(cond_dim, cond_dim),
-        )
-        self.step_feat = nn.Sequential(
-            nn.Linear(d_model, d_model),
             nn.ReLU(),
         )
-        self.out_proj = nn.Linear(d_model + cond_dim, 2)
+        self.delta_proj = nn.Linear(cond_dim, 2)  # zero-initialized below
 
         self._init_weights()
 
@@ -147,6 +159,14 @@ class CPAGRNDecoderCond(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        # Zero-init the delta projection LAST (after the general loop above
+        # would otherwise xavier-init it): at the start of training, the
+        # conditioning branch contributes exactly zero, so this model is
+        # numerically IDENTICAL to plain gru2 at init. Training can only
+        # learn a correction from there — it cannot start by destabilizing
+        # an already-good base decoder.
+        nn.init.zeros_(self.delta_proj.weight)
+        nn.init.zeros_(self.delta_proj.bias)
 
     def forward(
         self,
@@ -187,25 +207,26 @@ class CPAGRNDecoderCond(nn.Module):
         edges_last = self.cpa_features(pos_last, vel_last, hdg_last)
         h = h + self.final_spatial(h, edges_last, mask)
 
-        # 5. Decoder conditioning (NEW) — vectorized over all pred_len steps at
-        # once (nn.Linear broadcasts over any leading dims; no Python loop
-        # needed — a per-step loop here was a costly, unnecessary mistake in
-        # an earlier draft, causing ~10x sequential small-kernel overhead).
+        # 5. Decoder conditioning (NEW) — base decoder keeps its FULL
+        # per-step capacity (identical to gru2); conditioning contributes
+        # only a small additive correction, vectorized over all pred_len
+        # steps at once (nn.Linear broadcasts over leading dims).
         tcpa_ctx, dcpa_ctx = nearest_approaching_cpa(edges_last, mask)  # [B, N] each
-        h_feat = self.step_feat(h)  # [B, N, d_model]
+
+        base = self.decoder(h).reshape(B, N, self.pred_len, 2)  # [B,N,P,2], same as gru2
 
         t_idx = torch.arange(
-            1, self.pred_len + 1, device=obs.device, dtype=h_feat.dtype
+            1, self.pred_len + 1, device=obs.device, dtype=h.dtype
         ) / self.pred_len                                        # [pred_len]
         t_frac   = t_idx.view(1, 1, -1).expand(B, N, self.pred_len)          # [B,N,P]
         tcpa_exp = tcpa_ctx.unsqueeze(-1).expand(B, N, self.pred_len)        # [B,N,P]
         dcpa_exp = dcpa_ctx.unsqueeze(-1).expand(B, N, self.pred_len)        # [B,N,P]
 
         cond_in  = torch.stack([tcpa_exp, dcpa_exp, t_frac], dim=-1)  # [B,N,P,3]
-        cond_all = self.cond_mlp(cond_in)                            # [B,N,P,cond_dim]
+        cond_all = self.cond_mlp(cond_in)                             # [B,N,P,cond_dim]
+        delta    = self.delta_proj(cond_all)                          # [B,N,P,2] — ≈0 at init
 
-        h_exp = h_feat.unsqueeze(2).expand(B, N, self.pred_len, self.d_model)  # [B,N,P,d_model]
-        out   = self.out_proj(torch.cat([h_exp, cond_all], dim=-1))  # [B,N,P,2]
+        out = base + delta
 
         if mask is not None:
             out = out * mask.float().unsqueeze(-1).unsqueeze(-1)
