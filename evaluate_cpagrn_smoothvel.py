@@ -40,8 +40,18 @@ def get_args():
     return p.parse_args()
 
 
+M_PER_DEG_LAT = 111_320.0
+
+
 def l2_degrees(pred_lat, pred_lon, true_lat, true_lon):
     return np.sqrt((pred_lat - true_lat) ** 2 + (pred_lon - true_lon) ** 2)
+
+
+def l2_meters(pred_lat, pred_lon, true_lat, true_lon):
+    m_per_deg_lon = M_PER_DEG_LAT * np.cos(np.radians(true_lat))
+    dlat_m = (pred_lat - true_lat) * M_PER_DEG_LAT
+    dlon_m = (pred_lon - true_lon) * m_per_deg_lon
+    return np.sqrt(dlat_m ** 2 + dlon_m ** 2)
 
 
 def main():
@@ -81,6 +91,8 @@ def main():
     T = args.pred_len
     ade_per_horizon = [[] for _ in range(T)]
     fde_list = []
+    ade_per_horizon_m = [[] for _ in range(T)]
+    fde_list_m = []
 
     with torch.no_grad():
         for obs, pred_gt, mask, _ in loader:
@@ -108,22 +120,37 @@ def main():
                         continue
                     err = l2_degrees(pred_lat[b,n,:], pred_lon[b,n,:],
                                      true_lat[b,n,:], true_lon[b,n,:])
+                    err_m = l2_meters(pred_lat[b,n,:], pred_lon[b,n,:],
+                                       true_lat[b,n,:], true_lon[b,n,:])
                     for t in range(T):
                         ade_per_horizon[t].append(err[t])
+                        ade_per_horizon_m[t].append(err_m[t])
                     fde_list.append(err[-1])
+                    fde_list_m.append(err_m[-1])
 
     ade_h = [np.mean(h) for h in ade_per_horizon]
     ade   = np.mean(ade_h)
     fde   = np.mean(fde_list)
+    ade_h_m = [np.mean(h) for h in ade_per_horizon_m]
+    ade_m   = np.mean(ade_h_m)
+    fde_m   = np.mean(fde_list_m)
 
     print(f'\n{"="*55}')
     print(f'  CPA-GRN (smoothvel) | {args.tag} | {args.split}')
     print('='*55)
+    print('  [legacy degree-mixed L2]')
     for t, a in enumerate(ade_h, 1):
-        print(f'  ADE {t:>2}min : {a:.6f}°  ({a*60:.5f} nm)')
+        print(f'  ADE {t:>2}min : {a:.6f}°  (naive {a*M_PER_DEG_LAT:.1f} m)')
     print('-'*55)
-    print(f'  ADE (avg) : {ade:.6f}°  ({ade*60:.5f} nm)')
-    print(f'  FDE       : {fde:.6f}°  ({fde*60:.5f} nm)')
+    print(f'  ADE (avg) : {ade:.6f}°  (naive {ade*M_PER_DEG_LAT:.1f} m)')
+    print(f'  FDE       : {fde:.6f}°  (naive {fde*M_PER_DEG_LAT:.1f} m)')
+    print('-'*55)
+    print('  [corrected: geodetic local equirectangular projection]')
+    for t, a in enumerate(ade_h_m, 1):
+        print(f'  ADE {t:>2}min : {a:.2f} m')
+    print('-'*55)
+    print(f'  ADE (avg) : {ade_m:.2f} m')
+    print(f'  FDE       : {fde_m:.2f} m')
     print('='*55)
 
 

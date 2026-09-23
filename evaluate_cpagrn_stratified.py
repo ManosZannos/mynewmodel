@@ -87,8 +87,22 @@ def compute_min_dcpa(obs: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -
     return torch.nan_to_num(min_dcpa, nan=10.0, posinf=10.0)
 
 
+M_PER_DEG_LAT = 111_320.0  # ~constant across latitudes (varies <1% pole-to-equator)
+
+
 def l2_degrees(pred_lat, pred_lon, true_lat, true_lon):
+    """Legacy metric: raw Euclidean distance in mixed lat/lon degree units.
+    NOT geodetically correct (treats 1 deg lon == 1 deg lat), see l2_meters()."""
     return np.sqrt((pred_lat - true_lat) ** 2 + (pred_lon - true_lon) ** 2)
+
+
+def l2_meters(pred_lat, pred_lon, true_lat, true_lon):
+    """Geodetically correct L2 error in meters via local equirectangular
+    projection: each point's own true latitude sets the lon->meters scale."""
+    m_per_deg_lon = M_PER_DEG_LAT * np.cos(np.radians(true_lat))
+    dlat_m = (pred_lat - true_lat) * M_PER_DEG_LAT
+    dlon_m = (pred_lon - true_lon) * m_per_deg_lon
+    return np.sqrt(dlat_m ** 2 + dlon_m ** 2)
 
 
 def main():
@@ -155,19 +169,26 @@ def main():
                         continue
                     err = l2_degrees(pred_lat[b,n,:], pred_lon[b,n,:],
                                      true_lat[b,n,:], true_lon[b,n,:])
+                    err_m = l2_meters(pred_lat[b,n,:], pred_lon[b,n,:],
+                                       true_lat[b,n,:], true_lon[b,n,:])
                     ade = float(np.mean(err))
                     fde = float(err[-1])
+                    ade_m = float(np.mean(err_m))
+                    fde_m = float(err_m[-1])
                     is_risky = bool(min_dcpa[b, n] <= args.risk_threshold)
-                    records.append((ade, fde, is_risky))
+                    records.append((ade, fde, ade_m, fde_m, is_risky))
 
     ade_all = np.array([r[0] for r in records])
     fde_all = np.array([r[1] for r in records])
-    risky   = np.array([r[2] for r in records])
+    ade_all_m = np.array([r[2] for r in records])
+    fde_all_m = np.array([r[3] for r in records])
+    risky   = np.array([r[4] for r in records])
 
     print(f'\n{"="*60}')
     print(f'  Stratified evaluation | {args.tag} | {args.split}')
     print(f'  risk_threshold = {args.risk_threshold} (DCPA, z-score units)')
     print('='*60)
+    print('  [legacy degree-mixed L2]')
     print(f'  Overall     (n={len(ade_all):>5}): ADE={ade_all.mean():.6f}°  FDE={fde_all.mean():.6f}°')
     if risky.sum() > 0:
         print(f'  RISKY       (n={risky.sum():>5}): ADE={ade_all[risky].mean():.6f}°  FDE={fde_all[risky].mean():.6f}°')
@@ -175,6 +196,14 @@ def main():
         print(f'  RISKY       (n=0): no vessels below threshold in this split')
     print(f'  Non-risky   (n={(~risky).sum():>5}): ADE={ade_all[~risky].mean():.6f}°  FDE={fde_all[~risky].mean():.6f}°')
     print(f'  Risky fraction of test set: {100*risky.mean():.1f}%')
+    print('-'*60)
+    print('  [corrected: geodetic local equirectangular projection, meters]')
+    print(f'  Overall     (n={len(ade_all_m):>5}): ADE={ade_all_m.mean():.2f} m  FDE={fde_all_m.mean():.2f} m')
+    if risky.sum() > 0:
+        print(f'  RISKY       (n={risky.sum():>5}): ADE={ade_all_m[risky].mean():.2f} m  FDE={fde_all_m[risky].mean():.2f} m')
+    else:
+        print(f'  RISKY       (n=0): no vessels below threshold in this split')
+    print(f'  Non-risky   (n={(~risky).sum():>5}): ADE={ade_all_m[~risky].mean():.2f} m  FDE={fde_all_m[~risky].mean():.2f} m')
     print('='*60)
 
 
