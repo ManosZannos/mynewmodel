@@ -1,14 +1,21 @@
 """
-evaluate_cpagrn_v5_multihead.py — Evaluation για το πείραμα Multi-Head
-Neighbor Attention (βλ. model_cpagrn_multihead.py).
+evaluate_cpagrn_nocpa.py — Evaluation for the No-CPA ablation checkpoints
+(trained with train_cpagrn_nocpa_huberloss.py).
 
-Πανομοιότυπο με το evaluate_cpagrn.py, με ΜΟΝΗ διαφορά ότι εισάγει το
-μοντέλο από το model_cpagrn_multihead.py αντί για model_cpagrn.py, και
-περνάει το num_heads στον constructor. Δεν αγγίζει το evaluate_cpagrn.py.
+Identical to evaluate_cpagrn.py (including the geodetically-correct ADE/FDE in
+metres via local equirectangular projection) EXCEPT that the model class is
+imported from model_cpagrn_nocpa (edge_dim=5, geometry-only edges). It cannot
+reuse evaluate_cpagrn.py because the state_dict shapes differ (attention MLP
+input is d_model+5 instead of d_model+7).
+
+Architecture hyperparameters (d_model, gru_layers, top_k) are read from the
+checkpoint's saved args, as in the other evaluate scripts — do not pass them
+on the command line.
 
 Usage:
-    python evaluate_cpagrn_v5_multihead.py --tag CPAGRN_v5_multihead4_obs10_pred10_s42 \
-        --split test --obs_len 10 --pred_len 10 --gpu_num 0
+    python evaluate_cpagrn_nocpa.py \
+        --tag CPAGRN_v5_nocpa_huber_d05_gru2_lr5e4_obs10_pred10_s42 \
+        --obs_len 10 --pred_len 10 --split test --gpu_num <GPU>
 """
 
 from __future__ import annotations
@@ -18,30 +25,37 @@ import numpy as np
 
 import torch
 from dataset import get_dataloaders, denorm
-from model_cpagrn_multihead import CPAGRN
+from model_cpagrn_nocpa import CPAGRN
 
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--tag',            type=str,   default='CPAGRN_v5_multihead4_obs10_pred10_s42')
+    p.add_argument('--tag',            type=str,   default='CPAGRN_obs5_pred5_s42')
     p.add_argument('--split',          type=str,   default='test',
                    choices=['val', 'test'])
     p.add_argument('--data_dir',       type=str,   default='dataset/noaa_dec2021_1min')
-    p.add_argument('--obs_len',        type=int,   default=10)
-    p.add_argument('--pred_len',       type=int,   default=10)
+    p.add_argument('--obs_len',        type=int,   default=5)
+    p.add_argument('--pred_len',       type=int,   default=5)
     p.add_argument('--batch_size',     type=int,   default=32)
     p.add_argument('--gpu_num',        type=int,   default=0)
     return p.parse_args()
 
 
-M_PER_DEG_LAT = 111_320.0
+M_PER_DEG_LAT = 111_320.0  # ~constant across latitudes (varies <1% pole-to-equator)
 
 
 def l2_degrees(pred_lat, pred_lon, true_lat, true_lon):
+    """Legacy metric: raw Euclidean distance in mixed lat/lon degree units.
+    Kept only for continuity with prior reported numbers — NOT geodetically
+    correct (treats 1 deg lon == 1 deg lat), see l2_meters()."""
     return np.sqrt((pred_lat - true_lat) ** 2 + (pred_lon - true_lon) ** 2)
 
 
 def l2_meters(pred_lat, pred_lon, true_lat, true_lon):
+    """Geodetically correct L2 error in meters via local equirectangular
+    projection: each point's own true latitude sets the lon->meters scale
+    (m_per_deg_lon = 111320 * cos(lat)), so lat and lon contribute their
+    actual physical distance before being combined."""
     m_per_deg_lon = M_PER_DEG_LAT * np.cos(np.radians(true_lat))
     dlat_m = (pred_lat - true_lat) * M_PER_DEG_LAT
     dlon_m = (pred_lon - true_lon) * m_per_deg_lon
@@ -53,6 +67,7 @@ def main():
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_num)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # Load checkpoint
     ckpt_path = os.path.join('checkpoints', args.tag, 'val_best.pth')
     assert os.path.exists(ckpt_path), f'Not found: {ckpt_path}'
     ckpt  = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -65,14 +80,12 @@ def main():
         d_model      = saved.get('d_model',    64),
         gru_layers   = saved.get('gru_layers', 1),
         pred_len     = saved.get('pred_len',   args.pred_len),
-        num_heads    = saved.get('num_heads',  4),
+        top_k        = saved.get('top_k',      10),
     ).to(device)
     model.load_state_dict(ckpt['model'])
     model.eval()
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'Parameters: {n_params:,}')
-
+    # Data
     _, val_loader, test_loader, file_stats = get_dataloaders(
         args.data_dir, args.obs_len, args.pred_len, args.batch_size
     )
@@ -126,26 +139,34 @@ def main():
     ade_h = [np.mean(h) for h in ade_per_horizon]
     ade   = np.mean(ade_h)
     fde   = np.mean(fde_list)
+
     ade_h_m = [np.mean(h) for h in ade_per_horizon_m]
     ade_m   = np.mean(ade_h_m)
     fde_m   = np.mean(fde_list_m)
 
     print(f'\n{"="*55}')
-    print(f'  CPA-GRN (multi-head) | {args.tag} | {args.split}')
+    print(f'  CPA-GRN No-CPA | {args.tag} | {args.split}')
     print('='*55)
-    print('  [legacy degree-mixed L2]')
+    print('  [legacy: raw degree-mixed L2, x111320 naive conversion]')
     for t, a in enumerate(ade_h, 1):
         print(f'  ADE {t:>2}min : {a:.6f}°  (naive {a*M_PER_DEG_LAT:.1f} m)')
     print('-'*55)
     print(f'  ADE (avg) : {ade:.6f}°  (naive {ade*M_PER_DEG_LAT:.1f} m)')
     print(f'  FDE       : {fde:.6f}°  (naive {fde*M_PER_DEG_LAT:.1f} m)')
-    print('-'*55)
+    print('='*55)
     print('  [corrected: geodetic local equirectangular projection]')
     for t, a in enumerate(ade_h_m, 1):
         print(f'  ADE {t:>2}min : {a:.2f} m')
     print('-'*55)
     print(f'  ADE (avg) : {ade_m:.2f} m')
     print(f'  FDE       : {fde_m:.2f} m')
+    print(f'  Correction factor (corrected/naive): {ade_m/(ade*M_PER_DEG_LAT):.4f}')
+    print('='*55)
+    print(f'\n  SMCHN Table 2 reference (same dataset, naive-degree convention):')
+    print(f'  Vanilla LSTM {args.pred_len}min ADE = '
+          f'{"0.0019°" if args.pred_len==5 else "0.0031°"}')
+    print(f'  SMCHN        {args.pred_len}min ADE = '
+          f'{"0.0013°" if args.pred_len==5 else "0.0010°"}')
     print('='*55)
 
 

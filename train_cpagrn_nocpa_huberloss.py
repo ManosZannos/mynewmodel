@@ -1,15 +1,25 @@
 """
-train_cpagrn_auxrisk.py — Training script for CPA-GRN, Auxiliary Risk Head variant.
+train_cpagrn_nocpa_huberloss.py — Training script for the No-CPA ablation,
+matched to the FINAL headline recipe (gru2, lr=5e-4, Huber delta=0.05).
 
-Same encoder/GRU/neighbor-selection/decoder as gru2. Adds a small auxiliary
-head trained to predict the REALIZED future closest-approach distance
-(ground truth, computed from future positions of all vessels), with a small
-auxiliary loss term (default weight 0.1). See model_cpagrn_auxrisk.py.
+Differs from train_cpagrn_huberloss.py in EXACTLY ONE thing: the model is
+imported from model_cpagrn_nocpa_huberloss (edge features = geometry only,
+no TCPA/DCPA). Everything else — data, optimizer, LR schedule, loss, gradient
+clipping, epochs, batch size, checkpoint format, seeds — is identical, so the
+comparison against the headline isolates the contribution of CPA/TCPA.
 
-Usage:
-    python train_cpagrn_auxrisk.py --obs_len 10 --pred_len 10 --gru_layers 2 \
-        --top_k 10 --aux_weight 0.1 --seed 42 --lr 5e-4 \
-        --tag CPAGRN_v5_auxrisk_gru2_lr5e4_obs10_pred10_s42 --gpu_num <GPU>
+Do NOT re-calibrate --huber_delta here: it must stay at 0.05 (the headline
+value), otherwise the ablation is no longer single-factor. The untrained-model
+calibration print below is kept only for log parity with the headline runs.
+
+Checkpoints use the same format as the headline, but the architecture differs
+(edge_dim=5), so they must be evaluated with evaluate_cpagrn_nocpa.py, NOT
+evaluate_cpagrn.py (state_dict shapes would not match).
+
+Usage (run the same 3 seeds as the headline: 42, 123, 456):
+    python train_cpagrn_nocpa_huberloss.py --obs_len 10 --pred_len 10 --gru_layers 2 \
+        --top_k 10 --huber_delta 0.05 --seed 42 --lr 5e-4 \
+        --tag CPAGRN_v5_nocpa_huber_d05_gru2_lr5e4_obs10_pred10_s42 --gpu_num <GPU>
 """
 
 from __future__ import annotations
@@ -25,7 +35,7 @@ import torch.nn as nn
 import numpy as np
 
 from dataset import get_dataloaders
-from model_cpagrn_auxrisk import CPAGRNAuxRisk, compute_true_future_dcpa, auxrisk_loss
+from model_cpagrn_nocpa_huberloss import CPAGRN, huber_cpagrn_loss
 
 
 def get_args():
@@ -36,7 +46,7 @@ def get_args():
     p.add_argument('--d_model',        type=int,   default=64)
     p.add_argument('--gru_layers',     type=int,   default=2)
     p.add_argument('--top_k',          type=int,   default=10)
-    p.add_argument('--aux_weight',     type=float, default=0.1)
+    p.add_argument('--huber_delta',    type=float, default=0.05)
     p.add_argument('--epochs',         type=int,   default=200)
     p.add_argument('--batch_size',     type=int,   default=32)
     p.add_argument('--lr',             type=float, default=5e-4)   # headline recipe default
@@ -44,7 +54,7 @@ def get_args():
     p.add_argument('--optimizer',      type=str,   default='adam', choices=['adam', 'adamw'])
     p.add_argument('--clip_grad',      type=float, default=1.0)
     p.add_argument('--gpu_num',        type=int,   default=0)
-    p.add_argument('--tag',            type=str,   default='CPAGRN_auxrisk_obs10_pred10')
+    p.add_argument('--tag',            type=str,   default='CPAGRN_nocpa_huber_obs10_pred10')
     p.add_argument('--seed',           type=int,   default=42)
     p.add_argument('--log_every',      type=int,   default=10)
     return p.parse_args()
@@ -60,10 +70,8 @@ def get_lr(epoch, args):
 
 def run_epoch(loader, model, optimizer, device, args, stats, train: bool):
     model.train(train)
-    total_loss     = 0.0
-    total_main     = 0.0
-    total_aux      = 0.0
-    n_batches      = 0
+    total_loss = 0.0
+    n_batches  = 0
 
     grad_ctx = torch.enable_grad() if train else torch.no_grad()
     with grad_ctx:
@@ -75,13 +83,9 @@ def run_epoch(loader, model, optimizer, device, args, stats, train: bool):
             last_obs    = obs[:, :, -1, :2]
             target_disp = pred_gt - last_obs.unsqueeze(2)
 
-            pred_disp, aux_pred = model(obs, mask=mask, stats=stats)
+            pred_disp = model(obs, mask=mask, stats=stats)
 
-            true_dcpa = compute_true_future_dcpa(pred_gt, mask)
-            loss, main_loss, aux_loss = auxrisk_loss(
-                pred_disp, target_disp, aux_pred, true_dcpa, mask,
-                aux_weight=args.aux_weight,
-            )
+            loss = huber_cpagrn_loss(pred_disp, target_disp, mask, delta=args.huber_delta)
 
             if train:
                 optimizer.zero_grad()
@@ -90,13 +94,9 @@ def run_epoch(loader, model, optimizer, device, args, stats, train: bool):
                 optimizer.step()
 
             total_loss += loss.item()
-            total_main += main_loss.item()
-            total_aux  += aux_loss.item()
             n_batches  += 1
 
-    return (total_loss / max(n_batches, 1),
-            total_main / max(n_batches, 1),
-            total_aux  / max(n_batches, 1))
+    return total_loss / max(n_batches, 1)
 
 
 def main():
@@ -122,8 +122,8 @@ def main():
     )
     log = logging.getLogger()
     log.info(f'Tag: {args.tag}')
-    log.info(f'Model: model_cpagrn_auxrisk.py (gru_layers={args.gru_layers}, '
-              f'top_k={args.top_k}, aux_weight={args.aux_weight})')
+    log.info(f'Model: model_cpagrn_nocpa_huberloss.py (No-CPA ablation: geometry-only '
+              f'edges, edge_dim=5) + Huber loss (delta={args.huber_delta})')
     log.info(f'Args: {vars(args)}')
 
     train_loader, val_loader, _, stats = get_dataloaders(
@@ -134,7 +134,7 @@ def main():
     )
     log.info(f'Train batches: {len(train_loader)} | Val batches: {len(val_loader)}')
 
-    model = CPAGRNAuxRisk(
+    model = CPAGRN(
         feature_size = 4,
         d_model      = args.d_model,
         gru_layers   = args.gru_layers,
@@ -144,6 +144,28 @@ def main():
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f'Parameters: {n_params:,}')
+
+    # ── Calibration print (epoch-0, untrained-weights) — see module docstring ──
+    with torch.no_grad():
+        obs0, pred_gt0, mask0, _ = next(iter(train_loader))
+        obs0, pred_gt0, mask0 = obs0.to(device), pred_gt0.to(device), mask0.to(device)
+        last_obs0    = obs0[:, :, -1, :2]
+        target_disp0 = pred_gt0 - last_obs0.unsqueeze(2)
+        pred_disp0   = model(obs0, mask=mask0, stats=stats)
+        dist0 = (pred_disp0 - target_disp0).norm(dim=-1)
+        m0 = mask0.unsqueeze(-1).expand_as(dist0)
+        vals = dist0[m0].detach().cpu().numpy()
+        p10, p25, p50, p75 = np.percentile(vals, [10, 25, 50, 75])
+        log.info(
+            f'[UNTRAINED-MODEL calibration] displacement-error magnitude '
+            f'(first batch, z-score units): p10={p10:.4f}  p25={p25:.4f}  '
+            f'p50={p50:.4f}  p75={p75:.4f}'
+        )
+        log.info(
+            f'  These are UNTRAINED-model errors (much larger than a converged '
+            f'model will produce) — use only as a rough scale sanity check, not '
+            f'as the calibration target itself. Current --huber_delta={args.huber_delta}.'
+        )
 
     if args.optimizer == 'adamw':
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -159,28 +181,23 @@ def main():
             pg['lr'] = lr
 
         t0 = time.time()
-        train_loss, train_main, train_aux = run_epoch(
-            train_loader, model, optimizer, device, args, stats, train=True)
-        val_loss, val_main, val_aux = run_epoch(
-            val_loader, model, optimizer, device, args, stats, train=False)
-        elapsed = time.time() - t0
+        train_loss = run_epoch(train_loader, model, optimizer, device, args, stats, train=True)
+        val_loss   = run_epoch(val_loader,   model, optimizer, device, args, stats, train=False)
+        elapsed    = time.time() - t0
 
         if (epoch + 1) % args.log_every == 0 or epoch == 0:
             log.info(
                 f'Epoch {epoch+1:>3}/{args.epochs} | lr={lr:.2e} | '
-                f'train={train_loss:.6f} (main={train_main:.6f} aux={train_aux:.6f}) | '
-                f'val={val_loss:.6f} (main={val_main:.6f} aux={val_aux:.6f}) | t={elapsed:.1f}s'
+                f'train={train_loss:.6f} | val={val_loss:.6f} | t={elapsed:.1f}s'
             )
 
-        # Model selection uses MAIN loss only (the task we actually care about),
-        # not the combined loss — avoids the aux term biasing checkpoint choice.
-        if val_main < best_val:
-            best_val   = val_main
+        if val_loss < best_val:
+            best_val   = val_loss
             best_epoch = epoch + 1
             torch.save({
                 'epoch':    epoch + 1,
                 'model':    model.state_dict(),
-                'val_loss': val_main,
+                'val_loss': val_loss,
                 'args':     vars(args),
                 'stats':    stats,
             }, os.path.join(ckpt_dir, 'val_best.pth'))
@@ -190,7 +207,7 @@ def main():
             'model': model.state_dict(),
         }, os.path.join(ckpt_dir, 'latest.pth'))
 
-    log.info(f'Done. Best val (main loss): {best_val:.6f} at epoch {best_epoch}')
+    log.info(f'Done. Best val: {best_val:.6f} at epoch {best_epoch}')
 
 
 if __name__ == '__main__':
