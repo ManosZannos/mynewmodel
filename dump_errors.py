@@ -43,7 +43,7 @@ from evaluate_cpagrn_stratified import compute_min_dcpa
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--arch',       type=str, required=True, choices=['cpagrn', 'nocpa', 'lstm'])
+    p.add_argument('--arch',       type=str, required=True, choices=['cpagrn', 'nocpa', 'nograph', 'lstm'])
     p.add_argument('--tag',        type=str, required=True)
     p.add_argument('--split',      type=str, default='test', choices=['val', 'test'])
     p.add_argument('--data_dir',   type=str, default='dataset/noaa_dec2021_1min')
@@ -58,11 +58,13 @@ def get_args():
 
 
 def build_model(arch: str, saved: dict, pred_len: int, device):
-    if arch in ('cpagrn', 'nocpa'):
+    if arch in ('cpagrn', 'nocpa', 'nograph'):
         if arch == 'cpagrn':
             from model_cpagrn import CPAGRN
-        else:
+        elif arch == 'nocpa':
             from model_cpagrn_nocpa import CPAGRN
+        else:
+            from model_cpagrn_nograph_huberloss import CPAGRN
         model = CPAGRN(
             feature_size = 4,
             d_model      = saved.get('d_model',    64),
