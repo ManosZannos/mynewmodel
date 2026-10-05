@@ -31,6 +31,7 @@ Usage:
 from __future__ import annotations
 import argparse
 import itertools
+from math import comb
 
 import numpy as np
 
@@ -109,6 +110,43 @@ def fmt_ci(r):
     return f"{r['diff']:+.1f} m [{r['lo']:+.1f}, {r['hi']:+.1f}] ({r['pct']:+.1f}%){sig}"
 
 
+def seed_tests(xa, xb, rng, max_exact=200000, n_rand=50000):
+    """Training-seed-level comparison of per-seed overall ADE (b - a; positive = a better).
+    Returns [Welch p, permutation p]. Permutation is exact when C(n_a+n_b, n_a) is small."""
+    xa, xb = np.asarray(xa, float), np.asarray(xb, float)
+    if len(xa) < 2 or len(xb) < 2:
+        return ['n/a', 'n/a']
+    va, vb = xa.var(ddof=1) / len(xa), xb.var(ddof=1) / len(xb)
+    se = np.sqrt(va + vb)
+    if se == 0:
+        welch = 'n/a'
+    else:
+        t = (xb.mean() - xa.mean()) / se
+        df = (va + vb) ** 2 / (va ** 2 / (len(xa) - 1) + vb ** 2 / (len(xb) - 1))
+        try:
+            from scipy import stats
+            welch = f'{2 * stats.t.sf(abs(t), df):.3f}'
+        except Exception:
+            welch = 'n/a (scipy missing)'
+    allv, na = np.concatenate([xa, xb]), len(xa)
+    obs = abs(xb.mean() - xa.mean())
+    total = comb(len(allv), na)
+    if total <= max_exact:
+        cnt = 0
+        for idx in itertools.combinations(range(len(allv)), na):
+            ga = allv[list(idx)]
+            gb = np.delete(allv, list(idx))
+            cnt += abs(gb.mean() - ga.mean()) >= obs - 1e-12
+        perm = f'{cnt / total:.3f} (exact, {total} splits)'
+    else:
+        cnt = 0
+        for _ in range(n_rand):
+            p = rng.permutation(len(allv))
+            cnt += abs(allv[p[na:]].mean() - allv[p[:na]].mean()) >= obs - 1e-12
+        perm = f'{(cnt + 1) / (n_rand + 1):.3f} (Monte Carlo)'
+    return [welch, perm]
+
+
 def md_table(header, rows):
     out = ['| ' + ' | '.join(header) + ' |', '|' + '|'.join(['---'] * len(header)) + '|']
     out += ['| ' + ' | '.join(str(c) for c in r) + ' |' for r in rows]
@@ -157,9 +195,10 @@ def main():
         sd = lambda x: f'{np.std(x, ddof=1):.2f}' if len(x) > 1 else '—'
         rows.append([n, len(models[n]), f'{np.mean(ade_seed):.2f} ± {sd(ade_seed)}',
                      f'{np.mean(fde_seed):.2f} ± {sd(fde_seed)}',
-                     f'{np.median(ADE[n]):.2f}', f'{np.percentile(ADE[n], 90):.2f}'])
+                     f'{np.median(ADE[n]):.2f}', f'{np.percentile(ADE[n], 90):.2f}',
+                     ', '.join(f'{v:.1f}' for v in ade_seed)])
     out.append('## 1. Overall (metres; ± = std across seeds)\n')
-    out.append(md_table(['model', 'seeds', 'ADE mean', 'FDE mean', 'ADE median (per vessel)', 'ADE p90'], rows))
+    out.append(md_table(['model', 'seeds', 'ADE mean', 'FDE mean', 'ADE median (per vessel)', 'ADE p90', 'per-seed ADE'], rows))
     out.append('\nMean much larger than median = heavy-tailed errors dominated by a minority of vessels.\n')
 
     # 2. paired overall
@@ -170,6 +209,19 @@ def main():
         rows.append([f'{a}:{b}', 'FDE', fmt_ci(cl.paired(FDE[a], FDE[b], allsel))])
     out.append('## 2. Paired comparison, scene-clustered bootstrap\n')
     out.append(md_table(['pair', 'metric', 'difference [95% CI] (relative)'], rows))
+    out.append('')
+
+    # 2b. seed-level comparison: training randomness, NOT captured by the scene bootstrap
+    rows = []
+    for a, b in pairs:
+        xa = [d['err_m'].mean() for d in models[a]]
+        xb = [d['err_m'].mean() for d in models[b]]
+        rows.append([f'{a}:{b}', f'{len(xa)} vs {len(xb)}', f'{np.mean(xb) - np.mean(xa):+.2f} m'] + seed_tests(xa, xb, rng))
+    out.append('## 2b. Seed-level comparison (per-seed overall ADE)\n')
+    out.append('The scene bootstrap in section 2 measures test-set sampling noise for the trained models; '
+               'it does NOT include training-seed randomness. This table does. '
+               'A claim that survives only section 2 is not established.\n')
+    out.append(md_table(['pair', 'seeds', 'mean diff (b-a)', 'Welch p', 'permutation p'], rows))
     out.append('')
 
     # 3. strata

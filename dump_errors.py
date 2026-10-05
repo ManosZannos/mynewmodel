@@ -10,6 +10,8 @@ comparisons) becomes a cheap CPU post-processing of these dumps
 Supported architectures (--arch):
     cpagrn : model_cpagrn.CPAGRN            (headline; also gru2 MSE etc.)
     nocpa  : model_cpagrn_nocpa.CPAGRN      (No-CPA ablation)
+    nograph: model_cpagrn_nograph_huberloss.CPAGRN (no neighbor aggregation)
+    relvel : model_cpagrn_relvel_huberloss.CPAGRN  (relative-velocity control)
     lstm   : model_lstm.VanillaLSTM         (baseline)
 Architecture hyper-parameters are read from the checkpoint's saved args, as in
 the evaluate_*.py scripts — do not pass them on the command line.
@@ -43,7 +45,7 @@ from evaluate_cpagrn_stratified import compute_min_dcpa
 
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument('--arch',       type=str, required=True, choices=['cpagrn', 'nocpa', 'nograph', 'lstm'])
+    p.add_argument('--arch',       type=str, required=True, choices=['cpagrn', 'nocpa', 'nograph', 'relvel', 'lstm'])
     p.add_argument('--tag',        type=str, required=True)
     p.add_argument('--split',      type=str, default='test', choices=['val', 'test'])
     p.add_argument('--data_dir',   type=str, default='dataset/noaa_dec2021_1min')
@@ -58,11 +60,13 @@ def get_args():
 
 
 def build_model(arch: str, saved: dict, pred_len: int, device):
-    if arch in ('cpagrn', 'nocpa', 'nograph'):
+    if arch in ('cpagrn', 'nocpa', 'nograph', 'relvel'):
         if arch == 'cpagrn':
             from model_cpagrn import CPAGRN
         elif arch == 'nocpa':
             from model_cpagrn_nocpa import CPAGRN
+        elif arch == 'relvel':
+            from model_cpagrn_relvel_huberloss import CPAGRN
         else:
             from model_cpagrn_nograph_huberloss import CPAGRN
         model = CPAGRN(
