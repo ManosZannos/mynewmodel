@@ -82,8 +82,11 @@ SEG_GAP_S = 600            # cut a segment when reports are > 10 min apart (v1 M
 BRIDGE_MAX_S = 360         # do not create grid points inside a reporting gap longer than this
                            # (v1: up to 5 interpolated minutes inside gaps <= 10 min)
 GAP_IMP_S = 120            # flag grid points that bridge a gap > 120 s (EnvShip short-gap limit)
-IMPLIED_FACTOR = 2.5       # implied speed > max(2.5 * max(SOG), SOG_MAX + 5) -> cut
-IMPLIED_FLOOR_KN = SOG_MAX + 5.0
+IMPLIED_CAP_KN = SOG_MAX + 5.0   # implied speed between consecutive reports > 27 kn -> glitch.
+                                 # A fixed cap (not EnvShip's max(factor*SOG, cap)) because rows with
+                                 # SOG > 22 kn are dropped, so nothing legitimate exceeds it. With every
+                                 # kept report pair <= 27 kn, the piecewise-linear 1-min track can never
+                                 # step faster than 27 kn either (checked at the end of main).
 SOG_INTERP_DIFF_KN = 5.0   # interpolate SOG only if the two reports differ by <= 5 kn, else hold
 SOG_SENTINEL = 102.2
 R_EARTH = 6371008.8
@@ -142,8 +145,7 @@ def _implied_and_thr(t, lat, lon, sog, i, j):
     dy = (lat[j] - lat[i]) * k * R_EARTH
     dx = (lon[j] - lon[i]) * k * R_EARTH * np.cos(0.5 * (lat[j] + lat[i]) * k)
     implied = np.hypot(dx, dy) / np.maximum(dt, 1.0) * KNOTS_PER_MPS
-    s = np.nan_to_num(sog, nan=0.0)
-    thr = np.maximum(IMPLIED_FACTOR * np.maximum(s[i], s[j]), IMPLIED_FLOOR_KN)
+    thr = np.full_like(implied, IMPLIED_CAP_KN)
     return implied, thr
 
 
@@ -173,8 +175,7 @@ def segment_reports(t, lat, lon, sog):
     dy = (lat[1:] - lat[:-1]) * k * R_EARTH
     dx = (lon[1:] - lon[:-1]) * k * R_EARTH * np.cos(0.5 * (lat[1:] + lat[:-1]) * k)
     implied = np.hypot(dx, dy) / dt * KNOTS_PER_MPS
-    s = np.nan_to_num(sog, nan=0.0)
-    thr = np.maximum(IMPLIED_FACTOR * np.maximum(s[1:], s[:-1]), IMPLIED_FLOOR_KN)
+    thr = np.full_like(implied, IMPLIED_CAP_KN)
     cut = (dt > SEG_GAP_S) | (implied > thr)
     return np.concatenate([[0], np.cumsum(cut)]), int(((implied > thr) & (dt <= SEG_GAP_S)).sum())
 
@@ -344,8 +345,8 @@ def main():
     print(f'output check — implied speed / SOG (>= 3 kn): p10/p50/p90 = '
           f'{np.percentile(ratio, 10):.2f} / {np.median(ratio):.2f} / {np.percentile(ratio, 90):.2f}, '
           f'within ±10%: {100 * np.mean(np.abs(ratio - 1) <= 0.1):.1f}%')
-    tele = same & (d > IMPLIED_FLOOR_KN / KNOTS_PER_MPS * GRID_S)
-    print(f'output check — consecutive-minute steps faster than {IMPLIED_FLOOR_KN:.0f} kn (any SOG): '
+    tele = same & (d > IMPLIED_CAP_KN / KNOTS_PER_MPS * GRID_S)
+    print(f'output check — consecutive-minute steps faster than {IMPLIED_CAP_KN:.0f} kn (any SOG): '
           f'{int(tele.sum()):,} (should be ~0)')
     print(f'HDG_SRC share: report {100 * (res.HDG_SRC == 0).mean():.1f}% | COG {100 * (res.HDG_SRC == 1).mean():.1f}% '
           f'| held {100 * (res.HDG_SRC == 2).mean():.1f}%   GAP_IMP: {100 * res.GAP_IMP.mean():.1f}%')
@@ -376,7 +377,7 @@ def main():
     with open(os.path.join(args.out_base, 'global_stats.json'), 'w') as f:
         json.dump(stats, f, indent=2)
     meta = dict(version='v2', heading_policy=args.heading_policy, grid_s=GRID_S, seg_gap_s=SEG_GAP_S, bridge_max_s=BRIDGE_MAX_S,
-                gap_imp_s=GAP_IMP_S, implied_factor=IMPLIED_FACTOR, implied_floor_kn=IMPLIED_FLOOR_KN,
+                gap_imp_s=GAP_IMP_S, implied_cap_kn=IMPLIED_CAP_KN,
                 sog_interp_diff_kn=SOG_INTERP_DIFF_KN, sog_max=SOG_MAX, min_vessels_gt=MIN_VESSELS,
                 rows=totals, vessels=len(mmsis))
     with open(os.path.join(args.out_base, 'build_meta.json'), 'w') as f:
