@@ -17,8 +17,9 @@ the numeric thresholds are ours because EnvShip's config file is not in their re
      SOG >= 102.2. Heading gaps are filled from COG (when moving) and then held within the
      segment; HDG_SRC records where each value came from.  [EnvShip pipeline_utils]
   3. Angles are interpolated circularly (no 359->0 artefact).  [EnvShip circular_interp_deg]
-  4. Segmentation on raw reports by time gap OR implausible implied speed (glitch -> the
-     segment is cut, the bad point ends up in a 1-point segment and is dropped).  [EnvShip 05]
+  4. Glitches: one-point position spikes are removed (despike); remaining implausible jumps
+     (implied speed) cut the segment as in EnvShip stage 05, and the cut always leaves a hole of
+     at least one minute so a track never "teleports" between consecutive minutes.
   5. GAP_IMP flag = grid point bridged across a reporting gap > 120 s.  [EnvShip 07: short gap]
   6. frame_id = minutes since 2021-12-01 00:00 UTC, so "consecutive frame_id" in dataset.py
      means consecutive minutes (v1 numbered the distinct timestamps instead).
@@ -134,6 +135,37 @@ def hold_fill(v):
     return s.ffill().bfill().to_numpy()
 
 
+def _implied_and_thr(t, lat, lon, sog, i, j):
+    """implied speed (kn) and its threshold between report indices i and j (arrays)."""
+    k = np.pi / 180.0
+    dt = (t[j] - t[i]).astype(float)
+    dy = (lat[j] - lat[i]) * k * R_EARTH
+    dx = (lon[j] - lon[i]) * k * R_EARTH * np.cos(0.5 * (lat[j] + lat[i]) * k)
+    implied = np.hypot(dx, dy) / np.maximum(dt, 1.0) * KNOTS_PER_MPS
+    s = np.nan_to_num(sog, nan=0.0)
+    thr = np.maximum(IMPLIED_FACTOR * np.maximum(s[i], s[j]), IMPLIED_FLOOR_KN)
+    return implied, thr
+
+
+def despike(t, lat, lon, sog, passes=3):
+    """Remove one-point position spikes: i -> i+1 and i+1 -> i+2 implausible, i -> i+2 plausible.
+    Returns a boolean keep-mask. (Persistent shifts are left to segment_reports.)"""
+    keep = np.ones(len(t), dtype=bool)
+    for _ in range(passes):
+        idx = np.where(keep)[0]
+        if len(idx) < 3:
+            break
+        a, b, c = idx[:-2], idx[1:-1], idx[2:]
+        v_ab, t_ab = _implied_and_thr(t, lat, lon, sog, a, b)
+        v_bc, t_bc = _implied_and_thr(t, lat, lon, sog, b, c)
+        v_ac, t_ac = _implied_and_thr(t, lat, lon, sog, a, c)
+        spike = (v_ab > t_ab) & (v_bc > t_bc) & (v_ac <= t_ac) & ((t[c] - t[a]) <= SEG_GAP_S)
+        if not spike.any():
+            break
+        keep[b[spike]] = False
+    return keep
+
+
 def segment_reports(t, lat, lon, sog):
     """Segment ids on raw reports: time gap or implausible implied speed (EnvShip stage 05)."""
     k = np.pi / 180.0
@@ -237,7 +269,7 @@ def main():
     print(f'\nrows in box after cleaning: {n_raw_box:,} | moving vessels: {df.MMSI.nunique():,} '
           f'| Heading missing: {100 * df.Heading.isna().mean():.1f}% (kept, filled later)')
 
-    out_parts, n_speed_cuts, n_seg = [], 0, 0
+    out_parts, n_speed_cuts, n_seg, n_spikes, n_boundary = [], 0, 0, 0, 0
     for mmsi, vd in df.groupby('MMSI', sort=False):
         vd = vd.sort_values('BaseDateTime')
         t = vd['BaseDateTime'].values.astype('datetime64[s]').astype(np.int64)
@@ -249,8 +281,14 @@ def main():
         sog, cog, hdg = (vd[c].to_numpy(float) for c in ('SOG', 'COG', 'Heading'))
         if len(t) < 2:
             continue
+        kp = despike(t, lat, lon, sog)
+        n_spikes += int((~kp).sum())
+        t, lat, lon, sog, cog, hdg = t[kp], lat[kp], lon[kp], sog[kp], cog[kp], hdg[kp]
+        if len(t) < 2:
+            continue
         seg, cuts = segment_reports(t, lat, lon, sog)
         n_speed_cuts += cuts
+        vparts = []
         for s in np.unique(seg):
             m = seg == s
             if m.sum() < 2:
@@ -258,15 +296,27 @@ def main():
             r = resample_segment(t[m], lat[m], lon[m], sog[m], cog[m], hdg[m])
             if r is None or r.empty:
                 continue
-            r['MMSI'] = mmsi
-            out_parts.append(r)
-            n_seg += 1
+            r['seg'] = s
+            vparts.append(r)
+        if not vparts:
+            continue
+        v = pd.concat(vparts, ignore_index=True).sort_values('t')
+        # a speed cut must leave a hole: if the first minute of a new segment directly follows the
+        # last minute of the previous one, drop it (otherwise the track "teleports" between minutes)
+        adj = (v['seg'].values[1:] != v['seg'].values[:-1]) & (np.diff(v['t'].values) <= GRID_S)
+        if adj.any():
+            n_boundary += int(adj.sum())
+            v = v.drop(v.index[1:][adj])
+        v = v.drop(columns='seg')
+        v['MMSI'] = mmsi
+        out_parts.append(v)
+        n_seg += len(vparts)
     res = pd.concat(out_parts, ignore_index=True)
     del out_parts, df
-    # two segments of the same vessel cannot share a minute after a time-gap cut, but an
-    # implied-speed cut can produce overlap at the boundary minute: keep one row
-    res = res.drop_duplicates(['MMSI', 't'], keep='first')
-    print(f'segments resampled: {n_seg:,} | implied-speed cuts: {n_speed_cuts:,} | 1-min rows: {len(res):,}')
+    res = res.drop_duplicates(['MMSI', 't'], keep='first')   # safety; should be a no-op
+    print(f'one-point spikes removed: {n_spikes:,} | segments resampled: {n_seg:,} | '
+          f'implied-speed cuts (after despiking): {n_speed_cuts:,} | boundary minutes dropped: {n_boundary:,} | '
+          f'1-min rows: {len(res):,}')
 
     # scene filter (as v1): timestamps with > MIN_VESSELS vessels
     counts = res.groupby('t')['MMSI'].transform('count')
@@ -294,6 +344,9 @@ def main():
     print(f'output check — implied speed / SOG (>= 3 kn): p10/p50/p90 = '
           f'{np.percentile(ratio, 10):.2f} / {np.median(ratio):.2f} / {np.percentile(ratio, 90):.2f}, '
           f'within ±10%: {100 * np.mean(np.abs(ratio - 1) <= 0.1):.1f}%')
+    tele = same & (d > IMPLIED_FLOOR_KN / KNOTS_PER_MPS * GRID_S)
+    print(f'output check — consecutive-minute steps faster than {IMPLIED_FLOOR_KN:.0f} kn (any SOG): '
+          f'{int(tele.sum()):,} (should be ~0)')
     print(f'HDG_SRC share: report {100 * (res.HDG_SRC == 0).mean():.1f}% | COG {100 * (res.HDG_SRC == 1).mean():.1f}% '
           f'| held {100 * (res.HDG_SRC == 2).mean():.1f}%   GAP_IMP: {100 * res.GAP_IMP.mean():.1f}%')
 
