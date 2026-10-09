@@ -217,6 +217,19 @@ def main():
     L.append('\nReading: the manoeuvre rows are the headroom of any learned model over CV. Where they sit '
              '(encounters vs port areas) points to interaction vs geography.\n')
 
+    rows = []
+    for a, g in mv.groupby('area'):
+        for lab, col in (('moving nb', 'enc_moving'), ('any nb', 'enc_any')):
+            e, n = g[g[col] == 1], g[g[col] == 0]
+            rows.append([a, lab, f'{len(e):,}', f'{100 * e.manoeuvre.mean():.1f}%' if len(e) else '—',
+                         f'{len(n):,}', f'{100 * n.manoeuvre.mean():.1f}%' if len(n) else '—',
+                         f'{e.cv_ade.mean():.0f} / {n.cv_ade.mean():.0f}' if len(e) and len(n) else '—'])
+    L.append('## D2. Encounter vs no encounter WITHIN each area (removes the location confound)\n')
+    L.append(md_table(['area', 'encounter with', 'n encounter', 'manoeuvre rate (enc)', 'n no-enc',
+                       'manoeuvre rate (no enc)', 'CV ADE enc / no-enc (m)'], rows))
+    L.append('\nReading: encounters happen mostly in ports, where manoeuvres happen anyway. Only a gap that '
+             'survives inside the same area points to interaction rather than geography.\n')
+
     q = mv[['n_1nm', 'n_3nm', 'n_moving_3nm']].quantile([0.5, 0.9]).round(0)
     L.append('## Neighbourhood of moving samples (counts of other vessels)\n')
     L.append(md_table(['quantile', 'any ≤ 1 nm', 'any ≤ 3 nm', 'moving ≤ 3 nm'],
