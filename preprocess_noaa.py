@@ -54,7 +54,7 @@ DEFAULT_CONFIG = {
     "seg_gap_s": 600,               # A7  🔬 {300, 600, 900}
     "bridge_max_s": 180,            # A8  🔬 {120, 180, 360}
     "gap_imp_flag_s": 120,
-    "interp_method": "linear",      # A8  🔬 linear / cubic (μόνο linear υλοποιείται εδώ)
+    "interp_method": "hermite",     # A8  κινηματική Hermite (SOG/COG των άκρων), αλλιώς linear· V3
     "min_segment_s": 300,           # A12 🔬
     "speed_caps_kn": {              # A4  τιμές από EnvShip, ⚠️ ελέγχονται στο funnel
         "global": 55.0, "cargo": 35.0, "tanker": 35.0, "passenger": 45.0,
@@ -340,6 +340,20 @@ def resample_segment(t, lat, lon, sog, cog, hdg, cfg):
     x, y = _to_local(lat, lon, lat0, lon0)
     gx = (1 - alpha) * x[l] + alpha * x[r]
     gy = (1 - alpha) * y[l] + alpha * y[r]
+    if cfg.get("interp_method", "linear") == "hermite":
+        # κινηματική Hermite: ταχύτητες των άκρων από SOG/COG (V3: p90 27.8 έναντι 48.1 m στα 120–180 s)
+        cvm0 = cfg["cog_valid_min_sog_kn"]
+        vel_ok = ~np.isnan(sog) & ~np.isnan(cog) & (sog >= cvm0)
+        vxr = np.where(vel_ok, np.nan_to_num(sog) * KN * np.sin(np.radians(np.nan_to_num(cog))), 0.0)
+        vyr = np.where(vel_ok, np.nan_to_num(sog) * KN * np.cos(np.radians(np.nan_to_num(cog))), 0.0)
+        use = ~exact & vel_ok[l] & vel_ok[r]
+        h = span
+        a2, a3 = alpha ** 2, alpha ** 3
+        h00, h10, h01, h11 = 2 * a3 - 3 * a2 + 1, a3 - 2 * a2 + alpha, -2 * a3 + 3 * a2, a3 - a2
+        hx = h00 * x[l] + h10 * h * vxr[l] + h01 * x[r] + h11 * h * vxr[r]
+        hy = h00 * y[l] + h10 * h * vyr[l] + h01 * y[r] + h11 * h * vyr[r]
+        gx = np.where(use, hx, gx)
+        gy = np.where(use, hy, gy)
 
     # SOG (A9)
     sa, sb = sog[l], sog[r]
