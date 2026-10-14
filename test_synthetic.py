@@ -130,7 +130,7 @@ def report_times(dur_s, lo=60, hi=80, phase=None, rng=None, gaps=()):
         if not any(a < t < b for a, b in gaps):
             out.append(t)
         t += float(rng.uniform(lo, hi)) if hi > lo else float(lo)
-    return np.array(out)
+    return np.round(np.array(out))   # οι χρονοσφραγίδες AIS είναι ακέραια δευτερόλεπτα
 
 
 def make_reports(track, times, mmsi=367000001, vessel_type=70, transceiver="A",
