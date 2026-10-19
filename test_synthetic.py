@@ -531,6 +531,73 @@ def test_velocity_vectors():
 
 
 # ---------------------------------------------------------------------------
+# Περιπτώσεις από τον οπτικό έλεγχο (V5, Μάρτιος 2025)
+# ---------------------------------------------------------------------------
+def test_v5_wrong_low_sog_does_not_cut():
+    # πλοίο που δηλώνει SOG 0 ενώ κινείται με 12 kn (V5: 338090233, 368121190)
+    tr = Track(3600, lambda t: 12, lambda t: 30 + 0.01 * t)
+    raw = make_reports(tr, report_times(3600, 60, 90), vessel_type=52)
+    raw["sog"] = 0.0
+    out, funnel, _ = run(raw)
+    assert out["seg_id"].nunique() == 1, "λάθος χαμηλό SOG δεν πρέπει να κόβει την τροχιά"
+    assert funnel["dropped"].get("short_segment", 0) == 0
+    assert funnel["dropped"].get("despike", 0) == 0
+
+
+def test_v5_corner_and_deceleration_not_spikes():
+    # γωνία 60° στα 12 kn (V5: 368244550, 369140000) και ferry που κόβει 15 → 0 kn σε 2 λεπτά
+    corner = Track(2400, lambda t: 12, lambda t: 0 if t < 1200 else min(60, (t - 1200) * 1.0))
+    dec = Track(2400, lambda t: 15 if t < 1200 else max(0.0, 15 - (t - 1200) * 15 / 120),
+                lambda t: 90)
+    for name, tr in (("γωνία", corner), ("επιβράδυνση", dec)):
+        out, funnel, _ = run(make_reports(tr, report_times(2400, 60, 80), pos_noise_m=5))
+        assert funnel["dropped"].get("despike", 0) == 0, f"{name}: θεωρήθηκε spike"
+
+
+def test_v5_no_long_chains_of_removals():
+    # μόνιμη μετατόπιση 6 διαδοχικών αναφορών κατά 400 m (V5: 366991470)
+    tr = straight(2400, kn=10, course=0)
+    raw = make_reports(tr, report_times(2400, 60, 60, phase=17))
+    k = len(raw) // 2
+    for j in range(k, k + 6):
+        x, y = latlon_to_xy(raw.loc[j, "latitude"], raw.loc[j, "longitude"])
+        raw.loc[j, "latitude"], raw.loc[j, "longitude"] = xy_to_latlon(x + 400, y)
+    _, funnel, cfg = run(raw)
+    assert funnel["dropped"].get("despike", 0) <= 2 * cfg["despike"]["max_consecutive"], \
+        "το despike έφαγε αλυσίδα αναφορών"
+
+
+def test_v5_hermite_no_loops_at_low_speed():
+    # σχεδόν ακίνητο σκάφος με θορυβώδες SOG (2–2.9 kn) και τυχαίο COG (V5: 367424810, 369914072).
+    # Με Hermite για SOG ≥ 0.5 kn το σφάλμα έφτανε ~56 m· με το όριο των 3 kn ~13 m.
+    rng = np.random.default_rng(11)
+    tr = Track(3600, lambda t: 0.3, lambda t: 45)
+    raw = make_reports(tr, report_times(3600, 150, 180, rng=rng), pos_noise_m=5, rng=rng)
+    raw["cog"] = rng.uniform(0, 360, len(raw)).round(1)
+    raw["sog"] = rng.uniform(2.0, 2.9, len(raw)).round(1)
+    out, _, _ = run(raw)
+    err = pos_error_m(tr, out)
+    assert err.max() < 30, f"η παρεμβολή έφυγε {err.max():.0f} m από την τροχιά (βρόχος Hermite)"
+
+
+def test_v5_placeholder_mmsi_excluded():
+    parts = [make_reports(straight(1200), report_times(1200), mmsi=m) for m in (345000000, 366000000)]
+    parts.append(make_reports(straight(1200), report_times(1200), mmsi=345000001))
+    out, funnel, _ = run(pd.concat(parts, ignore_index=True))
+    assert set(out["mmsi"].unique()) == {345000001}
+
+
+def test_v5_qc_needs_min_reports():
+    tr = straight(1500, kn=10, course=0)
+    raw = make_reports(tr, report_times(1500, 70, 70, phase=5), mmsi=368297020)
+    k = len(raw) // 2
+    raw.loc[k, "latitude"] += 0.02
+    _, funnel, cfg = run(raw)
+    assert len(raw) < cfg["mmsi_qc_min_reports"]
+    assert 368297020 not in set(funnel["mmsi_qc_flagged"]), "σημαία QC από 1 ανωμαλία σε λίγες αναφορές"
+
+
+# ---------------------------------------------------------------------------
 # Συνέχεια, ποιότητα ανά MMSI, funnel, ντετερμινισμός
 # ---------------------------------------------------------------------------
 def test_midnight_utc_continuity():

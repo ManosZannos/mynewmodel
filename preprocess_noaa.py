@@ -47,7 +47,7 @@ REGIONS = {
 }
 
 DEFAULT_CONFIG = {
-    "config_version": "stageA-v3.0",
+    "config_version": "stageA-v3.1",
     "region": REGIONS["socal"],
     "margin_km": 10.0,              # κουτί + περιθώριο για γείτονες (στόχοι μόνο IN_CORE)
     "grid_s": 60,
@@ -69,7 +69,9 @@ DEFAULT_CONFIG = {
         "chord_k": 0.25,            # κατώφλι χορδής = max(chord_min_m, k * SOG * Δt)
         "cog_agree_deg": 30.0,      # το COG των i-1, i+1 πρέπει να συμφωνεί με τη χορδή
         "max_passes": 10,
+        "max_consecutive": 2,       # V5: όχι αλυσίδες αφαιρέσεων (366991470)
     },
+    "hermite_min_sog_kn": 3.0,      # Hermite μόνο όπου επικυρώθηκε (V3: SOG ≥ 3 kn), αλλιώς linear
     "sog_interp_max_diff_kn": 5.0,  # A9
     "cog_valid_min_sog_kn": 0.5,    # A10
     "stationary_sog_kn": 0.5,
@@ -77,6 +79,7 @@ DEFAULT_CONFIG = {
     "qc_sog_min_kn": 3.0,
     "qc_cog_max_deg": 30.0,
     "mmsi_qc_max_anomaly_frac": 0.05,
+    "mmsi_qc_min_reports": 50,      # V5: όχι σημαία από 1 ανωμαλία σε λίγες αναφορές
 }
 
 DROP_KEYS = ["invalid_position", "outside_box", "invalid_mmsi", "duplicate",
@@ -212,17 +215,22 @@ def box_with_margin(df, region, margin_km):
 
 
 def valid_mmsi(m: pd.Series) -> pd.Series:
+    """9 ψηφία, MID 201–775 (σταθμοί πλοίων), όχι placeholder MID + 000000 (π.χ. 345000000)."""
     ok = m.notna() & (m >= 100_000_000) & (m <= 999_999_999) & (m == np.floor(m))
     mid = (m // 1_000_000)
-    return ok & (mid >= 201) & (mid <= 775)
+    placeholder = (m % 1_000_000) == 0
+    return ok & (mid >= 201) & (mid <= 775) & ~placeholder
 
 
 # ---------------------------------------------------------------------------
 # A6: despike
 # ---------------------------------------------------------------------------
 def _pair_threshold(sog_a, sog_b, cap, dcfg):
+    """Κατώφλι implied speed. Το SOG μόνο ΑΝΕΒΑΖΕΙ το κατώφλι (γρήγορα σκάφη)· κατώτατο το
+    fallback (27 kn, v2), ώστε λάθος χαμηλό SOG να μην κόβει τροχιές (V5: 338090233, 368121190)."""
     s = np.fmax(sog_a, sog_b)                       # fmax: αγνοεί NaN αν υπάρχει η άλλη τιμή
-    thr = np.where(np.isnan(s), dcfg["fallback_kn"], s * dcfg["factor"] + dcfg["margin_kn"])
+    thr = np.where(np.isnan(s), dcfg["fallback_kn"],
+                   np.maximum(dcfg["fallback_kn"], s * dcfg["factor"] + dcfg["margin_kn"]))
     return np.minimum(thr, cap + dcfg["margin_kn"])
 
 
@@ -259,12 +267,26 @@ def despike_vessel(lat, lon, t, sog, cog, cap, cfg):
         crit_speed = (v_ab > thr_ab) & (v_bc > thr_bc) & (v_ac <= thr_ac)
         score_speed = np.minimum(v_ab / thr_ab, v_bc / thr_bc)
 
-        # δεύτερο κριτήριο: απόσταση του b από τη θέση που προβλέπει η χορδή a → c στον χρόνο του b
-        # (πιάνει και πλευρικά και διαμήκη spikes)
+        # δεύτερο κριτήριο: απόσταση του b από τη θέση που προβλέπεται στον χρόνο του b από τα a, c
+        # (πιάνει πλευρικά και διαμήκη spikes). Πρόβλεψη Hermite όταν a, c έχουν SOG ≥ hermite_min
+        # (λαμβάνει υπόψη στροφή και αλλαγή ταχύτητας), αλλιώς χορδή σταθερής ταχύτητας.
         _, dx_ab, dy_ab = _pair_dist_m(la[a], lo[a], la[b], lo[b])
         with np.errstate(divide="ignore", invalid="ignore"):
             frac = dt_ab / dt_ac
-        dev = np.hypot(dx_ab - frac * dx_ac, dy_ab - frac * dy_ac)
+        px, py = frac * dx_ac, frac * dy_ac
+        hmin = cfg.get("hermite_min_sog_kn", 3.0)
+        hok = (sg[a] >= hmin) & (sg[c] >= hmin) & ~np.isnan(cg[a]) & ~np.isnan(cg[c])
+        if hok.any():
+            f2, f3 = frac ** 2, frac ** 3
+            h10, h01, h11 = f3 - 2 * f2 + frac, -2 * f3 + 3 * f2, f3 - f2
+            vxa = np.nan_to_num(sg[a]) * KN * np.sin(np.radians(np.nan_to_num(cg[a])))
+            vya = np.nan_to_num(sg[a]) * KN * np.cos(np.radians(np.nan_to_num(cg[a])))
+            vxc = np.nan_to_num(sg[c]) * KN * np.sin(np.radians(np.nan_to_num(cg[c])))
+            vyc = np.nan_to_num(sg[c]) * KN * np.cos(np.radians(np.nan_to_num(cg[c])))
+            hx = h10 * dt_ac * vxa + h01 * dx_ac + h11 * dt_ac * vxc
+            hy = h10 * dt_ac * vya + h01 * dy_ac + h11 * dt_ac * vyc
+            px, py = np.where(hok, hx, px), np.where(hok, hy, py)
+        dev = np.hypot(dx_ab - px, dy_ab - py)
         bearing = np.degrees(np.arctan2(dx_ac, dy_ac)) % 360.0
         n_s = (~np.isnan(sg[a])).astype(float) + (~np.isnan(sg[c])).astype(float)
         sum_s = np.nan_to_num(sg[a]) + np.nan_to_num(sg[c])
@@ -286,10 +308,23 @@ def despike_vessel(lat, lon, t, sog, cog, cap, cfg):
         score = np.maximum(score, np.where(crit_chord, score_chord, 0.0))
         order = sorted(np.flatnonzero(cand), key=lambda k: (-score[k], k))
         chosen = set()
+        removed_mask = ~keep
+        max_run = dc.get("max_consecutive", 2)
         for k in order:
             if (k - 1) in chosen or (k + 1) in chosen:
                 continue
+            pos = idx[k + 1]
+            left = 0
+            while pos - left - 1 >= 0 and removed_mask[pos - left - 1]:
+                left += 1
+            right = 0
+            while pos + right + 1 < len(keep) and removed_mask[pos + right + 1]:
+                right += 1
+            if left + right + 1 > max_run:      # αλυσίδα αφαιρέσεων → τομή, όχι διαγραφή
+                continue
             chosen.add(k)
+        if not chosen:
+            break
         drop_pos = idx[np.array(sorted(chosen)) + 1]
         keep[drop_pos] = False
         removed += len(drop_pos)
@@ -342,8 +377,8 @@ def resample_segment(t, lat, lon, sog, cog, hdg, cfg):
     gy = (1 - alpha) * y[l] + alpha * y[r]
     if cfg.get("interp_method", "linear") == "hermite":
         # κινηματική Hermite: ταχύτητες των άκρων από SOG/COG (V3: p90 27.8 έναντι 48.1 m στα 120–180 s)
-        cvm0 = cfg["cog_valid_min_sog_kn"]
-        vel_ok = ~np.isnan(sog) & ~np.isnan(cog) & (sog >= cvm0)
+        hmin = cfg.get("hermite_min_sog_kn", 3.0)   # V5: σε χαμηλές ταχύτητες οι εφαπτόμενες κάνουν βρόχους
+        vel_ok = ~np.isnan(sog) & ~np.isnan(cog) & (sog >= hmin)
         vxr = np.where(vel_ok, np.nan_to_num(sog) * KN * np.sin(np.radians(np.nan_to_num(cog))), 0.0)
         vyr = np.where(vel_ok, np.nan_to_num(sog) * KN * np.cos(np.radians(np.nan_to_num(cog))), 0.0)
         use = ~exact & vel_ok[l] & vel_ok[r]
@@ -491,7 +526,7 @@ def run_stage_a(raw: pd.DataFrame, cfg: dict):
         t, lat, lon, sog, cog, hdg = (a[keep] for a in (t, lat, lon, sog, cog, hdg))
         seg, n_cut = segment_vessel(lat, lon, t, sog, cap, cfg)
         funnel["implied_cuts"] += n_cut
-        if n_rep and (n_spk + n_cut) / n_rep > cfg["mmsi_qc_max_anomaly_frac"]:
+        if n_rep >= cfg.get("mmsi_qc_min_reports", 50) and (n_spk + n_cut) / n_rep > cfg["mmsi_qc_max_anomaly_frac"]:
             funnel["mmsi_qc_flagged"].append(int(mmsi))
 
         prev_end = None
