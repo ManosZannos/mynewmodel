@@ -322,6 +322,21 @@ def test_lateral_spikes_removed():
         assert err.max() < 5.0, f"spike {d} m: σφάλμα {err.max():.0f} m μένει στην έξοδο"
 
 
+def test_longitudinal_spikes_removed():
+    # spike κατά μήκος της πορείας: το κριτήριο της χορδής μετρά απόκλιση στον χρόνο, όχι μόνο πλευρικά
+    for d in (200, 300, 500, 1000, 2000):
+        tr = straight(2400, kn=10, course=0)
+        times = report_times(2400, 60, 60, phase=17)
+        raw = make_reports(tr, times)
+        k = len(times) // 2
+        x, y = latlon_to_xy(raw.loc[k, "latitude"], raw.loc[k, "longitude"])
+        raw.loc[k, "latitude"], raw.loc[k, "longitude"] = xy_to_latlon(x, y + d)
+        out, funnel, _ = run(raw)
+        assert funnel["dropped"].get("despike", 0) >= 1, f"διαμήκες spike {d} m δεν αφαιρέθηκε"
+        assert out["seg_id"].nunique() == 1, f"διαμήκες spike {d} m έκοψε το segment"
+        assert pos_error_m(tr, out).max() < 5.0
+
+
 def test_teleport_cuts_with_hole():
     tr1 = straight(1200, kn=10, course=0)
     tr2 = straight(1200, kn=10, course=0, x0=5000, y0=tr1.y[-1], t0=T0 + pd.Timedelta(seconds=1260))

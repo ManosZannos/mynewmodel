@@ -65,7 +65,7 @@ DEFAULT_CONFIG = {
         "margin_kn": 5.0,
         "fallback_kn": 27.0,        # όταν λείπει το SOG (επαληθευμένο κατώφλι του v2)
         "pos_noise_m": 0.0,         # 🔬 {0, 10, 30}
-        "chord_min_m": 150.0,       # δεύτερο κριτήριο: απόκλιση από τη χορδή i-1 → i+1
+        "chord_min_m": 150.0,       # δεύτερο κριτήριο: απόκλιση από τη θέση της χορδής i-1 → i+1 στον χρόνο του i
         "chord_k": 0.25,            # κατώφλι χορδής = max(chord_min_m, k * SOG * Δt)
         "cog_agree_deg": 30.0,      # το COG των i-1, i+1 πρέπει να συμφωνεί με τη χορδή
         "max_passes": 10,
@@ -259,12 +259,12 @@ def despike_vessel(lat, lon, t, sog, cog, cap, cfg):
         crit_speed = (v_ab > thr_ab) & (v_bc > thr_bc) & (v_ac <= thr_ac)
         score_speed = np.minimum(v_ab / thr_ab, v_bc / thr_bc)
 
-        # δεύτερο κριτήριο: απόσταση του b από τη χορδή a → c
+        # δεύτερο κριτήριο: απόσταση του b από τη θέση που προβλέπει η χορδή a → c στον χρόνο του b
+        # (πιάνει και πλευρικά και διαμήκη spikes)
         _, dx_ab, dy_ab = _pair_dist_m(la[a], lo[a], la[b], lo[b])
-        chord = np.hypot(dx_ac, dy_ac)
         with np.errstate(divide="ignore", invalid="ignore"):
-            dev = np.where(chord > 1.0, np.abs(dx_ac * dy_ab - dy_ac * dx_ab) / chord,
-                           np.hypot(dx_ab, dy_ab))
+            frac = dt_ab / dt_ac
+        dev = np.hypot(dx_ab - frac * dx_ac, dy_ab - frac * dy_ac)
         bearing = np.degrees(np.arctan2(dx_ac, dy_ac)) % 360.0
         n_s = (~np.isnan(sg[a])).astype(float) + (~np.isnan(sg[c])).astype(float)
         sum_s = np.nan_to_num(sg[a]) + np.nan_to_num(sg[c])
