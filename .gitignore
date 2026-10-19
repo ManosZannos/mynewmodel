@@ -12,3 +12,5 @@ dataset/
 Logs_train/
 runs_10_10/
 error_dumps/
+logs_*.txt
+reports/
