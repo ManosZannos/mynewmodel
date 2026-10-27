@@ -556,6 +556,22 @@ def test_v5_corner_and_deceleration_not_spikes():
         assert funnel["dropped"].get("despike", 0) == 0, f"{name}: θεωρήθηκε spike"
 
 
+def test_v5_ferry_docking_not_spikes():
+    # ferry: επιβράδυνση 12 → 0 kn με στροφή 90° προς την προβλήτα, και απομάκρυνση 0 → 12 kn
+    # (V5 Δεκ.: 367104060). Θόρυβος GPS 5 m, αναφορές ανά 60–80 s.
+    arrive = Track(1800, lambda t: 12 if t < 900 else max(0.0, 12 - (t - 900) * 12 / 180),
+                   lambda t: 0 if t < 900 else min(90, (t - 900) * 0.5))
+    depart = Track(1800, lambda t: 0.0 if t < 600 else min(12, (t - 600) * 12 / 120),
+                   lambda t: 180 if t < 700 else 180 + min(60, (t - 700) * 1.0))
+    for name, tr in (("άφιξη", arrive), ("αναχώρηση", depart)):
+        for seed in range(5):
+            rng = np.random.default_rng(seed)
+            raw = make_reports(tr, report_times(1800, 60, 80, rng=rng), vessel_type=60,
+                               pos_noise_m=5, rng=rng)
+            _, funnel, _ = run(raw)
+            assert funnel["dropped"].get("despike", 0) == 0, f"{name} (seed {seed}): θεωρήθηκε spike"
+
+
 def test_v5_no_long_chains_of_removals():
     # μόνιμη μετατόπιση 6 διαδοχικών αναφορών κατά 400 m (V5: 366991470)
     tr = straight(2400, kn=10, course=0)
