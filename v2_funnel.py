@@ -86,6 +86,9 @@ def main():
     low_total = 0
     for fname, hours in sorted(cov.items()):
         v = pd.Series(hours, dtype=float)
+        v.index = pd.to_datetime(v.index, utc=True)
+        day0 = pd.Timestamp(fname.split("ais-")[1][:10], tz="UTC")
+        v = v.reindex(pd.date_range(day0, periods=24, freq="h"), fill_value=0.0)  # ώρες με 0 αναφορές
         low = v[v < 0.5 * v.median()]
         low_total += len(low)
         flag = "" if low.empty else f"  ΧΑΜΗΛΕΣ ΩΡΕΣ: {[pd.Timestamp(h).hour for h in low.index]}"
