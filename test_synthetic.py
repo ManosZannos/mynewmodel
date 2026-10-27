@@ -450,26 +450,28 @@ def test_duplicates_keep_most_complete():
     assert row["sog"].notna().all(), "κρατήθηκε η ελλιπής εγγραφή αντί για την πλήρη"
 
 
-def test_speed_plausibility_by_type():
+def test_speed_plausibility_global_cap():
     cfg = cfg_default()
-    caps = cfg["speed_caps_kn"]
-    # ρυμουλκό (52) που δηλώνει 30 kn ενώ κινείται με 8 → SOG άκυρο, τροχιά ακέραιη
-    tug = make_reports(straight(1800, kn=8), report_times(1800), mmsi=367000052, vessel_type=52)
-    tug["sog"] = 30.0
-    # pilot (50) με πραγματικά 25 kn → κρατιέται (γενικό όριο)
-    pilot = make_reports(straight(1800, kn=25), report_times(1800), mmsi=367000050, vessel_type=50)
-    # high-speed craft (40) με 35 kn → κρατιέται
+    cap = cfg["speed_caps_kn"]["global"]
+    # SOG εξωπραγματικό (70 kn) ενώ το πλοίο κινείται με 8 → SOG άκυρο, τροχιά ακέραιη
+    bad = make_reports(straight(1800, kn=8), report_times(1800), mmsi=367000052, vessel_type=52)
+    bad["sog"] = 70.0
+    # γρήγορα μικρά σκάφη με «λάθος» τύπο (V5, Μάρτιος 2025): sport fishing 35 kn, «ρυμουλκό» 50 kn
+    fish = make_reports(straight(1800, kn=35), report_times(1800), mmsi=367010460, vessel_type=30,
+                        transceiver="B")
+    tug = make_reports(straight(1800, kn=50), report_times(1800), mmsi=368121190, vessel_type=31)
     hsc = make_reports(straight(1800, kn=35), report_times(1800), mmsi=367000040, vessel_type=40)
-    out, funnel, _ = run(pd.concat([tug, pilot, hsc], ignore_index=True))
-    assert 30 > caps["tug"]
-    t_out = out[out["mmsi"] == 367000052]
-    assert not ((t_out["sog"] - 30).abs() < 1).any(), "το SOG 30 kn του ρυμουλκού έπρεπε να ακυρωθεί"
-    assert funnel["nulled"].get("sog_implausible", 0) >= len(tug)
-    assert t_out["seg_id"].nunique() == 1
-    for m, kn in [(367000050, 25), (367000040, 35)]:
+    out, funnel, _ = run(pd.concat([bad, fish, tug, hsc], ignore_index=True))
+    assert 70 > cap
+    b = out[out["mmsi"] == 367000052]
+    assert not ((b["sog"] - 70).abs() < 1).any(), "το SOG 70 kn έπρεπε να ακυρωθεί"
+    assert funnel["nulled"].get("sog_implausible", 0) >= len(bad)
+    assert b["seg_id"].nunique() == 1
+    for m, kn in [(367010460, 35), (368121190, 50), (367000040, 35)]:
         o = out[out["mmsi"] == m]
-        assert len(o) > 20 and o["seg_id"].nunique() == 1, f"{m}: γρήγορο σκάφος κόπηκε"
+        assert len(o) > 20 and o["seg_id"].nunique() == 1, f"{m}: γρήγορο σκάφος ({kn} kn) κόπηκε"
         assert (o["sog"] - kn).abs().max() < 0.5, f"{m}: το SOG {kn} kn δεν έπρεπε να ακυρωθεί"
+    assert funnel["dropped"].get("short_segment", 0) == 0
 
 
 def test_vessel_category_from_mode():

@@ -47,7 +47,7 @@ REGIONS = {
 }
 
 DEFAULT_CONFIG = {
-    "config_version": "stageA-v3.1",
+    "config_version": "stageA-v3.2",
     "region": REGIONS["socal"],
     "margin_km": 10.0,              # κουτί + περιθώριο για γείτονες (στόχοι μόνο IN_CORE)
     "grid_s": 60,
@@ -56,10 +56,10 @@ DEFAULT_CONFIG = {
     "gap_imp_flag_s": 120,
     "interp_method": "hermite",     # A8  κινηματική Hermite (SOG/COG των άκρων), αλλιώς linear· V3
     "min_segment_s": 300,           # A12 🔬
-    "speed_caps_kn": {              # A4  τιμές από EnvShip, ⚠️ ελέγχονται στο funnel
-        "global": 55.0, "cargo": 35.0, "tanker": 35.0, "passenger": 45.0,
-        "fishing": 25.0, "tug": 20.0,
-    },
+    # A4 μόνο γενικό όριο αληθοφάνειας. Τα όρια ανά τύπο του EnvShip (35/45/25/20 kn) καταργήθηκαν:
+    # στον Μάρτιο 2025 τα εμπορικά δεν τα ξεπερνούν ποτέ, ενώ μικρά σκάφη με λάθος κωδικό τύπου
+    # (sport fishing 31–43 kn, «ρυμουλκό» στα 50 kn, SOG = implied speed) κόβονταν σε κάθε βήμα.
+    "speed_caps_kn": {"global": 55.0},
     "despike": {                    # A6
         "factor": 1.5,              # κατώφλι = max(SOG) * factor + margin, ≤ όριο τύπου + margin
         "margin_kn": 5.0,
