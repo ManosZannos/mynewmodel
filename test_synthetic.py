@@ -623,6 +623,34 @@ def test_mmsi_clone_flagged():
     assert 367000303 not in set(funnel["mmsi_qc_flagged"])
 
 
+def test_heading_not_filled_from_future():
+    # αργό class B χωρίς heading· heading εμφανίζεται μόνο στο τέλος (V7: 11–12 πλοία)
+    tr = Track(3600, lambda t: 0.2, lambda t: 0)
+    raw = make_reports(tr, report_times(3600, 60, 80), transceiver="B", vessel_type=37)
+    raw["heading"] = np.nan
+    raw.loc[raw.index[-5:], "heading"] = 123.0
+    out, _, _ = run(raw)
+    t_first = T0 + pd.Timedelta(seconds=float(raw["_t_s"].iloc[-5]))
+    early = out[out["t"] < t_first - pd.Timedelta(minutes=2)]
+    assert len(early) > 30 and early["heading"].isna().all(), "το heading συμπληρώθηκε από το μέλλον"
+
+
+def test_no_future_information():
+    # V7: η έξοδος για το διάστημα [0, Τ − 30 λεπτά] δεν πρέπει να αλλάζει αν κόψουμε τα δεδομένα στο Τ
+    raw = _mixed_scenario()
+    raw = raw[raw["mmsi"] != 99912345]
+    cut_s = 2400
+    trunc = raw[raw["_t_s"] <= cut_s]
+    full, _, _ = run(raw)
+    part, _, _ = run(trunc)
+    lim = T0 + pd.Timedelta(seconds=cut_s - 1800)
+    cols = ["mmsi", "t", "lat", "lon", "sog", "cog", "COG_VALID", "heading", "HDG_SRC", "GAP_IMP",
+            "INTERP_SPAN", "STATIONARY", "QC_SOG", "QC_COG", "vx_sog", "vy_sog", "vx_pos", "vy_pos"]
+    a = full.loc[full["t"] <= lim, cols].reset_index(drop=True)
+    b = part.loc[part["t"] <= lim, cols].reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b, check_dtype=False)
+
+
 def _mixed_scenario():
     rng = np.random.default_rng(42)
     parts = []

@@ -47,7 +47,7 @@ REGIONS = {
 }
 
 DEFAULT_CONFIG = {
-    "config_version": "stageA-v3.2",
+    "config_version": "stageA-v3.3",
     "region": REGIONS["socal"],
     "margin_km": 10.0,              # κουτί + περιθώριο για γείτονες (στόχοι μόνο IN_CORE)
     "grid_s": 60,
@@ -438,7 +438,7 @@ def resample_segment(t, lat, lon, sog, cog, hdg, cfg):
     src = np.where(use_cog, 1, src)
     h = pd.Series(ghdg)
     held = h.isna()
-    h = h.ffill().bfill()
+    h = h.ffill()          # μόνο από το παρελθόν (V7: το bfill έφερνε τιμές από μεταγενέστερες μέρες)
     src = np.where(held & h.notna(), 2, src)
     out["heading"] = h.to_numpy()
     out["HDG_SRC"] = src
