@@ -17,7 +17,11 @@
 # ── Data Processing ───────────────────────────────────────────────────────────
 numpy==2.2.6
 pandas==2.3.3
-
+shapely==2.1.2
+pyproj==3.7.1
+pyogrio==0.13.0
+scipy==1.15.3
+osmium==4.3.2
 # ── Visualization (για plot_trajectories.py, visualize_attention.py) ──────────
 matplotlib==3.10.9
 
