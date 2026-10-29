@@ -139,6 +139,33 @@ def test_features_latlon_end_to_end():
     assert not out[["D_SHORE", "ON_LAND_DEPTH_M", "SHORE_DX", "SHORE_DY"]].isna().any().any()
 
 
+def test_cache_key_changes_with_osm_inputs():
+    """v1.0: η cache αγνοούσε νέο .pbf (π.χ. Λουιζιάνα) → σιωπηλά παλιά γεωμετρία."""
+    import tempfile, shutil, pathlib
+    d = pathlib.Path(tempfile.mkdtemp())
+    try:
+        (d / "land-polygons-split-4326.zip").write_bytes(b"x" * 10)
+        (d / "texas-latest.osm.pbf").write_bytes(b"x" * 20)
+        bb = (-97.5, 26.0, -91.5, 32.0)
+        k1 = C.cache_key(bb, CFG, str(d))
+        assert C.cache_key(bb, CFG, str(d)) == k1, "μη ντετερμινιστικό κλειδί"
+        (d / "prepared_dummy.parquet").write_bytes(b"y")            # η ίδια η cache δεν επηρεάζει το κλειδί
+        assert C.cache_key(bb, CFG, str(d)) == k1
+        (d / "louisiana-latest.osm.pbf").write_bytes(b"x" * 30)
+        assert C.cache_key(bb, CFG, str(d)) != k1, "νέο pbf δεν άλλαξε το κλειδί της cache"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_bench_breakdown_moving_vs_stationary():
+    import pandas as pd
+    df = pd.DataFrame({"sog": [0.0, 0.1, 5.0, 8.0]})
+    feat = pd.DataFrame({"ON_LAND": [1, 0, 1, 0], "ON_LAND_DEPTH_M": [12.0, 0, 40.0, 0]})
+    b = C.bench_breakdown(df, feat)
+    assert b["κινούμενα"]["ON_LAND"] == 0.5 and b["ακίνητα"]["ON_LAND"] == 0.5
+    assert b["κινούμενα"]["βάθος p50/p90/p99 (m)"][0] == 40.0
+
+
 if __name__ == "__main__":
     k = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and k in n]

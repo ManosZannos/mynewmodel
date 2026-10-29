@@ -48,7 +48,7 @@ from shapely import STRtree
 R_EARTH = 6_371_000.0
 
 DEFAULTS = {
-    "stageC_version": "stageC-v1.0",
+    "stageC_version": "stageC-v1.1",
     "d_shore_cap_m": 20_000.0,       # ακριβής έως εδώ (το περιθώριο γεωμετρίας το εξασφαλίζει)
     "d_waterfront_cap_m": 5_000.0,
     "d_land_cog_cap_m": 5_000.0,
@@ -310,6 +310,17 @@ def geo_bbox(data_bb, cfg):
     return core, (lo0 - dlon, la0 - dlat, lo1 + dlon, la1 + dlat)
 
 
+def osm_inputs(osm_dir):
+    """Αρχεία εισόδου OSM (όνομα → μέγεθος): ορίζουν, μαζί με κουτί και config, την cache."""
+    fs = sorted(glob.glob(f"{osm_dir}/*.zip") + glob.glob(f"{osm_dir}/*.osm.pbf"))
+    return {Path(f).name: os.path.getsize(f) for f in fs}
+
+
+def cache_key(core_bb, cfg, osm_dir):
+    payload = {"bb": list(core_bb), "cfg": {k: cfg[k] for k in cfg if k != "chunk_rows"}, "osm": osm_inputs(osm_dir)}
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:8]
+
+
 def prepare_geometry(osm_dir, core_bb, geom_bb, cfg, cache_path):
     """Φορτώνει ή φτιάχνει την προβεβλημένη γεωμετρία (cache Parquet με WKB)."""
     lat0, lon0 = 0.5 * (core_bb[1] + core_bb[3]), 0.5 * (core_bb[0] + core_bb[2])
@@ -395,6 +406,21 @@ def _process_day(f):
             "nan_out": int(feat[["D_SHORE", "ON_LAND_DEPTH_M"]].isna().to_numpy().sum())}
 
 
+def bench_breakdown(df, feat, sog_moving=0.5):
+    """ON_LAND και βάθος στην ξηρά, χωριστά για κινούμενα (SOG ≥ 0.5 kn) και ακίνητα."""
+    out = {}
+    if "sog" not in df:
+        return out
+    sog = df["sog"].to_numpy()
+    land = feat["ON_LAND"].to_numpy() == 1
+    depth = feat["ON_LAND_DEPTH_M"].to_numpy()
+    for lab, m in (("κινούμενα", sog >= sog_moving), ("ακίνητα", sog < sog_moving)):
+        dl = depth[m & land]
+        out[lab] = {"γραμμές": int(m.sum()), "ON_LAND": round(float(land[m].mean()), 4) if m.any() else None,
+                    "βάθος p50/p90/p99 (m)": np.percentile(dl, [50, 90, 99]).round(0).tolist() if len(dl) else None}
+    return out
+
+
 def _git():
     try:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
@@ -443,9 +469,8 @@ def main(argv=None):
     core_bb, geom_bb = geo_bbox(bb, cfg)
     print(f"  δεδομένα bbox {np.round(bb, 3).tolist()} → κουτί {core_bb}, γεωμετρία {np.round(geom_bb, 3).tolist()}")
 
-    key = hashlib.sha1(json.dumps({"bb": core_bb, "cfg": {k: cfg[k] for k in cfg if k != "chunk_rows"}},
-                                  sort_keys=True).encode()).hexdigest()[:8]
-    cache = Path(a.osm_dir) / f"prepared_{key}.parquet"
+    cache = Path(a.osm_dir) / f"prepared_{cache_key(core_bb, cfg, a.osm_dir)}.parquet"
+    print(f"  αρχεία OSM: {osm_inputs(a.osm_dir)}")
     t0 = time.time()
     cached = cache.exists()
     _G, _TR, (lat0, lon0), ginfo = prepare_geometry(a.osm_dir, core_bb, geom_bb, cfg, cache)
@@ -458,7 +483,7 @@ def main(argv=None):
 
     if a.bench:
         rng = np.random.default_rng(0)
-        pool_df = pd.concat([_read_day(f, READ_COLS) for f in rng.choice(files, size=min(len(files), 8), replace=False)],
+        pool_df = pd.concat([_read_day(f, READ_COLS + ["sog"]) for f in rng.choice(files, size=min(len(files), 8), replace=False)],
                             ignore_index=True)
         smp = pool_df.sample(n=min(a.bench, len(pool_df)), random_state=0).reset_index(drop=True)
         t1 = time.time()
@@ -470,6 +495,8 @@ def main(argv=None):
               f"{n_rows / rate / 60 / max(a.workers, 1):.1f} με {a.workers}")
         print(f"  [bench] D_SHORE p50/p90 {np.nanpercentile(feat['D_SHORE'], [50, 90]).round(0).tolist()} m | "
               f"ON_LAND {feat['ON_LAND'].mean():.3%} | D_LAND_COG < cap {(feat['D_LAND_COG'] < cfg['d_land_cog_cap_m']).mean():.1%}")
+        for lab, m in bench_breakdown(smp, feat).items():
+            print(f"  [bench] {lab}: {m}")
         return
 
     _OUT = Path(a.build_dir) / "stageC" / f"shore_{osm_date}"
