@@ -48,11 +48,11 @@ from shapely import STRtree
 R_EARTH = 6_371_000.0
 
 DEFAULTS = {
-    "stageC_version": "stageC-v1.1",
+    "stageC_version": "stageC-v1.2",
     "d_shore_cap_m": 20_000.0,       # ακριβής έως εδώ (το περιθώριο γεωμετρίας το εξασφαλίζει)
     "d_waterfront_cap_m": 5_000.0,
     "d_land_cog_cap_m": 5_000.0,
-    "bbox_round_deg": 0.5,           # το κουτί δεδομένων στρογγυλεύεται προς τα έξω → κοινή cache Μαρ./Δεκ.
+    "bbox_round_deg": 1.0,           # κουτί δεδομένων → ακέραιες μοίρες: ίδια προβολή/γεωμετρία σε κάθε μήνα (v1.1: 0.5 → Μαρ. ≠ Δεκ.)
     "geom_margin_extra_m": 2_000.0,  # περιθώριο γεωμετρίας = d_shore_cap + αυτό
     "piece_vertices": 32,            # τμήματα γραμμών για το STRtree
     "chunk_rows": 400_000,
