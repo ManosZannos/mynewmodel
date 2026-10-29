@@ -36,13 +36,15 @@ import pandas as pd
 R_EARTH = 6_371_000.0
 
 DEFAULTS = {
-    "stageB_version": "stageB-v1.0",
+    "stageB_version": "stageB-v1.1",
     "obs_min": 10, "pred_min": 10, "stride_min": 5,
     "moving_min_sog_kn": 0.5,        # στόχος: μέσο SOG παρατήρησης
     "moving_min_disp_m": 100.0,      # στόχος: καθαρή μετατόπιση στην παρατήρηση (V5)
     "headline_min_sog_kn": 3.0,      # κύρια μετρική
-    "difficulty_tiers": [5.0, 12.0], # EnvShip: easy < 5 ≤ medium < 12 ≤ hard
-    "caps": {"train": [55, 12], "val": [70, 20], "test": [70, 20]},   # [ανά πλοίο, ανά segment]
+    "difficulty_tiers_envship": [5.0, 12.0],   # EnvShip (20 s): δεν μεταφέρονται σε 1 λεπτό + θόρυβο
+    "difficulty_calib_q": [0.35, 0.75],       # κατώφλια από το vessel-train: 35/40/25 (αναλογίες EnvShip)
+    # [ανά πλοίο, ανά segment] — ΣΗΜΑΙΑ "capped", όχι φίλτρο: ως φίλτρο ανέβαζαν το class B 22% → 54%
+    "caps": {"train": [55, 12], "val": [70, 20], "test": [70, 20]},
     "vessel_split": [0.8, 0.1, 0.1], "balance_tol": 0.03, "salts": list(range(20)),
     "time_split": [0.7, 0.15, 0.15], "gap_min": 20,
     "east_lon": -117.6, "region_val_frac": 0.1,
@@ -124,8 +126,9 @@ def build_windows(x, cfg, chunk=400_000):
     w["moving"] = ((w["mean_sog_obs"] >= cfg["moving_min_sog_kn"]) &
                    (w["disp_obs_m"] >= cfg["moving_min_disp_m"])).astype(np.int8)
     w["headline"] = (w["moving"].astype(bool) & (w["mean_sog_obs"] >= cfg["headline_min_sog_kn"])).astype(np.int8)
-    t1, t2 = cfg["difficulty_tiers"]
-    w["tier"] = np.where(w["difficulty"] < t1, "easy", np.where(w["difficulty"] < t2, "medium", "hard"))
+    t1, t2 = cfg["difficulty_tiers_envship"]
+    w["tier_envship"] = np.where(w["difficulty"] < t1, "easy", np.where(w["difficulty"] < t2, "medium", "hard"))
+    w["tier"] = ""                                   # βαθμονομημένο, συμπληρώνεται μετά το vessel manifest
     w["eligible"] = ((w["moving"] == 1) & (w["core_last"] == 1) & (w["mmsi_qc"] == 0)).astype(np.int8)
     w.insert(0, "window_id", np.arange(len(w), dtype=np.int64))
     return w
@@ -143,8 +146,13 @@ def assign_by_hash(mmsi_unique, salt, fracs):
     return pd.Series(np.where(h < a, "train", np.where(h < b, "val", "test")), index=mmsi_unique)
 
 
+def set_tiers(w, thr):
+    w["tier"] = np.where(w["difficulty"] < thr[0], "easy", np.where(w["difficulty"] < thr[1], "medium", "hard"))
+
+
 def apply_caps(t, caps):
-    """Ντετερμινιστικά όρια: ομοιόμορφα κατανεμημένα παράθυρα ανά segment, μετά ανά πλοίο."""
+    """Ντετερμινιστικά όρια: ομοιόμορφα κατανεμημένα παράθυρα ανά segment, μετά ανά πλοίο.
+    Επιστρέφει το υποσύνολο· στο main γίνεται σημαία 'capped'."""
     keep = []
     for split, g in t.groupby("split"):
         per_v, per_s = caps[split]
@@ -228,6 +236,10 @@ def manifest_alltest(w, cfg, ref_manifest):
 # ---------------------------------------------------------------------------
 def summarize(name, t, w):
     tw = t.merge(w[["window_id", "headline", "tier", "vessel_cat", "transceiver"]], on="window_id")
+    return _summ(tw)
+
+
+def _summ(tw):
     rows = {}
     for sp, g in tw.groupby("split"):
         rows[sp] = {"windows": int(len(g)), "headline": int(g["headline"].sum()), "vessels": int(g["mmsi"].nunique()),
@@ -266,30 +278,45 @@ def main(argv=None):
     print(f"[stageB] {a.build_dir}")
     x = load_build(a.build_dir)
     w = build_windows(x, cfg)
-    w.to_parquet(out / "windows.parquet", index=False) if _has_pyarrow() else w.to_csv(out / "windows.csv.gz", index=False)
     print(f"  παράθυρα: {len(w):,} | επιλέξιμα (κινούμενα, IN_CORE, χωρίς QC): {int(w['eligible'].sum()):,} | "
           f"κύρια μετρική: {int((w['eligible'] & w['headline']).sum()):,}")
-    print("  δυσκολία (κύρια μετρική):", w.loc[(w["eligible"] == 1) & (w["headline"] == 1), "tier"]
+    print("  δυσκολία κατά EnvShip (κύρια μετρική):", w.loc[(w["eligible"] == 1) & (w["headline"] == 1), "tier_envship"]
           .value_counts(normalize=True).round(3).to_dict())
 
-    for name in a.manifests:
+    thr = None
+    if a.ref_manifest:
+        thr = json.load(open(a.ref_manifest, encoding="utf-8")).get("difficulty_thresholds")
+    order = sorted(a.manifests, key=lambda n: n != "vessel")       # πρώτα το vessel (βαθμονόμηση)
+    for name in order:
         if name == "vessel":
             t, info = manifest_vessel(w, cfg)
+            if thr is None:
+                tr_ids = t.loc[t["split"] == "train", "window_id"]
+                d = w.set_index("window_id").loc[tr_ids]
+                d = d.loc[d["headline"] == 1, "difficulty"]
+                thr = [round(float(v), 3) for v in np.quantile(d, cfg["difficulty_calib_q"])]
+            info["difficulty_thresholds"] = thr
         elif name == "region":
             t, info = manifest_region(w, cfg)
         elif name == "time":
             t, info = manifest_time(w, cfg)
         else:
             t, info = manifest_alltest(w, cfg, a.ref_manifest)
-        n_before = t.groupby("split").size().to_dict()
-        t = apply_caps(t, cfg["caps"])
+        if thr is None:
+            print("  ⚠️ χωρίς βαθμονομημένα κατώφλια δυσκολίας (λείπει vessel ή --ref_manifest): tier = EnvShip")
+            w["tier"] = w["tier_envship"]
+        else:
+            set_tiers(w, thr)
+        capped_ids = set(apply_caps(t, cfg["caps"])["window_id"])
+        t["capped"] = t["window_id"].isin(capped_ids).astype(np.int8)
         rows, overlap = summarize(name, t, w)
+        rows_c, _ = summarize(name, t[t["capped"] == 1], w)
         meta = {"manifest": name, "build": str(a.build_dir), "config": cfg, "commit": _git(), **info,
-                "windows_before_caps": {k: int(v) for k, v in n_before.items()}, "splits": rows,
+                "difficulty_thresholds": thr, "splits_natural": rows, "splits_capped": rows_c,
                 "test_rows_from_train_mmsi": overlap}
         if "seen_mmsi" in t.columns:
             meta["seen_mmsi_share_test"] = round(float(t["seen_mmsi"].mean()), 4)
-        keep_cols = ["window_id", "mmsi", "seg_id", "t_start", "split"] + (["seen_mmsi"] if "seen_mmsi" in t.columns else [])
+        keep_cols = ["window_id", "mmsi", "seg_id", "t_start", "split", "capped"] + (["seen_mmsi"] if "seen_mmsi" in t.columns else [])
         if _has_pyarrow():
             t[keep_cols].to_parquet(out / f"targets_{name}.parquet", index=False)
         else:
@@ -297,18 +324,21 @@ def main(argv=None):
         with open(out / f"manifest_{name}.json", "w", encoding="utf-8") as fh:
             json.dump(meta, fh, indent=2, ensure_ascii=False, default=str)
         print(f"\n  [{name}] {info.get('rule')}")
-        for sp in ("train", "val", "test"):
-            if sp in rows:
-                r = rows[sp]
-                print(f"    {sp:<5} {r['windows']:>8,} παράθυρα ({r['headline']:,} κύρια) σε {r['vessels']:,} πλοία | "
-                      f"δυσκολία {r['tiers_headline']} | class B {r['class_B_headline']}")
+        for label, rr in (("φυσική κατανομή", rows), ("με όρια (capped)", rows_c)):
+            print(f"   {label}:")
+            for sp in ("train", "val", "test"):
+                if sp in rr:
+                    r = rr[sp]
+                    print(f"    {sp:<5} {r['windows']:>8,} παράθυρα ({r['headline']:,} κύρια) σε {r['vessels']:,} πλοία | "
+                          f"δυσκολία {r['tiers_headline']} | class B {r['class_B_headline']}")
         if overlap is not None:
             print(f"    test γραμμές από MMSI του train: {overlap:.1%}")
         if "seen_mmsi_share_test" in meta:
             print(f"    seen MMSI (ως προς το train αναφοράς): {meta['seen_mmsi_share_test']:.1%}")
-        for k in ("salt", "eligible_share_before_caps", "boundaries_utc", "dropped_crossing"):
+        for k in ("salt", "eligible_share_before_caps", "difficulty_thresholds", "boundaries_utc", "dropped_crossing"):
             if k in info:
                 print(f"    {k}: {info[k]}")
+    w.to_parquet(out / "windows.parquet", index=False) if _has_pyarrow() else w.to_csv(out / "windows.csv.gz", index=False)
     print(f"\n[stageB] έξοδος: {out}")
 
 

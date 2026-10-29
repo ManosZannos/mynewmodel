@@ -72,10 +72,9 @@ def test_stationary_not_eligible():
 
 def test_difficulty_straight_vs_turning():
     straight = W[(W["mmsi"] % 4 != 0) & (W["mmsi"] < 367200000) & (W["eligible"] == 1)]
-    assert straight["difficulty"].median() < 2.0, f"ευθείες: διάμεση δυσκολία {straight['difficulty'].median():.1f}"
-    assert (straight["tier"] == "easy").mean() > 0.95
     turning = W[(W["mmsi"] % 4 == 0) & (W["mmsi"] < 367200000) & (W["eligible"] == 1)]
-    assert turning["difficulty"].quantile(0.9) > 12, "οι στροφές δεν φτάνουν το hard"
+    assert straight["difficulty"].median() < 2.0, f"ευθείες: διάμεση δυσκολία {straight['difficulty'].median():.1f}"
+    assert turning["difficulty"].quantile(0.9) > 12, "οι στροφές δεν ξεχωρίζουν"
 
 
 def test_vessel_manifest_disjoint():
@@ -103,13 +102,28 @@ def test_region_manifest_rule():
     assert not ((t["lon_min"] < EAST) & (t["lon_max"] > EAST)).any(), "παράθυρο που περνά το όριο"
 
 
-def test_caps_respected():
+def test_caps_flag_not_filter():
     caps = B.DEFAULTS["caps"]
-    for name in ("vessel", "region", "time"):
+    el = set(W.loc[W["eligible"] == 1, "window_id"])
+    for name in ("vessel", "time"):
         t = _out(D, f"targets_{name}")
-        for s, g in t.groupby("split"):
+        if name == "vessel":
+            assert set(t["window_id"]) == el, "τα όρια δεν πρέπει να αφαιρούν επιλέξιμα παράθυρα"
+        c = t[t["capped"] == 1]
+        assert 0 < len(c) <= len(t)
+        for s, g in c.groupby("split"):
             assert g.groupby("mmsi").size().max() <= caps[s][0]
             assert g.groupby("seg_id").size().max() <= caps[s][1]
+
+
+def test_difficulty_calibrated_on_train():
+    m = json.load(open(D / "stageB" / "manifest_vessel.json"))
+    thr = m["difficulty_thresholds"]
+    t = _out(D, "targets_vessel").merge(W[["window_id", "difficulty", "headline", "tier"]], on="window_id")
+    tr = t[(t["split"] == "train") & (t["headline"] == 1)]
+    share = tr["tier"].value_counts(normalize=True)
+    assert abs(share.get("easy", 0) - 0.35) < 0.05 and abs(share.get("hard", 0) - 0.25) < 0.05, share.to_dict()
+    assert thr[0] < thr[1]
 
 
 def test_deterministic():
