@@ -166,6 +166,13 @@ def test_bench_breakdown_moving_vs_stationary():
     assert b["κινούμενα"]["βάθος p50/p90/p99 (m)"][0] == 40.0
 
 
+def test_same_region_same_geometry_across_months():
+    """v1.1: SoCal Μαρ. (έως −115.07°) και Δεκ. (έως −115.65°) έπαιρναν διαφορετικό κουτί/προβολή."""
+    mar = [-120.109, 29.911, -115.065, 34.708]
+    dec = [-120.109, 29.910, -115.651, 34.978]
+    assert C.geo_bbox(mar, CFG)[0] == C.geo_bbox(dec, CFG)[0], (C.geo_bbox(mar, CFG)[0], C.geo_bbox(dec, CFG)[0])
+
+
 if __name__ == "__main__":
     k = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and k in n]
