@@ -77,6 +77,18 @@ def test_difficulty_straight_vs_turning():
     assert turning["difficulty"].quantile(0.9) > 12, "οι στροφές δεν ξεχωρίζουν"
 
 
+def test_cv_difficulty():
+    el = W[(W["mmsi"] < 367200000) & (W["eligible"] == 1)]
+    straight, turning = el[el["mmsi"] % 4 != 0], el[el["mmsi"] % 4 == 0]
+    assert straight["cv_fde_m"].quantile(0.99) < 5.0, f"ευθεία: CV-FDE p99 {straight['cv_fde_m'].quantile(0.99):.1f} m"
+    assert turning["cv_fde_m"].quantile(0.9) > 500, "οι στροφές δεν ξεχωρίζουν στο CV-FDE"
+    m = json.load(open(D / "stageB" / "manifest_vessel.json"))
+    assert m["cv_thresholds"][0] < m["cv_thresholds"][1]
+    t = _out(D, "targets_vessel").merge(W[["window_id", "headline", "tier_cv"]], on="window_id")
+    sh = t[(t["split"] == "train") & (t["headline"] == 1)]["tier_cv"].value_counts(normalize=True)
+    assert abs(sh.get("easy", 0) - 0.35) < 0.05 and abs(sh.get("hard", 0) - 0.25) < 0.05, sh.to_dict()
+
+
 def test_vessel_manifest_disjoint():
     t = _out(D, "targets_vessel")
     sets = {s: set(g["mmsi"]) for s, g in t.groupby("split")}
