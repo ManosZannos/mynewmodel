@@ -36,7 +36,7 @@ import pandas as pd
 R_EARTH = 6_371_000.0
 
 DEFAULTS = {
-    "stageB_version": "stageB-v1.2",
+    "stageB_version": "stageB-v1.3",
     "obs_min": 10, "pred_min": 10, "stride_min": 5,
     "moving_min_sog_kn": 0.5,        # στόχος: μέσο SOG παρατήρησης
     "moving_min_disp_m": 100.0,      # στόχος: καθαρή μετατόπιση στην παρατήρηση (V5)
@@ -228,9 +228,10 @@ def manifest_time(w, cfg):
     end = t["t_start"] + L
     t["split"] = np.select([end <= b1, (t["t_start"] >= b1 + g) & (end <= b2), t["t_start"] >= b2 + g],
                            ["train", "val", "test"], default="")
+    dropped_gap = int((t["split"] == "").sum())      # επιλέξιμα που τέμνουν όριο ή πέφτουν στο κενό
     t = t[t["split"] != ""]
     info = {"rule": "χρονολογικά 70/15/15", "boundaries_utc": [str(pd.to_datetime(int(b) * 60, unit="s", utc=True))
-                                                              for b in (b1, b2)], "gap_min": g}
+                                                              for b in (b1, b2)], "gap_min": g, "dropped_gap": dropped_gap}
     return t, info
 
 
@@ -239,6 +240,7 @@ def manifest_alltest(w, cfg, ref_manifest):
     t = el[["window_id", "mmsi", "seg_id", "t_start"]].copy()
     t["split"] = "test"
     info = {"rule": "όλα test"}
+    head = el["headline"].to_numpy() == 1
     if ref_manifest:
         ref = json.load(open(ref_manifest, encoding="utf-8"))
         tp = Path(ref_manifest).with_name(Path(ref_manifest).name.replace("manifest_", "targets_").replace(".json", ".parquet"))
@@ -247,7 +249,26 @@ def manifest_alltest(w, cfg, ref_manifest):
         train_mmsi = set(rw.loc[rw["split"] == "train", "mmsi"]) if rw is not None else set(ref.get("train_mmsi", []))
         t["seen_mmsi"] = t["mmsi"].isin(train_mmsi).astype(np.int8)
         info["ref_manifest"] = ref_manifest
+        sv = t.groupby("mmsi")["seen_mmsi"].first()
+        info["seen_share"] = {"vessels": round(float(sv.mean()), 4),
+                              "windows": round(float(t["seen_mmsi"].mean()), 4),
+                              "windows_headline": round(float(t.loc[head, "seen_mmsi"].mean()), 4) if head.any() else None}
     return t, info
+
+
+DROP_KEYS = ("dropped_crossing", "dropped_gap")
+
+
+def check_funnel(w, t, info):
+    """Κάθε επιλέξιμο παράθυρο είτε μπαίνει σε split είτε αποδίδεται σε κανόνα απόρριψης."""
+    n_el = int(w["eligible"].sum())
+    dropped = {k: int(info[k]) for k in DROP_KEYS if k in info}
+    by_split = t["split"].value_counts().reindex(["train", "val", "test"]).fillna(0).astype(int).to_dict()
+    f = {"eligible": n_el, **{f"n_{k}": v for k, v in by_split.items()}, **dropped,
+         "closes": len(t) + sum(dropped.values()) == n_el}
+    if not f["closes"]:
+        raise AssertionError(f"funnel δεν κλείνει: {f}")
+    return f
 
 
 # ---------------------------------------------------------------------------
@@ -332,15 +353,14 @@ def main(argv=None):
             w["tier"] = w["tier_envship"]
         else:
             set_tiers(w, thr, thr_cv)
+        funnel = check_funnel(w, t, info)
         capped_ids = set(apply_caps(t, cfg["caps"])["window_id"])
         t["capped"] = t["window_id"].isin(capped_ids).astype(np.int8)
         rows, overlap = summarize(name, t, w)
         rows_c, _ = summarize(name, t[t["capped"] == 1], w)
         meta = {"manifest": name, "build": str(a.build_dir), "config": cfg, "commit": _git(), **info,
                 "difficulty_thresholds": thr, "cv_thresholds": thr_cv, "splits_natural": rows, "splits_capped": rows_c,
-                "test_rows_from_train_mmsi": overlap}
-        if "seen_mmsi" in t.columns:
-            meta["seen_mmsi_share_test"] = round(float(t["seen_mmsi"].mean()), 4)
+                "test_rows_from_train_mmsi": overlap, "funnel": funnel}
         keep_cols = ["window_id", "mmsi", "seg_id", "t_start", "split", "capped"] + (["seen_mmsi"] if "seen_mmsi" in t.columns else [])
         if _has_pyarrow():
             t[keep_cols].to_parquet(out / f"targets_{name}.parquet", index=False)
@@ -359,9 +379,13 @@ def main(argv=None):
                           f"D (EnvShip) {r['tiers_headline']} | class B {r['class_B_headline']}")
         if overlap is not None:
             print(f"    test γραμμές από MMSI του train: {overlap:.1%}")
-        if "seen_mmsi_share_test" in meta:
-            print(f"    seen MMSI (ως προς το train αναφοράς): {meta['seen_mmsi_share_test']:.1%}")
-        for k in ("salt", "eligible_share_before_caps", "difficulty_thresholds", "cv_thresholds", "boundaries_utc", "dropped_crossing"):
+        if "seen_share" in info:
+            ss = info["seen_share"]
+            print(f"    seen MMSI (ως προς το train αναφοράς): πλοία {ss['vessels']:.1%} | παράθυρα {ss['windows']:.1%}"
+                  + (f" | παράθυρα κύριας {ss['windows_headline']:.1%}" if ss["windows_headline"] is not None else ""))
+        print(f"    funnel: επιλέξιμα {funnel['eligible']:,} = Σ splits {len(t):,}"
+              + "".join(f" + {k} {funnel[k]:,}" for k in DROP_KEYS if k in funnel) + " ✓")
+        for k in ("salt", "eligible_share_before_caps", "difficulty_thresholds", "cv_thresholds", "boundaries_utc"):
             if k in info:
                 print(f"    {k}: {info[k]}")
     w.to_parquet(out / "windows.parquet", index=False) if _has_pyarrow() else w.to_csv(out / "windows.csv.gz", index=False)

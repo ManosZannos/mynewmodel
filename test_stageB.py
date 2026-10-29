@@ -145,6 +145,53 @@ def test_deterministic():
     pd.testing.assert_frame_equal(a.reset_index(drop=True), b.reset_index(drop=True))
 
 
+# --- v1.3: funnel και seen σε μικρό χειροποίητο ευρετήριο (ανεξάρτητα από το build) ---
+def _toy_windows(n_vessels=4, minutes=3000, stride=5):
+    rows = [(v, s) for v in range(1, n_vessels + 1) for s in range(0, minutes, stride)]
+    w = pd.DataFrame(rows, columns=["mmsi", "t_start"])
+    w["window_id"] = np.arange(len(w))
+    w["seg_id"] = w["mmsi"] * 10
+    w["eligible"] = 1
+    w["headline"] = (w["window_id"] % 2).astype(int)
+    return w
+
+
+def test_time_funnel_counts_gap_drops():
+    """v1.2: τα παράθυρα στα κενά των ορίων χάνονταν χωρίς καταγραφή (1,405 στη SoCal Μαρτίου)."""
+    w = _toy_windows()
+    t, info = B.manifest_time(w, B.DEFAULTS)
+    assert "dropped_gap" in info, "λείπει το dropped_gap από το manifest time"
+    assert info["dropped_gap"] > 0 and len(t) + info["dropped_gap"] == int(w["eligible"].sum())
+    f = B.check_funnel(w, t, info)
+    assert f["closes"] and f["dropped_gap"] == info["dropped_gap"]
+
+
+def test_funnel_detects_unexplained_loss():
+    w = _toy_windows()
+    t, info = B.manifest_time(w, B.DEFAULTS)
+    try:
+        B.check_funnel(w, t.iloc[1:], info)
+    except AssertionError:
+        return
+    raise AssertionError("το check_funnel δεν εντόπισε ανεξήγητη απώλεια")
+
+
+def test_alltest_seen_vessels_vs_windows():
+    """v1.2: τυπωνόταν μόνο το ποσοστό παραθύρων (45.3%), ενώ το handoff ανέφερε 36.6% πλοία."""
+    w = _toy_windows(n_vessels=1, minutes=450)                     # 90 παράθυρα, MMSI 1 (seen)
+    others = _toy_windows(n_vessels=10, minutes=50)                # 10 παράθυρα ανά πλοίο
+    others = others[others["mmsi"] > 1].assign(window_id=lambda d: d["window_id"] + 10_000)
+    w = pd.concat([w, others], ignore_index=True)                  # 10 πλοία, 180 παράθυρα
+    tmp = Path(tempfile.mkdtemp())
+    pd.DataFrame({"window_id": [0], "mmsi": [1], "split": ["train"]}).to_csv(tmp / "targets_vessel.csv.gz", index=False)
+    (tmp / "manifest_vessel.json").write_text("{}", encoding="utf-8")
+    t, info = B.manifest_alltest(w, B.DEFAULTS, str(tmp / "manifest_vessel.json"))
+    shutil.rmtree(tmp, ignore_errors=True)
+    assert "seen_share" in info, "λείπει το seen_share από το manifest alltest"
+    assert info["seen_share"]["vessels"] == 0.1 and info["seen_share"]["windows"] == 0.5, info["seen_share"]
+    assert B.check_funnel(w, t, info)["closes"]
+
+
 if __name__ == "__main__":
     k = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and k in n]
