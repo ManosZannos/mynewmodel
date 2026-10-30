@@ -36,7 +36,7 @@ import pandas as pd
 R_EARTH = 6_371_000.0
 
 DEFAULTS = {
-    "stageB_version": "stageB-v1.3",
+    "stageB_version": "stageB-v1.4",
     "obs_min": 10, "pred_min": 10, "stride_min": 5,
     "moving_min_sog_kn": 0.5,        # στόχος: μέσο SOG παρατήρησης
     "moving_min_disp_m": 100.0,      # στόχος: καθαρή μετατόπιση στην παρατήρηση (V5)
@@ -48,6 +48,9 @@ DEFAULTS = {
     "vessel_split": [0.8, 0.1, 0.1], "balance_tol": 0.03, "salts": list(range(20)),
     "time_split": [0.7, 0.15, 0.15], "gap_min": 20,
     "east_lon": -117.6, "region_val_frac": 0.1,
+    # v1.4: QC από το στάδιο Γ — σημείο μέσα στην ξηρά βαθύτερα από τ (V5-Γ: τρέιλερ, ράμπες, κενά χάρτη).
+    # Παράθυρο με τέτοιο σημείο σε obs+pred → εκτός στόχων· ο loader αποκλείει τα ίδια σημεία ως γείτονες.
+    "on_land_tau_m": 25.0,
 }
 
 COLS = ["mmsi", "t", "seg_id", "lat", "lon", "sog", "cog", "COG_VALID", "GAP_IMP",
@@ -55,14 +58,34 @@ COLS = ["mmsi", "t", "seg_id", "lat", "lon", "sog", "cog", "COG_VALID", "GAP_IMP
 
 
 # ---------------------------------------------------------------------------
-def load_build(d):
+def attach_shore(parts, shore_parts, tau):
+    """Ανά αρχείο μέρας: στήλη LAND_BAD = ON_LAND & βάθος > τ. Το στάδιο Γ κρατά τη σειρά γραμμών του build."""
+    out = []
+    for i, (b, s) in enumerate(zip(parts, shore_parts)):
+        if len(b) != len(s) or not (b["mmsi"].to_numpy() == s["mmsi"].to_numpy()).all():
+            raise AssertionError(f"αρχείο {i}: το στάδιο Γ δεν ευθυγραμμίζεται με το build ({len(b)} ≠ {len(s)} ή άλλα MMSI)")
+        b = b.copy()
+        b["LAND_BAD"] = ((s["ON_LAND"].to_numpy() == 1) & (s["ON_LAND_DEPTH_M"].to_numpy() > tau)).astype(np.int8)
+        out.append(b)
+    return out
+
+
+def load_build(d, shore_dir=None, tau=None):
     files = sorted(glob.glob(f"{d}/day_*.parquet"))
     if files:
-        x = pd.concat((pd.read_parquet(f, columns=COLS) for f in files), ignore_index=True)
+        parts = [pd.read_parquet(f, columns=COLS) for f in files]
     else:
         files = sorted(glob.glob(f"{d}/day_*.csv.gz"))
-        x = pd.concat((pd.read_csv(f, usecols=COLS) for f in files), ignore_index=True)
-        x["t"] = pd.to_datetime(x["t"], utc=True)
+        parts = [pd.read_csv(f, usecols=COLS) for f in files]
+        for p in parts:
+            p["t"] = pd.to_datetime(p["t"], utc=True)
+    if shore_dir:
+        sf = [Path(shore_dir) / Path(f).name.replace(".csv.gz", ".parquet") for f in files]
+        missing = [str(f) for f in sf if not f.exists()]
+        if missing:
+            raise FileNotFoundError(f"λείπουν αρχεία σταδίου Γ: {missing[:3]}")
+        parts = attach_shore(parts, [pd.read_parquet(f, columns=["mmsi", "ON_LAND", "ON_LAND_DEPTH_M"]) for f in sf], tau)
+    x = pd.concat(parts, ignore_index=True)
     x = x.sort_values(["mmsi", "t"], kind="mergesort").reset_index(drop=True)
     x["tm"] = ((x["t"] - pd.Timestamp(0, tz="UTC")) // pd.Timedelta(minutes=1)).astype(np.int64)
     return x
@@ -86,6 +109,7 @@ def build_windows(x, cfg, chunk=400_000):
     sog, cog = x["sog"].to_numpy(float), x["cog"].to_numpy(float)
     cogv, gimp = x["COG_VALID"].to_numpy(), x["GAP_IMP"].to_numpy()
     core = x["IN_CORE"].to_numpy()
+    land_bad = x["LAND_BAD"].to_numpy() if "LAND_BAD" in x else np.zeros(len(x), np.int8)
     out = []
     off = np.arange(L)
     for c0 in range(0, len(starts), chunk):
@@ -124,6 +148,7 @@ def build_windows(x, cfg, chunk=400_000):
             "lat_last": la[:, O - 1], "lon_last": lo[:, O - 1],
             "lon_min": lo.min(1), "lon_max": lo.max(1),
             "core_last": core[ix[:, O - 1]].astype(np.int8),
+            "on_land": land_bad[ix].any(1).astype(np.int8),
             "mean_sog_obs": mean_sog_obs, "disp_obs_m": disp_obs,
             "interp_ratio": gimp[ix].mean(1), "difficulty": D,
             "cv_ade_m": cv_err.mean(1), "cv_fde_m": cv_err[:, -1],
@@ -140,7 +165,8 @@ def build_windows(x, cfg, chunk=400_000):
     w["tier_envship"] = np.where(w["difficulty"] < t1, "easy", np.where(w["difficulty"] < t2, "medium", "hard"))
     w["tier"] = ""                                   # βαθμονομημένο, συμπληρώνεται μετά το vessel manifest
     w["tier_cv"] = ""                                # βαθμονομημένο στο cv_fde_m (κύριο stratum δυσκολίας)
-    w["eligible"] = ((w["moving"] == 1) & (w["core_last"] == 1) & (w["mmsi_qc"] == 0)).astype(np.int8)
+    w["eligible_pre_shore"] = ((w["moving"] == 1) & (w["core_last"] == 1) & (w["mmsi_qc"] == 0)).astype(np.int8)
+    w["eligible"] = ((w["eligible_pre_shore"] == 1) & (w["on_land"] == 0)).astype(np.int8)
     w.insert(0, "window_id", np.arange(len(w), dtype=np.int64))
     return w
 
@@ -309,6 +335,8 @@ def main(argv=None):
                     choices=["vessel", "region", "time", "alltest"])
     ap.add_argument("--ref_manifest", default=None)
     ap.add_argument("--east_lon", type=float, default=None)
+    ap.add_argument("--shore_dir", default=None,
+                    help="έξοδος σταδίου Γ (<build>/stageC/shore_<date>): QC ON_LAND > τ· χωρίς αυτό, χωρίς QC ακτής")
     a = ap.parse_args(argv)
     cfg = json.loads(json.dumps(DEFAULTS))
     if a.east_lon is not None:
@@ -317,8 +345,19 @@ def main(argv=None):
     out = Path(a.build_dir) / "stageB"
     out.mkdir(exist_ok=True)
     print(f"[stageB] {a.build_dir}")
-    x = load_build(a.build_dir)
+    x = load_build(a.build_dir, a.shore_dir, cfg["on_land_tau_m"])
     w = build_windows(x, cfg)
+    pre = w["eligible_pre_shore"] == 1
+    shore_qc = {"shore_dir": a.shore_dir, "tau_m": cfg["on_land_tau_m"], "applied": bool(a.shore_dir),
+                "eligible_before": int(pre.sum()), "excluded_on_land": int((pre & (w["on_land"] == 1)).sum()),
+                "excluded_on_land_headline": int((pre & (w["on_land"] == 1) & (w["headline"] == 1)).sum()),
+                "excluded_by_cat": w.loc[pre & (w["on_land"] == 1), "vessel_cat"].astype(str).value_counts().head(8).to_dict()}
+    if a.shore_dir:
+        print(f"  QC ακτής (τ = {cfg['on_land_tau_m']:.0f} m): εκτός {shore_qc['excluded_on_land']:,} από "
+              f"{shore_qc['eligible_before']:,} επιλέξιμα ({shore_qc['excluded_on_land'] / max(shore_qc['eligible_before'], 1):.3%}), "
+              f"κύρια {shore_qc['excluded_on_land_headline']:,} | {shore_qc['excluded_by_cat']}")
+    else:
+        print("  QC ακτής: ΔΕΝ εφαρμόστηκε (χωρίς --shore_dir)")
     print(f"  παράθυρα: {len(w):,} | επιλέξιμα (κινούμενα, IN_CORE, χωρίς QC): {int(w['eligible'].sum()):,} | "
           f"κύρια μετρική: {int((w['eligible'] & w['headline']).sum()):,}")
     print("  δυσκολία κατά EnvShip (κύρια μετρική):", w.loc[(w["eligible"] == 1) & (w["headline"] == 1), "tier_envship"]
@@ -360,7 +399,7 @@ def main(argv=None):
         rows_c, _ = summarize(name, t[t["capped"] == 1], w)
         meta = {"manifest": name, "build": str(a.build_dir), "config": cfg, "commit": _git(), **info,
                 "difficulty_thresholds": thr, "cv_thresholds": thr_cv, "splits_natural": rows, "splits_capped": rows_c,
-                "test_rows_from_train_mmsi": overlap, "funnel": funnel}
+                "test_rows_from_train_mmsi": overlap, "funnel": funnel, "shore_qc": shore_qc}
         keep_cols = ["window_id", "mmsi", "seg_id", "t_start", "split", "capped"] + (["seen_mmsi"] if "seen_mmsi" in t.columns else [])
         if _has_pyarrow():
             t[keep_cols].to_parquet(out / f"targets_{name}.parquet", index=False)

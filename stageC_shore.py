@@ -16,7 +16,8 @@ stageC_shore.py — Στάδιο Γ της προδιαγραφής: χαρακ�
 Μέθοδος: ακριβής διανυσματική (shapely 2, STRtree) σε τοπική Transverse Mercator με κέντρο το κουτί.
   D_SHORE      απόσταση από την ακτή (m), με άνω όριο d_shore_cap_m
   SHORE_DX/DY  μοναδιαίο διάνυσμα προς το πλησιέστερο σημείο ακτής (ανατολή, βορράς, αληθής βορράς)
-  D_LAND_COG   απόσταση μέχρι την ξηρά κατά μήκος του COG (τομή ακτίνας-ακτής), άνω όριο 5 km,
+  D_LAND_COG   απόσταση κατά μήκος του COG μέχρι ξηρά ή κατασκευή-εμπόδιο (κυματοθραύστης, προβλήτα,
+               groyne, κρηπίδωμα· όχι όριο λιμανιού) — τομή ακτίνας-εμποδίων, άνω όριο 5 km,
                NaN όταν COG_VALID = 0, 0 όταν το σημείο είναι μέσα στην ξηρά
   ON_LAND      σημείο μέσα στην ξηρά· ON_LAND_DEPTH_M = βάθος μέσα στην ξηρά (ανοχή = κατώφλι αργότερα)
 Οι αποστάσεις διορθώνονται για τον συντελεστή κλίμακας της προβολής και οι γωνίες για τη σύγκλιση
@@ -48,7 +49,7 @@ from shapely import STRtree
 R_EARTH = 6_371_000.0
 
 DEFAULTS = {
-    "stageC_version": "stageC-v1.2",
+    "stageC_version": "stageC-v1.3",
     "d_shore_cap_m": 20_000.0,       # ακριβής έως εδώ (το περιθώριο γεωμετρίας το εξασφαλίζει)
     "d_waterfront_cap_m": 5_000.0,
     "d_land_cog_cap_m": 5_000.0,
@@ -58,6 +59,8 @@ DEFAULTS = {
     "chunk_rows": 400_000,
     "water_tags": {"natural": ["water"], "waterway": ["riverbank", "dock"]},
     "waterfront_tags": {"man_made": ["pier", "breakwater", "groyne", "quay"], "landuse": ["port"]},
+    # v1.3: εμπόδια για το D_LAND_COG (V5-Γ: στο King Harbor οι ακτίνες περνούσαν τον κυματοθραύστη)
+    "barrier_tags": {"man_made": ["pier", "breakwater", "groyne", "quay"]},
 }
 OUT_COLS = ["ON_LAND", "ON_LAND_DEPTH_M", "D_SHORE", "SHORE_DX", "SHORE_DY", "D_WATERFRONT", "D_LAND_COG"]
 
@@ -113,22 +116,27 @@ def split_lines(geoms, k):
 class ShoreGeom:
     """Ξηρά (πολύγωνο), τμήματα ακτής και waterfront σε μέτρα της προβολής."""
 
-    def __init__(self, land, waterfront_lines, cfg):
+    def __init__(self, land, waterfront_lines, cfg, barrier_lines=()):
         self.land = land
         shapely.prepare(self.land)
         k = cfg["piece_vertices"]
-        self.shore = split_lines(shapely.boundary(land), k) if not shapely.is_empty(land) else np.array([], dtype=object)
-        self.wf = split_lines(waterfront_lines, k) if len(np.atleast_1d(waterfront_lines)) else np.array([], dtype=object)
+        empty = np.array([], dtype=object)
+        self.shore = split_lines(shapely.boundary(land), k) if not shapely.is_empty(land) else empty
+        self.wf = split_lines(waterfront_lines, k) if len(np.atleast_1d(waterfront_lines)) else empty
+        self.barrier = split_lines(barrier_lines, k) if len(np.atleast_1d(barrier_lines)) else empty
+        self.obst = np.concatenate([self.shore, self.barrier]).astype(object)     # εμπόδια της ακτίνας
         self.shore_tree = STRtree(self.shore)
         self.wf_tree = STRtree(self.wf)
+        self.bar_tree = STRtree(self.barrier)
+        self.obst_tree = STRtree(self.obst)
 
     @classmethod
-    def build(cls, land_polys, water_polys, waterfront_lines, cfg):
+    def build(cls, land_polys, water_polys, waterfront_lines, cfg, barrier_lines=()):
         land = shapely.union_all(shapely.make_valid(np.atleast_1d(land_polys)))   # ενώνει τις ραφές του split
         if len(np.atleast_1d(water_polys)):
             water = shapely.union_all(shapely.make_valid(np.atleast_1d(water_polys)))
             land = shapely.difference(land, water)
-        return cls(land, np.atleast_1d(waterfront_lines), cfg)
+        return cls(land, np.atleast_1d(waterfront_lines), cfg, np.atleast_1d(barrier_lines))
 
 
 def _nearest(tree, pieces, pts, cap):
@@ -155,19 +163,20 @@ def compute_features(x, y, az_grid_deg, cog_valid, G, cfg):
     d_wf, _ = _nearest(G.wf_tree, G.wf, pts, cfg["d_waterfront_cap_m"])
 
     cap = cfg["d_land_cog_cap_m"]
+    d_bar, _ = _nearest(G.bar_tree, G.barrier, pts, cap)      # κυματοθραύστης μπορεί να απέχει > 5 km από την ακτή
     valid = np.asarray(cog_valid) == 1
     d_lc = np.full(n, np.nan)
     d_lc[valid] = cap
-    cand = np.flatnonzero(valid & ~inside & (d_sh < cap))
-    if len(cand) and len(G.shore):
+    cand = np.flatnonzero(valid & ~inside & (np.minimum(d_sh, d_bar) < cap))
+    if len(cand) and len(G.obst):
         az = np.radians(np.asarray(az_grid_deg, float)[cand])
         x0, y0 = x[cand], y[cand]
         seg = np.stack([np.column_stack([x0, y0]), np.column_stack([x0 + cap * np.sin(az), y0 + cap * np.cos(az)])], axis=1)
         rays = shapely.linestrings(seg)
-        ri, pj = G.shore_tree.query(rays, predicate="intersects")
+        ri, pj = G.obst_tree.query(rays, predicate="intersects")
         res = np.full(len(cand), cap)
         if len(ri):
-            inter = shapely.intersection(rays[ri], G.shore[pj])
+            inter = shapely.intersection(rays[ri], G.obst[pj])
             dd = shapely.distance(shapely.points(x0[ri], y0[ri]), inter)
             ok = np.isfinite(dd)
             np.minimum.at(res, ri[ok], dd[ok])
@@ -211,7 +220,7 @@ def features_latlon(lat, lon, cog, cog_valid, G, transformer, lon0, cfg):
 # ---------------------------------------------------------------------------
 # OSM
 def classify_tags(tags, cfg):
-    """→ σύνολο από {'water', 'waterfront'}· tags: dict ή TagList του pyosmium (αρκεί .get)."""
+    """→ σύνολο από {'water', 'waterfront', 'barrier'}· tags: dict ή TagList του pyosmium (αρκεί .get)."""
     out = set()
     for key, vals in cfg["water_tags"].items():
         if tags.get(key) in vals:
@@ -219,6 +228,9 @@ def classify_tags(tags, cfg):
     for key, vals in cfg["waterfront_tags"].items():
         if tags.get(key) in vals:
             out.add("waterfront")
+    for key, vals in cfg.get("barrier_tags", {}).items():
+        if tags.get(key) in vals:
+            out.add("barrier")
     return out
 
 
@@ -243,11 +255,11 @@ def _pbf_box(path):
 def read_pbf(path, bb, cfg):
     """Πολύγωνα νερού και γραμμές waterfront (WGS84) μέσα στο bbox, με pyosmium."""
     import osmium
-    keys = sorted(set(cfg["water_tags"]) | set(cfg["waterfront_tags"]))
+    keys = sorted(set(cfg["water_tags"]) | set(cfg["waterfront_tags"]) | set(cfg.get("barrier_tags", {})))
     wkb = osmium.geom.WKBFactory()
     fp = (osmium.FileProcessor(str(path)).with_locations()
           .with_areas(osmium.filter.KeyFilter(*keys)).with_filter(osmium.filter.KeyFilter(*keys)))
-    water, wf, n_way, n_bad = [], [], 0, 0
+    water, wf, bar, n_way, n_bad = [], [], [], 0, 0
     for o in fp:
         if o.is_area():
             cls = classify_tags(o.tags, cfg)
@@ -263,6 +275,8 @@ def read_pbf(path, bb, cfg):
                 water.append(g)
             if "waterfront" in cls and not o.from_way():
                 wf.append(shapely.boundary(g))
+            if "barrier" in cls and not o.from_way():
+                bar.append(shapely.boundary(g))
         elif o.is_way():
             cls = classify_tags(o.tags, cfg)
             if "waterfront" not in cls:
@@ -275,9 +289,11 @@ def read_pbf(path, bb, cfg):
                 continue
             if _bbox_hit(g, bb):
                 wf.append(g)
+                if "barrier" in cls:
+                    bar.append(g)
     if n_way and n_bad / n_way > 0.5:
         raise RuntimeError(f"{path}: {n_bad}/{n_way} ways χωρίς θέσεις κόμβων — έλεγξε το with_locations")
-    return water, wf, {"waterfront_ways": n_way, "ways_bad_location": n_bad}
+    return water, wf, bar, {"waterfront_ways": n_way, "ways_bad_location": n_bad, "barrier": len(bar)}
 
 
 def find_land_shp(osm_dir):
@@ -329,31 +345,36 @@ def prepare_geometry(osm_dir, core_bb, geom_bb, cfg, cache_path):
         c = pd.read_parquet(cache_path)
         land = shapely.from_wkb(c.loc[c["kind"] == "land", "wkb"].iloc[0])
         wf = shapely.from_wkb(c.loc[c["kind"] == "wf", "wkb"].to_numpy())
+        bar = shapely.from_wkb(c.loc[c["kind"] == "barrier", "wkb"].to_numpy())
         info = json.loads(cache_path.with_suffix(".json").read_text(encoding="utf-8"))
-        return ShoreGeom(land, wf, cfg), tr, (lat0, lon0), info
+        return ShoreGeom(land, wf, cfg, bar), tr, (lat0, lon0), info
     import pyogrio
     t0 = time.time()
     shp = find_land_shp(osm_dir)
     _, _, geom_wkb, _ = pyogrio.raw.read(shp, bbox=geom_bb, columns=[])
     land_geo = shapely.clip_by_rect(shapely.from_wkb(geom_wkb), *geom_bb)
-    water, wf, pbf_info = [], [], {}
+    water, wf, bar, pbf_info = [], [], [], {}
     for pbf in sorted(glob.glob(f"{osm_dir}/*.osm.pbf")):
         box = _pbf_box(pbf)
         if box is not None and (box[2] < geom_bb[0] or box[0] > geom_bb[2] or box[3] < geom_bb[1] or box[1] > geom_bb[3]):
             pbf_info[Path(pbf).name] = "εκτός κουτιού"
             continue
-        w, f, inf = read_pbf(pbf, geom_bb, cfg)
+        w, f, b, inf = read_pbf(pbf, geom_bb, cfg)
         water += w
         wf += f
+        bar += b
         pbf_info[Path(pbf).name] = {"water_polys": len(w), "waterfront": len(f), **inf}
     water_geo = shapely.clip_by_rect(np.array(water, dtype=object), *geom_bb) if water else np.array([], dtype=object)
     wf_geo = shapely.clip_by_rect(np.array(wf, dtype=object), *geom_bb) if wf else np.array([], dtype=object)
+    bar_geo = shapely.clip_by_rect(np.array(bar, dtype=object), *geom_bb) if bar else np.array([], dtype=object)
     G = ShoreGeom.build(project_geoms(land_geo, tr), project_geoms(water_geo, tr) if len(water_geo) else water_geo,
-                        project_geoms(wf_geo, tr) if len(wf_geo) else wf_geo, cfg)
-    pd.DataFrame({"kind": ["land"] + ["wf"] * len(G.wf),
-                  "wkb": [shapely.to_wkb(G.land)] + list(shapely.to_wkb(G.wf))}).to_parquet(cache_path, index=False)
+                        project_geoms(wf_geo, tr) if len(wf_geo) else wf_geo, cfg,
+                        project_geoms(bar_geo, tr) if len(bar_geo) else bar_geo)
+    pd.DataFrame({"kind": ["land"] + ["wf"] * len(G.wf) + ["barrier"] * len(G.barrier),
+                  "wkb": [shapely.to_wkb(G.land)] + list(shapely.to_wkb(G.wf)) + list(shapely.to_wkb(G.barrier))}
+                 ).to_parquet(cache_path, index=False)
     info = {"land_shp": shp, "land_pieces_read": int(len(land_geo)), "pbf": pbf_info,
-            "shore_pieces": int(len(G.shore)), "waterfront_pieces": int(len(G.wf)),
+            "shore_pieces": int(len(G.shore)), "waterfront_pieces": int(len(G.wf)), "barrier_pieces": int(len(G.barrier)),
             "prepare_seconds": round(time.time() - t0, 1)}
     cache_path.with_suffix(".json").write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
     return G, tr, (lat0, lon0), info
@@ -476,7 +497,8 @@ def main(argv=None):
     _G, _TR, (lat0, lon0), ginfo = prepare_geometry(a.osm_dir, core_bb, geom_bb, cfg, cache)
     _LON0 = lon0
     print(f"  γεωμετρία ({'cache ' + cache.name if cached else 'νέα → ' + cache.name}): "
-          f"{ginfo['shore_pieces']:,} τμήματα ακτής, {ginfo['waterfront_pieces']:,} waterfront | {time.time() - t0:.0f} s")
+          f"{ginfo['shore_pieces']:,} τμήματα ακτής, {ginfo['waterfront_pieces']:,} waterfront, "
+          f"{ginfo.get('barrier_pieces', 0):,} εμπόδια | {time.time() - t0:.0f} s")
     print(f"  pbf: {ginfo.get('pbf')}")
     if a.prepare_only:
         return

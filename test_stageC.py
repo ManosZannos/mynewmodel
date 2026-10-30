@@ -10,9 +10,9 @@ CFG = C.DEFAULTS
 CAP_SH, CAP_WF, CAP_LC = CFG["d_shore_cap_m"], CFG["d_waterfront_cap_m"], CFG["d_land_cog_cap_m"]
 
 
-def _G(land, water=(), wf=()):
+def _G(land, water=(), wf=(), barrier=()):
     return C.ShoreGeom.build(np.array(list(land), dtype=object), np.array(list(water), dtype=object),
-                             np.array(list(wf), dtype=object), CFG)
+                             np.array(list(wf), dtype=object), CFG, np.array(list(barrier), dtype=object))
 
 
 def _f(G, pts, az=None, cogv=None):
@@ -104,7 +104,8 @@ def test_classify_tags():
     assert c({"natural": "water"}) == {"water"}
     assert c({"waterway": "riverbank"}) == {"water"}
     assert c({"waterway": "canal"}) == set(), "το waterway=canal είναι άξονας, όχι όχθη"
-    assert c({"man_made": "pier"}) == {"waterfront"} and c({"landuse": "port"}) == {"waterfront"}
+    assert c({"man_made": "pier"}) == {"waterfront", "barrier"} and c({"man_made": "breakwater"}) == {"waterfront", "barrier"}
+    assert c({"landuse": "port"}) == {"waterfront"}, "το όριο λιμανιού δεν είναι εμπόδιο"
     assert c({"natural": "coastline"}) == set()
 
 
@@ -171,6 +172,18 @@ def test_same_region_same_geometry_across_months():
     mar = [-120.109, 29.911, -115.065, 34.708]
     dec = [-120.109, 29.910, -115.651, 34.978]
     assert C.geo_bbox(mar, CFG)[0] == C.geo_bbox(dec, CFG)[0], (C.geo_bbox(mar, CFG)[0], C.geo_bbox(dec, CFG)[0])
+
+
+def test_breakwater_blocks_ray_port_boundary_does_not():
+    """v1.2: οι ακτίνες D_LAND_COG περνούσαν μέσα από κυματοθραύστες (V5-Γ, King Harbor)."""
+    far = [box(50_000, 0, 51_000, 1000)]                                 # ξηρά πέρα από 20 km
+    line = LineString([(1000, -500), (1000, 500)])
+    G_bar = _G(far, wf=[line], barrier=[line])                            # κυματοθραύστης 1 km ανατολικά
+    G_port = _G(far, wf=[line])                                          # ίδια γραμμή ως όριο λιμανιού μόνο
+    d_bar = _f(G_bar, [(0, 0), (0, 0)], [90, 270])["d_land_cog"]
+    assert abs(d_bar[0] - 1000) < 1e-6, f"ο κυματοθραύστης δεν σταμάτησε την ακτίνα: {d_bar[0]}"
+    assert d_bar[1] == CAP_LC
+    assert _f(G_port, [(0, 0)], [90])["d_land_cog"][0] == CAP_LC, "το όριο λιμανιού σταμάτησε την ακτίνα"
 
 
 if __name__ == "__main__":

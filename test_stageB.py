@@ -192,6 +192,38 @@ def test_alltest_seen_vessels_vs_windows():
     assert B.check_funnel(w, t, info)["closes"]
 
 
+# --- v1.4: QC ακτής από το στάδιο Γ ---
+def _toy_track(minutes=40, bad_minutes=()):
+    t0 = pd.Timestamp("2025-03-01", tz="UTC")
+    x = pd.DataFrame({"mmsi": 1, "t": t0 + pd.to_timedelta(np.arange(minutes), unit="min"), "seg_id": 10,
+                      "lat": 33.0, "lon": -118.0 + np.arange(minutes) * 0.003, "sog": 10.0, "cog": 90.0,
+                      "COG_VALID": 1, "GAP_IMP": 0, "IN_CORE": 1, "MMSI_QC": 0, "vessel_cat": "cargo", "transceiver": "A"})
+    x["tm"] = ((x["t"] - pd.Timestamp(0, tz="UTC")) // pd.Timedelta(minutes=1)).astype(np.int64)
+    x["LAND_BAD"] = np.isin(np.arange(minutes), bad_minutes).astype(np.int8)
+    return x
+
+
+def test_on_land_windows_excluded():
+    """v1.3: παράθυρα με σημείο στη στεριά (τρέιλερ/ράμπες, V5-Γ) έμεναν επιλέξιμοι στόχοι."""
+    w = B.build_windows(_toy_track(40, bad_minutes=[12]), B.DEFAULTS)
+    assert list(w["t_start"] - w["t_start"].min()) == [0, 5, 10, 15, 20]
+    assert "on_land" in w, "λείπει η σημαία on_land"
+    assert list(w["on_land"]) == [1, 1, 1, 0, 0], list(w["on_land"])        # το λεπτό 12 ανήκει στα 0–19, 5–24, 10–29
+    assert list(w["eligible_pre_shore"]) == [1] * 5 and list(w["eligible"]) == [0, 0, 0, 1, 1]
+
+
+def test_attach_shore_tau_and_alignment():
+    b = pd.DataFrame({"mmsi": [1, 1, 2, 2]})
+    s = pd.DataFrame({"mmsi": [1, 1, 2, 2], "ON_LAND": [1, 1, 0, 1], "ON_LAND_DEPTH_M": [10.0, 30.0, 0.0, 25.0]})
+    out = B.attach_shore([b], [s], 25.0)[0]
+    assert list(out["LAND_BAD"]) == [0, 1, 0, 0], "τ: μόνο βάθος > 25 m"
+    try:
+        B.attach_shore([b], [s.iloc[::-1].reset_index(drop=True)], 25.0)
+    except AssertionError:
+        return
+    raise AssertionError("η μη ευθυγράμμιση με το στάδιο Γ δεν εντοπίστηκε")
+
+
 if __name__ == "__main__":
     k = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and k in n]
