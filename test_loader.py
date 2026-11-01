@@ -133,6 +133,15 @@ def test_nonoverlap_and_gap_frac():
     assert abs(extra["pred_gap_frac"][i] - 0.3) < 1e-9, extra["pred_gap_frac"][i]     # γραμμές 25–27 στα 25–34
 
 
+def test_nonoverlap_coverage_unaligned_segment():
+    """v1.1: σε segments που δεν ξεκινούν σε πολλαπλάσιο του 5 το υποσύνολο ήταν κενό (2,081 αντί ~9.6 χιλ.)."""
+    x = _track(9, 100, t0="2025-03-01 00:07")
+    x["tm"] = ((x["t"] - pd.Timestamp(0, tz="UTC")) // pd.Timedelta(minutes=1)).astype(np.int64)
+    w = SB.build_windows(x, SB.DEFAULTS)
+    nov = LD.make_arrays(x, w)[3]["nonoverlap"]
+    assert nov.sum() == int(np.ceil(len(w) / 4)), (nov.sum(), len(w))
+
+
 def test_resample_obs():
     x = _x()
     w = SB.build_windows(x, SB.DEFAULTS)

@@ -27,7 +27,7 @@ import pandas as pd
 
 import stageB_manifests as SB
 
-LOADER_VERSION = "loader-v1.1"
+LOADER_VERSION = "loader-v1.2"
 R_EARTH = SB.R_EARTH
 OBS, PRED = SB.DEFAULTS["obs_min"], SB.DEFAULTS["pred_min"]
 SCALES = {"pos_m": 1000.0, "step_m": 100.0, "sog_kn": 20.0}
@@ -114,6 +114,13 @@ def scene_group(d_shore, d_wf):
     return g
 
 
+def _nonoverlap(w):
+    """Παράθυρα με έναρξη σε πολλαπλάσιο των 20 λεπτών από το πρώτο παράθυρο του ίδιου (mmsi, seg_id)."""
+    t = w["t_start"].to_numpy()
+    first = w.groupby(["mmsi", "seg_id"])["t_start"].transform("min").to_numpy()
+    return ((t - first) % (OBS + PRED) == 0).astype(np.int8)
+
+
 def make_arrays(x, w):
     """Πίνακες obs/fut/pos για τα παράθυρα w (μόνο οι γραμμές obs μπαίνουν στα χαρακτηριστικά)."""
     ix = window_rows(x, w)
@@ -136,8 +143,8 @@ def make_arrays(x, w):
     extra = {"lat_last": lat[:, OBS - 1], "lon_last": lon[:, OBS - 1],
              # v1.1: ποσοστό σημείων στόχου από μεγάλα κενά (GAP_IMP) — stratum παρεμβολής (πρακτική EnvShip core/full)
              "pred_gap_frac": x["GAP_IMP"].to_numpy(float)[ix[:, OBS:]].mean(1),
-             # v1.1: μη επικαλυπτόμενο υποσύνολο (έναρξη σε πολλαπλάσιο των 20 λεπτών) — αξιολόγηση τύπου «Protocol before progress»
-             "nonoverlap": (w["t_start"].to_numpy() % (OBS + PRED) == 0).astype(np.int8)}
+             # μη επικαλυπτόμενο υποσύνολο: κάθε 4ο παράθυρο ανά segment (v1.1 μετρούσε σε απόλυτο χρόνο → ~5% αντί ~25%)
+             "nonoverlap": _nonoverlap(w)}
     if "D_SHORE" in x:
         extra["scene_group"] = scene_group(x["D_SHORE"].to_numpy()[last], x["D_WATERFRONT"].to_numpy()[last])
     return obs, fut, pos, extra
