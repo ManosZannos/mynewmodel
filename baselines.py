@@ -30,7 +30,7 @@ import pandas as pd
 
 import loader as LD
 
-BASELINES_VERSION = "baselines-v1.0"
+BASELINES_VERSION = "baselines-v1.1"
 STRATA = ["tier_cv", "scene_group", "vessel_cat"]
 
 
@@ -80,6 +80,13 @@ def print_metrics(tag, m):
 def shore_dir_of(build):
     c = sorted(glob.glob(f"{build}/stageC/shore_*"))
     return c[-1] if c else None
+
+
+def train_rows(train_build, eval_build, x_eval):
+    """Γραμμές του build εκπαίδευσης· αν είναι το ίδιο με της αξιολόγησης, χωρίς δεύτερη φόρτωση (v1.0: 2×)."""
+    if Path(train_build).resolve() == Path(eval_build).resolve():
+        return x_eval
+    return LD.load_rows(train_build, shore_dir_of(train_build))
 
 
 def _hash01(mmsi):
@@ -178,7 +185,8 @@ def main(argv=None):
 
     sd_e = shore_dir_of(eb)
     print(f"  αξιολόγηση: {eb} / {em} / {a.eval_split} | στάδιο Γ: {sd_e}")
-    ev = LD.load_split(eb, em, a.eval_split, shore_dir=sd_e)
+    x_ev = LD.load_rows(eb, sd_e)
+    ev = LD.load_split(eb, em, a.eval_split, x=x_ev)
     res = {"tag": tag, "versions": {"baselines": BASELINES_VERSION, "loader": LD.LOADER_VERSION,
                                     "python": sys.version.split()[0], "numpy": np.__version__, "pandas": pd.__version__},
            "args": vars(a), "eval": {"build": eb, "manifest": em, "split": a.eval_split, "shore_dir": sd_e}}
@@ -198,7 +206,7 @@ def main(argv=None):
             model.load_state_dict(torch.load(a.load_model, map_location=device))
             res["model_path"] = a.load_model
         else:
-            x_tr = LD.load_rows(a.train_build, shore_dir_of(a.train_build))
+            x_tr = train_rows(a.train_build, eb, x_ev)
             tr = LD.load_split(a.train_build, a.manifest, "train", x=x_tr)
             if a.train_capped:
                 keep = tr["meta"]["capped"].to_numpy() == 1

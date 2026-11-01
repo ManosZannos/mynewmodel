@@ -107,6 +107,17 @@ def test_load_split_end_to_end_csv():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def test_rows_loaded_once_when_same_build():
+    """v1.0: το build διαβαζόταν 2 φορές όταν εκπαίδευση και αξιολόγηση ήταν στο ίδιο build."""
+    x = _x()
+    orig = LD.load_rows
+    LD.load_rows = lambda *a, **k: (_ for _ in ()).throw(AssertionError("δεύτερη φόρτωση του ίδιου build"))
+    try:
+        assert BL.train_rows("dataset/socal", "dataset/socal/", x) is x
+    finally:
+        LD.load_rows = orig
+
+
 if __name__ == "__main__":
     k = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and k in n]

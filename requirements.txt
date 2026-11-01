@@ -1,29 +1,35 @@
 # CPA-GRN — Requirements
 # Vessel Trajectory Prediction with CPA-Aware Graph Recurrent Network
 #
-# Tested on:
-#   Python 3.10
-#   CUDA 12.4
-#   RTX 4090 (24GB) / DGX A100 (40GB)
+# Επαληθευμένο περιβάλλον (ίδιο σε RTX και DGX, 11/2026):
+#   Python 3.10.20 · conda env «trajpred»
+#   RTX 4090 (24GB) / DGX A100 (40GB, driver 535)
 #
 # Install (σε αυτή τη σειρά):
-#   1) pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+#   1) pip install torch==2.7.1+cu118 --index-url https://download.pytorch.org/whl/cu118
 #   2) pip install -r requirements.txt
 #
-# Σημείωση: το torch ΔΕΝ περιλαμβάνεται παρακάτω στη λίστα — εγκαθίσταται
-# αποκλειστικά μέσω της εντολής (1) παραπάνω, ώστε να μην κινδυνεύει να
-# αντικατασταθεί από CPU-only build μέσω του προεπιλεγμένου PyPI index.
+# Σημείωση: το torch ΔΕΝ περιλαμβάνεται παρακάτω — εγκαθίσταται μόνο με την εντολή (1),
+# ώστε να μην αντικατασταθεί από CPU-only build μέσω του προεπιλεγμένου PyPI index.
 
-# ── Data Processing ───────────────────────────────────────────────────────────
+# ── Data Processing (όλα τα στάδια, loader, baselines) ───────────────────────
 numpy==2.2.6
 pandas==2.3.3
+pyarrow==25.0.1          # Parquet (builds, stageB, stageC)
+zstandard                # ανάγνωση raw NOAA .csv.zst (στάδιο Α) — TODO: pin με `pip show zstandard` στον RTX
+
+# ── Στάδιο Γ (ακτογραμμή) — χρειάζεται μόνο στον RTX ─────────────────────────
 shapely==2.1.2
 pyproj==3.7.1
 pyogrio==0.13.0
 scipy==1.15.3
-osmium==4.3.2
-# ── Visualization (για plot_trajectories.py, visualize_attention.py) ──────────
+osmium==4.3.2            # pyosmium
+
+# ── Visualization (v5_visual.py, v5c_visual.py, plot_trajectories.py) ─────────
 matplotlib==3.10.9
 
+# ── Προαιρετικό ───────────────────────────────────────────────────────────────
+# pyyaml                 # μόνο αν δοθεί config .yaml στο preprocess_noaa.py (τα configs/ είναι .json)
+
 # ── Standard Library (no install needed) ─────────────────────────────────────
-# argparse, os, sys, json, logging, math, time, glob, re, io, zipfile, warnings
+# argparse, os, sys, json, logging, math, time, glob, re, io, zipfile, warnings, hashlib, multiprocessing
