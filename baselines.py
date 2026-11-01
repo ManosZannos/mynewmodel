@@ -30,7 +30,7 @@ import pandas as pd
 
 import loader as LD
 
-BASELINES_VERSION = "baselines-v1.1"
+BASELINES_VERSION = "baselines-v1.2"
 STRATA = ["tier_cv", "scene_group", "vessel_cat"]
 
 
@@ -56,6 +56,11 @@ def metrics(ade, fde, meta):
     out = {"all": agg(np.ones(len(meta), bool)), "headline": agg(head)}
     if "capped" in meta:
         out["headline_capped"] = agg(head & (meta["capped"].to_numpy() == 1))
+    if "nonoverlap" in meta:
+        out["headline_nonoverlap"] = agg(head & (meta["nonoverlap"].to_numpy() == 1))
+    if "pred_gap_frac" in meta:
+        g = meta["pred_gap_frac"].to_numpy()
+        out["by_gap"] = {"0": agg(head & (g == 0)), "0-0.2": agg(head & (g > 0) & (g <= 0.2)), ">0.2": agg(head & (g > 0.2))}
     for s in STRATA:
         if s in meta:
             vals = meta[s].astype(str).to_numpy()
@@ -70,9 +75,10 @@ def print_metrics(tag, m):
     h = m["headline"]
     print(f"  [{tag}] κύρια μετρική: ADE {h['ADE']} m | FDE {h['FDE']} m | FDE p90 {h['FDE_p90']} m | n={h['n']:,}"
           f"   (όλα: ADE {m['all']['ADE']}, FDE {m['all']['FDE']}, n={m['all']['n']:,})")
-    if "headline_capped" in m:
-        c = m["headline_capped"]
-        print(f"     capped: ADE {c['ADE']} | FDE {c['FDE']} | n={c['n']:,}")
+    for k in ("headline_capped", "headline_nonoverlap"):
+        if k in m:
+            c = m[k]
+            print(f"     {k[9:]}: ADE {c['ADE']} | FDE {c['FDE']} | n={c['n']:,}")
     for k in [k for k in m if k.startswith("by_")]:
         print(f"     {k[3:]:<12} " + " | ".join(f"{v}: {r['FDE']} ({r['n']:,})" for v, r in m[k].items()))
 
@@ -168,6 +174,8 @@ def main(argv=None):
     ap.add_argument("--eval_split", default="val")
     ap.add_argument("--train_capped", action="store_true", help="εκπαίδευση μόνο σε παράθυρα capped (V6)")
     ap.add_argument("--load_model", default=None)
+    ap.add_argument("--obs_step", type=int, default=60, choices=[20, 60, 120],
+                    help="πυκνότητα παρατήρησης (s) για το πείραμα πλέγματος· οι στόχοι μένουν στα 60 s")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--patience", type=int, default=3)
     ap.add_argument("--batch", type=int, default=1024)
@@ -178,7 +186,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     eb, em = a.eval_build or a.train_build, a.eval_manifest or a.manifest
     tag = a.tag or f"{a.model}_{Path(a.train_build).name}_{Path(eb).name}_{em}_{a.eval_split}" + \
-        (f"_s{a.seed}" if a.model == "lstm" else "") + ("_trcapped" if a.train_capped else "")
+        (f"_s{a.seed}" if a.model == "lstm" else "") + ("_trcapped" if a.train_capped else "") + \
+        (f"_obs{a.obs_step}s" if a.obs_step != 60 else "")
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     print(f"[baselines] {tag}")
@@ -187,6 +196,7 @@ def main(argv=None):
     print(f"  αξιολόγηση: {eb} / {em} / {a.eval_split} | στάδιο Γ: {sd_e}")
     x_ev = LD.load_rows(eb, sd_e)
     ev = LD.load_split(eb, em, a.eval_split, x=x_ev)
+    ev["obs"] = LD.resample_obs(ev["obs"], a.obs_step)
     res = {"tag": tag, "versions": {"baselines": BASELINES_VERSION, "loader": LD.LOADER_VERSION,
                                     "python": sys.version.split()[0], "numpy": np.__version__, "pandas": pd.__version__},
            "args": vars(a), "eval": {"build": eb, "manifest": em, "split": a.eval_split, "shore_dir": sd_e}}
@@ -208,6 +218,7 @@ def main(argv=None):
         else:
             x_tr = train_rows(a.train_build, eb, x_ev)
             tr = LD.load_split(a.train_build, a.manifest, "train", x=x_tr)
+            tr["obs"] = LD.resample_obs(tr["obs"], a.obs_step)
             if a.train_capped:
                 keep = tr["meta"]["capped"].to_numpy() == 1
                 tr = {**tr, "obs": tr["obs"][keep], "fut": tr["fut"][keep], "meta": tr["meta"][keep].reset_index(drop=True)}

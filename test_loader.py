@@ -118,6 +118,41 @@ def test_rows_loaded_once_when_same_build():
         LD.load_rows = orig
 
 
+# --- loader v1.1 / baselines v1.2 / compare_runs ---
+def test_nonoverlap_and_gap_frac():
+    """v1.0: χωρίς stratum παρεμβολής και χωρίς μη επικαλυπτόμενο υποσύνολο."""
+    x = _x()
+    x.loc[x.index[25:28], "GAP_IMP"] = 1
+    w = SB.build_windows(x, SB.DEFAULTS)
+    _, _, _, extra = LD.make_arrays(x, w)
+    assert "nonoverlap" in extra and "pred_gap_frac" in extra
+    sel = w[extra["nonoverlap"] == 1]
+    for _, g in sel.groupby("mmsi"):
+        assert (g["t_start"].diff().dropna() >= LD.OBS + LD.PRED).all(), "επικαλυπτόμενα στο υποσύνολο nonoverlap"
+    i = int(np.flatnonzero((w["mmsi"] == 1).to_numpy() & (w["row0"].to_numpy() == 15))[0])
+    assert abs(extra["pred_gap_frac"][i] - 0.3) < 1e-9, extra["pred_gap_frac"][i]     # γραμμές 25–27 στα 25–34
+
+
+def test_resample_obs():
+    x = _x()
+    w = SB.build_windows(x, SB.DEFAULTS)
+    obs, _, _, _ = LD.make_arrays(x, w)
+    o20, o120 = LD.resample_obs(obs, 20), LD.resample_obs(obs, 120)
+    assert o20.shape[1] == 3 * (LD.OBS - 1) + 1 and o120.shape[1] == LD.OBS // 2
+    assert np.allclose(o20[:, ::3, :2], obs[:, :, :2], atol=1e-6), "τα σημεία των 60 s πρέπει να διατηρούνται"
+    assert np.allclose(o20[:, -1, :2], 0) and np.allclose(o120[:, -1, :2], 0), "τελευταίο σημείο = t0"
+    assert np.allclose(o120[:, :, :2], obs[:, 1::2, :2])
+    assert np.allclose(LD.resample_obs(obs, 60), obs)
+
+
+def test_compare_runs():
+    import compare_runs as CR
+    r = CR.compare({0: 500.0, 1: 506.0, 2: 502.0}, {0: 490.0, 1: 497.0, 2: 491.0})
+    assert r["n"] == 3 and abs(r["diff"] + 10.0) < 1e-9 and r["se"] is not None and r["z"] < -3
+    r2 = CR.compare({0: 500.0, 1: 504.0}, {None: 642.4})
+    assert r2["n"] == 2 and abs(r2["diff"] - 140.4) < 1e-9
+
+
 if __name__ == "__main__":
     k = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and k in n]

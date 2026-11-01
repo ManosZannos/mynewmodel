@@ -27,7 +27,7 @@ import pandas as pd
 
 import stageB_manifests as SB
 
-LOADER_VERSION = "loader-v1.0"
+LOADER_VERSION = "loader-v1.1"
 R_EARTH = SB.R_EARTH
 OBS, PRED = SB.DEFAULTS["obs_min"], SB.DEFAULTS["pred_min"]
 SCALES = {"pos_m": 1000.0, "step_m": 100.0, "sog_kn": 20.0}
@@ -84,6 +84,28 @@ def local_xy(lat, lon):
     return xx - xx[:, OBS - 1:OBS], yy - yy[:, OBS - 1:OBS]
 
 
+def resample_obs(obs, step_s):
+    """Πυκνότητα παρατήρησης για το πείραμα 20/60/120 s (οι στόχοι μένουν στα 60 s).
+    120: κάθε δεύτερο σημείο (καταλήγει στο t0). 20: γραμμική παρεμβολή ανάμεσα στα σημεία των 60 s — ίδια
+    πληροφορία, περισσότερα σημεία (όπως ένα πλέγμα 20 s πάνω σε αναφορές ~70 s). dx, dy ξαναϋπολογίζονται."""
+    if step_s == 60:
+        return obs
+    if step_s == 120:
+        out = obs[:, (OBS - 1) % 2::2].copy()
+    elif step_s == 20:
+        n, T, F = obs.shape
+        tq = np.arange(0, T - 1 + 1e-9, 1 / 3)                      # 0, 1/3, ..., T-1
+        i0 = np.minimum(np.floor(tq).astype(int), T - 2)
+        a = (tq - i0)[None, :, None]
+        out = ((1 - a) * obs[:, i0] + a * obs[:, i0 + 1]).astype(np.float32)
+    else:
+        raise ValueError(f"obs step {step_s} s: μόνο 20, 60, 120")
+    xy = out[..., :2] * SCALES["pos_m"]
+    d = np.diff(xy, axis=1, prepend=xy[:, :1])
+    out[..., 2:4] = d / SCALES["step_m"]
+    return out
+
+
 def scene_group(d_shore, d_wf):
     g = np.full(len(d_shore), "offshore", dtype=object)
     g[d_shore <= SCENE["coastal_m"]] = "coastal"
@@ -111,7 +133,11 @@ def make_arrays(x, w):
     pos = np.stack([px, py], axis=-1).astype(np.float32)
     fut = np.stack([xx[:, OBS:], yy[:, OBS:]], axis=-1).astype(np.float32)
     last = ix[:, OBS - 1]
-    extra = {"lat_last": lat[:, OBS - 1], "lon_last": lon[:, OBS - 1]}
+    extra = {"lat_last": lat[:, OBS - 1], "lon_last": lon[:, OBS - 1],
+             # v1.1: ποσοστό σημείων στόχου από μεγάλα κενά (GAP_IMP) — stratum παρεμβολής (πρακτική EnvShip core/full)
+             "pred_gap_frac": x["GAP_IMP"].to_numpy(float)[ix[:, OBS:]].mean(1),
+             # v1.1: μη επικαλυπτόμενο υποσύνολο (έναρξη σε πολλαπλάσιο των 20 λεπτών) — αξιολόγηση τύπου «Protocol before progress»
+             "nonoverlap": (w["t_start"].to_numpy() % (OBS + PRED) == 0).astype(np.int8)}
     if "D_SHORE" in x:
         extra["scene_group"] = scene_group(x["D_SHORE"].to_numpy()[last], x["D_WATERFRONT"].to_numpy()[last])
     return obs, fut, pos, extra
