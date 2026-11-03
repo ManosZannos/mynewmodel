@@ -27,11 +27,11 @@ import pandas as pd
 
 import stageB_manifests as SB
 
-LOADER_VERSION = "loader-v1.2"
+LOADER_VERSION = "loader-v1.4"
 R_EARTH = SB.R_EARTH
 OBS, PRED = SB.DEFAULTS["obs_min"], SB.DEFAULTS["pred_min"]
 SCALES = {"pos_m": 1000.0, "step_m": 100.0, "sog_kn": 20.0}
-FEATURES = ["x", "y", "dx", "dy", "sog", "sin_cog", "cos_cog", "cog_valid", "gap_imp"]
+FEATURES = ["x", "y", "dx", "dy", "sog", "sin_cog", "cos_cog", "cog_valid", "gap_imp", "available"]
 SHORE_COLS = ["ON_LAND", "ON_LAND_DEPTH_M", "D_SHORE", "D_WATERFRONT"]
 # scene groups τύπου EnvShip, μόνο με κριτήρια απόστασης (τα κριτήρια πλήθους τμημάτων εξαρτώνται από το OSM)
 SCENE = {"harbor_wf_m": 1200.0, "nearshore_m": 900.0, "coastal_m": 2200.0}
@@ -42,10 +42,13 @@ def load_rows(build_dir, shore_dir=None):
     """Γραμμές του build με την ΙΔΙΑ σειρά με το stageB.load_build (άρα ισχύει το row0 των παραθύρων)."""
     files = sorted(glob.glob(f"{build_dir}/day_*.parquet"))
     if files:
-        parts = [pd.read_parquet(f, columns=SB.COLS) for f in files]
+        import pyarrow.parquet as pq
+        cols = SB.COLS + (["R_AFTER_S"] if "R_AFTER_S" in pq.read_schema(files[0]).names else [])
+        parts = [pd.read_parquet(f, columns=cols) for f in files]
     else:
         files = sorted(glob.glob(f"{build_dir}/day_*.csv.gz"))
-        parts = [pd.read_csv(f, usecols=SB.COLS) for f in files]
+        head = pd.read_csv(files[0], nrows=0).columns
+        parts = [pd.read_csv(f, usecols=SB.COLS + (["R_AFTER_S"] if "R_AFTER_S" in head else [])) for f in files]
         for p in parts:
             p["t"] = pd.to_datetime(p["t"], utc=True)
     if shore_dir:
@@ -121,26 +124,50 @@ def _nonoverlap(w):
     return ((t - first) % (OBS + PRED) == 0).astype(np.int8)
 
 
-def make_arrays(x, w):
-    """Πίνακες obs/fut/pos για τα παράθυρα w (μόνο οι γραμμές obs μπαίνουν στα χαρακτηριστικά)."""
+def available_mask(x, ix, causal=True):
+    """(n, OBS) bool: obs point k is available at t0 only if its later report arrived by t0
+    (R_AFTER_S <= 60 * (OBS-1-k)). Monotone in k, so availability is a prefix of the window."""
+    n = len(ix)
+    if not causal:
+        return np.ones((n, OBS), bool)
+    if "R_AFTER_S" not in x:
+        raise AssertionError("build χωρίς R_AFTER_S (στάδιο Α < v3.4): η αιτιατή παρατήρηση δεν είναι δυνατή")
+    ra = x["R_AFTER_S"].to_numpy()[ix[:, :OBS]]
+    return ra <= 60 * (OBS - 1 - np.arange(OBS))[None, :]
+
+
+def make_arrays(x, w, causal=True):
+    """Πίνακες obs/fut/pos για τα παράθυρα w. Causal: σημεία που εξαρτώνται από αναφορά μετά το t0
+    μηδενίζονται (available = 0) και η αρχή των συντεταγμένων είναι το τελευταίο διαθέσιμο σημείο."""
     ix = window_rows(x, w)
+    n = len(ix)
     lat, lon = x["lat"].to_numpy(float)[ix], x["lon"].to_numpy(float)[ix]
+    av = available_mask(x, ix, causal)
+    c = av.sum(1) - 1                                   # last available obs index
+    if (c < 3).any():
+        raise AssertionError(f"{int((c < 3).sum())} παράθυρα με < 4 διαθέσιμα σημεία παρατήρησης")
     xx, yy = local_xy(lat, lon)
+    rows = np.arange(n)
+    xx, yy = xx - xx[rows, c][:, None], yy - yy[rows, c][:, None]   # origin = last available point
     ob = ix[:, :OBS]
-    px, py = xx[:, :OBS], yy[:, :OBS]
+    px, py = np.where(av, xx[:, :OBS], 0.0), np.where(av, yy[:, :OBS], 0.0)
     dx = np.diff(px, axis=1, prepend=px[:, :1])
     dy = np.diff(py, axis=1, prepend=py[:, :1])
     cog = np.radians(x["cog"].to_numpy(float)[ob])
-    cv = (x["COG_VALID"].to_numpy()[ob] == 1)
+    # v1.4: COG only where SOG exists — when SOG is missing, stage A falls back to a position-based speed
+    # with central differences (uses the next minute), so COG_VALID there is not causal
+    sog_obs = x["sog"].to_numpy(float)[ob]
+    cv = (x["COG_VALID"].to_numpy()[ob] == 1) & ~np.isnan(sog_obs)
     feats = np.stack([px / SCALES["pos_m"], py / SCALES["pos_m"], dx / SCALES["step_m"], dy / SCALES["step_m"],
                       np.nan_to_num(x["sog"].to_numpy(float)[ob]) / SCALES["sog_kn"],
                       np.where(cv, np.sin(cog), 0.0), np.where(cv, np.cos(cog), 0.0), cv.astype(float),
-                      x["GAP_IMP"].to_numpy(float)[ob]], axis=-1)
+                      x["GAP_IMP"].to_numpy(float)[ob], np.ones((n, OBS))], axis=-1)
+    feats = np.where(av[..., None], feats, 0.0)         # unavailable points: all channels 0 (incl. available)
     obs = feats.astype(np.float32)
     pos = np.stack([px, py], axis=-1).astype(np.float32)
     fut = np.stack([xx[:, OBS:], yy[:, OBS:]], axis=-1).astype(np.float32)
-    last = ix[:, OBS - 1]
-    extra = {"lat_last": lat[:, OBS - 1], "lon_last": lon[:, OBS - 1],
+    last = ix[rows, c]
+    extra = {"lat_last": lat[rows, c], "lon_last": lon[rows, c], "last_avail": c,
              # v1.1: ποσοστό σημείων στόχου από μεγάλα κενά (GAP_IMP) — stratum παρεμβολής (πρακτική EnvShip core/full)
              "pred_gap_frac": x["GAP_IMP"].to_numpy(float)[ix[:, OBS:]].mean(1),
              # μη επικαλυπτόμενο υποσύνολο: κάθε 4ο παράθυρο ανά segment (v1.1 μετρούσε σε απόλυτο χρόνο → ~5% αντί ~25%)
@@ -158,7 +185,7 @@ def _read_tab(path_parquet):
     return pd.read_csv(p.with_name(p.stem + ".csv.gz"))
 
 
-def load_split(build_dir, manifest, split, shore_dir=None, headline_only=False, x=None, windows=None):
+def load_split(build_dir, manifest, split, shore_dir=None, headline_only=False, x=None, windows=None, causal=True):
     """Πίνακες για ένα split ενός manifest. Τα x/windows μπορούν να δοθούν για επαναχρησιμοποίηση."""
     sb = Path(build_dir) / "stageB"
     w = windows if windows is not None else _read_tab(sb / "windows.parquet")
@@ -173,14 +200,14 @@ def load_split(build_dir, manifest, split, shore_dir=None, headline_only=False, 
     ws = ws.sort_values("window_id").reset_index(drop=True)
     if x is None:
         x = load_rows(build_dir, shore_dir)
-    obs, fut, pos, extra = make_arrays(x, ws)
+    obs, fut, pos, extra = make_arrays(x, ws, causal)
     cols = [c for c in ("window_id", "mmsi", "split", "vessel_cat", "transceiver", "headline", "capped",
                         "tier_cv", "cv_fde_m", "seen_mmsi", "on_land") if c in ws]
     meta = ws[cols].copy()
     for k, v in extra.items():
         meta[k] = v
     return {"obs": obs, "fut": fut, "pos": pos, "meta": meta, "features": FEATURES, "scales": SCALES,
-            "loader_version": LOADER_VERSION, "manifest": manifest, "split": split}
+            "loader_version": LOADER_VERSION, "manifest": manifest, "split": split, "causal": causal}
 
 
 def manifest_info(build_dir, manifest):

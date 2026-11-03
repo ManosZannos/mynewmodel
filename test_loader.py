@@ -18,7 +18,8 @@ def _track(mmsi, minutes, seg=1, lat0=33.0, lon0=-118.0, turn_deg_per_min=0.0, s
         lon.append(lon[-1] + step * np.sin(np.radians(h)) / (111_195.0 * np.cos(np.radians(lat0))))
     return pd.DataFrame({"mmsi": mmsi, "t": pd.Timestamp(t0, tz="UTC") + pd.to_timedelta(np.arange(minutes), unit="min"),
                          "seg_id": seg, "lat": lat, "lon": lon, "sog": speed_kn, "cog": hdg % 360, "COG_VALID": 1,
-                         "GAP_IMP": 0, "IN_CORE": 1, "MMSI_QC": 0, "vessel_cat": "cargo", "transceiver": "A"})
+                         "GAP_IMP": 0, "IN_CORE": 1, "MMSI_QC": 0, "vessel_cat": "cargo", "transceiver": "A",
+                         "R_AFTER_S": 0})
 
 
 def _x():
@@ -88,7 +89,7 @@ def test_load_split_end_to_end_csv():
     try:
         x = _x()
         for day, g in x.groupby(x["t"].dt.strftime("%Y-%m-%d")):
-            g[SB.COLS].to_csv(d / f"day_{day}.csv.gz", index=False)
+            g[SB.COLS + ["R_AFTER_S"]].to_csv(d / f"day_{day}.csv.gz", index=False)
         xr = LD.load_rows(str(d))
         w = SB.build_windows(SB.load_build(str(d)), SB.DEFAULTS)
         w["tier_cv"] = "easy"
@@ -160,6 +161,66 @@ def test_compare_runs():
     assert r["n"] == 3 and abs(r["diff"] + 10.0) < 1e-9 and r["se"] is not None and r["z"] < -3
     r2 = CR.compare({0: 500.0, 1: 504.0}, {None: 642.4})
     assert r2["n"] == 2 and abs(r2["diff"] - 140.4) < 1e-9
+
+
+# --- loader v1.3: causal observation ---
+def _one_window(x):
+    w = SB.build_windows(x, SB.DEFAULTS)
+    i = int(np.flatnonzero((w["mmsi"] == 1).to_numpy() & (w["row0"].to_numpy() == 15))[0])
+    return w.iloc[[i]].reset_index(drop=True), 15
+
+
+def test_causal_mask_and_origin():
+    """v1.2: the last obs points used reports after t0 (interpolation look-ahead) and the origin did too."""
+    x = _x()
+    w, r0 = _one_window(x)
+    x.loc[r0 + 9, "R_AFTER_S"] = 30       # needs a report 30 s after t0  -> unavailable
+    x.loc[r0 + 8, "R_AFTER_S"] = 90       # report 30 s after t0          -> unavailable
+    x.loc[r0 + 7, "R_AFTER_S"] = 100      # report 20 s before t0         -> available
+    obs, fut, pos, extra = LD.make_arrays(x, w)
+    assert obs.shape[-1] == len(LD.FEATURES) and LD.FEATURES[-1] == "available"
+    assert list(obs[0, :, -1]) == [1] * 8 + [0, 0], obs[0, :, -1]
+    assert np.allclose(obs[0, 8:], 0) and extra["last_avail"][0] == 7
+    assert np.allclose(pos[0, 7], 0), "αρχή = τελευταίο διαθέσιμο σημείο"
+    x2 = x.copy()
+    x2.loc[[r0 + 8, r0 + 9], ["lat", "lon"]] += 0.01
+    x2.loc[[r0 + 8, r0 + 9], ["sog", "cog"]] = [25.0, 10.0]
+    obs2, fut2, _, _ = LD.make_arrays(x2, w)
+    assert np.array_equal(obs, obs2) and np.array_equal(fut, fut2), "είσοδος/στόχος εξαρτώνται από σημεία μετά το t0"
+    obs_nc = LD.make_arrays(x, w, causal=False)[0]
+    assert obs_nc[0, :, -1].all() and not np.allclose(obs_nc[0, 9], 0)
+
+
+def test_causal_cv_extrapolates_from_last_available():
+    x = _x()
+    w, r0 = _one_window(x)                     # MMSI 1: straight line, constant speed
+    x.loc[[r0 + 8, r0 + 9], "R_AFTER_S"] = [90, 30]
+    _, fut, pos, extra = LD.make_arrays(x, w)
+    ade, fde = BL.errors(BL.cv_predict(pos, last=extra["last_avail"]), fut)
+    assert fde[0] < 0.5 and ade[0] < 0.5, (ade, fde)     # exact on a straight line from point 7
+
+
+def test_missing_r_after_s_rejected_in_causal_mode():
+    x = _x().drop(columns=["R_AFTER_S"])
+    w, _ = _one_window(_x())
+    try:
+        LD.make_arrays(x, w)
+    except AssertionError:
+        LD.make_arrays(x, w, causal=False)
+        return
+    raise AssertionError("build χωρίς R_AFTER_S έγινε δεκτό σε αιτιατή λειτουργία")
+
+
+def test_cog_ignored_when_sog_missing():
+    """v1.3: COG_VALID with missing SOG comes from central differences (next minute) -> not causal."""
+    x = _x()
+    w, r0 = _one_window(x)
+    x.loc[r0 + 4, "sog"] = np.nan                     # COG_VALID stays 1 in the build
+    obs = LD.make_arrays(x, w)[0]
+    k = 4
+    i_cv, i_sin, i_cos = (LD.FEATURES.index(f) for f in ("cog_valid", "sin_cog", "cos_cog"))
+    assert obs[0, k, i_cv] == 0 and obs[0, k, i_sin] == 0 and obs[0, k, i_cos] == 0, obs[0, k]
+    assert obs[0, k - 1, i_cv] == 1
 
 
 if __name__ == "__main__":
