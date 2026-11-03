@@ -667,6 +667,25 @@ def test_no_future_information():
     pd.testing.assert_frame_equal(a, b, check_dtype=False)
 
 
+def test_r_after_s_marks_later_report():
+    # v3.4: R_AFTER_S = seconds to the first report at/after the grid point; rows with t + R_AFTER_S <= T
+    # must be identical whether or not the data after T exist (causal observation mask in the loader)
+    tr = Track(3600, lambda t: 10.0, lambda t: 45.0 + 0.02 * t)
+    times = report_times(3600, 60, 80, phase=17)
+    raw = make_reports(tr, times)
+    out, _, _ = run(raw)
+    assert "R_AFTER_S" in out.columns, "λείπει η στήλη R_AFTER_S"
+    g = (out["t"] - T0).dt.total_seconds().to_numpy()
+    nxt = times[np.searchsorted(times, g, side="left")]
+    assert np.array_equal(out["R_AFTER_S"].to_numpy(), (nxt - g).astype(int)), "λάθος R_AFTER_S"
+    cut = 1800
+    part, _, _ = run(raw[raw["_t_s"] <= cut])
+    ok = out[(g + out["R_AFTER_S"].to_numpy()) <= cut].reset_index(drop=True)
+    cols = ["t", "lat", "lon", "sog", "cog", "R_AFTER_S"]
+    pd.testing.assert_frame_equal(ok[cols], part[cols].iloc[:len(ok)].reset_index(drop=True), check_dtype=False)
+    assert len(part) == len(ok), "σημεία που χρειάζονται αναφορά μετά το T δεν πρέπει να υπάρχουν στο κομμένο"
+
+
 def _mixed_scenario():
     rng = np.random.default_rng(42)
     parts = []

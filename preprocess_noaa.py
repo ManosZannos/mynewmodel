@@ -47,7 +47,7 @@ REGIONS = {
 }
 
 DEFAULT_CONFIG = {
-    "config_version": "stageA-v3.3",
+    "config_version": "stageA-v3.4",
     "region": REGIONS["socal"],
     "margin_km": 10.0,              # κουτί + περιθώριο για γείτονες (στόχοι μόνο IN_CORE)
     "grid_s": 60,
@@ -416,6 +416,9 @@ def resample_segment(t, lat, lon, sog, cog, hdg, cfg):
 
     out = pd.DataFrame({"tg": g, "x": gx, "y": gy, "sog": gsog, "cog": gcog, "heading": ghdg,
                         "INTERP_SPAN": span})
+    # v3.4: seconds from the grid point to the later report used for lat/lon/sog/cog (0 = exact report).
+    # A point is causal at time T only if tg + R_AFTER_S <= T (used by the loader to mask observations).
+    out["R_AFTER_S"] = np.where(exact, 0, t[r] - g).astype(np.int32)
     # ταχύτητα από θέσεις, μέσα σε συνεχόμενα λεπτά
     run_id = np.concatenate([[0], np.cumsum(np.diff(g) != G)])
     vx = np.full(len(g), np.nan)
@@ -554,7 +557,7 @@ def run_stage_a(raw: pd.DataFrame, cfg: dict):
 
     cols = ["mmsi", "t", "seg_id", "lat", "lon", "sog", "cog", "COG_VALID", "heading", "HDG_SRC",
             "vessel_cat", "transceiver", "GAP_IMP", "INTERP_SPAN", "STATIONARY", "QC_SOG", "QC_COG",
-            "IN_CORE", "MMSI_QC", "vx_sog", "vy_sog", "vx_pos", "vy_pos"]
+            "IN_CORE", "MMSI_QC", "vx_sog", "vy_sog", "vx_pos", "vy_pos", "R_AFTER_S"]
     if not outs:
         empty = pd.DataFrame(columns=cols)
         empty["t"] = pd.to_datetime(empty["t"], utc=True)

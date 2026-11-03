@@ -30,16 +30,21 @@ import pandas as pd
 
 import loader as LD
 
-BASELINES_VERSION = "baselines-v1.2"
+BASELINES_VERSION = "baselines-v1.3"
 STRATA = ["tier_cv", "scene_group", "vessel_cat"]
 
 
 # ---------------------------------------------------------------------------
-def cv_predict(pos, pred=LD.PRED):
-    """pos (n, 10, 2) → (n, pred, 2): συνέχιση με την ταχύτητα των 3 τελευταίων λεπτών."""
-    v = (pos[:, -1] - pos[:, -4]) / 3.0
-    k = np.arange(1, pred + 1, dtype=np.float64)[None, :, None]
-    return pos[:, -1:].astype(np.float64) + v[:, None, :].astype(np.float64) * k
+def cv_predict(pos, pred=LD.PRED, last=None):
+    """pos (n, 10, 2) → (n, pred, 2): velocity of the 3 minutes ending at the last available point
+    (last = index per window; None = last obs point), extrapolated to the target minutes."""
+    n, T, _ = pos.shape
+    c = np.full(n, T - 1) if last is None else np.asarray(last)
+    rows = np.arange(n)
+    p_c = pos[rows, c].astype(np.float64)
+    v = (p_c - pos[rows, c - 3].astype(np.float64)) / 3.0
+    k = (T - 1 - c)[:, None] + np.arange(1, pred + 1)[None, :]
+    return p_c[:, None, :] + v[:, None, :] * k[..., None]
 
 
 def errors(pred, fut):
@@ -174,6 +179,8 @@ def main(argv=None):
     ap.add_argument("--eval_split", default="val")
     ap.add_argument("--train_capped", action="store_true", help="εκπαίδευση μόνο σε παράθυρα capped (V6)")
     ap.add_argument("--load_model", default=None)
+    ap.add_argument("--noncausal", action="store_true",
+                    help="παλιά (μη αιτιατή) παρατήρηση — μόνο για να μετρηθεί η επίδραση της παρεμβολής")
     ap.add_argument("--obs_step", type=int, default=60, choices=[20, 60, 120],
                     help="πυκνότητα παρατήρησης (s) για το πείραμα πλέγματος· οι στόχοι μένουν στα 60 s")
     ap.add_argument("--epochs", type=int, default=20)
@@ -187,7 +194,9 @@ def main(argv=None):
     eb, em = a.eval_build or a.train_build, a.eval_manifest or a.manifest
     tag = a.tag or f"{a.model}_{Path(a.train_build).name}_{Path(eb).name}_{em}_{a.eval_split}" + \
         (f"_s{a.seed}" if a.model == "lstm" else "") + ("_trcapped" if a.train_capped else "") + \
-        (f"_obs{a.obs_step}s" if a.obs_step != 60 else "")
+        (f"_obs{a.obs_step}s" if a.obs_step != 60 else "") + ("_noncausal" if a.noncausal else "")
+    if a.obs_step != 60 and not a.noncausal:
+        sys.exit("το πείραμα πυκνότητας (--obs_step) ορίζεται μόνο με --noncausal")
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     print(f"[baselines] {tag}")
@@ -195,7 +204,7 @@ def main(argv=None):
     sd_e = shore_dir_of(eb)
     print(f"  αξιολόγηση: {eb} / {em} / {a.eval_split} | στάδιο Γ: {sd_e}")
     x_ev = LD.load_rows(eb, sd_e)
-    ev = LD.load_split(eb, em, a.eval_split, x=x_ev)
+    ev = LD.load_split(eb, em, a.eval_split, x=x_ev, causal=not a.noncausal)
     ev["obs"] = LD.resample_obs(ev["obs"], a.obs_step)
     res = {"tag": tag, "versions": {"baselines": BASELINES_VERSION, "loader": LD.LOADER_VERSION,
                                     "python": sys.version.split()[0], "numpy": np.__version__, "pandas": pd.__version__},
@@ -206,7 +215,7 @@ def main(argv=None):
         res["commit"] = None
 
     if a.model == "cv":
-        pred = cv_predict(ev["pos"])
+        pred = cv_predict(ev["pos"], last=ev["meta"]["last_avail"].to_numpy())
     else:
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -217,7 +226,7 @@ def main(argv=None):
             res["model_path"] = a.load_model
         else:
             x_tr = train_rows(a.train_build, eb, x_ev)
-            tr = LD.load_split(a.train_build, a.manifest, "train", x=x_tr)
+            tr = LD.load_split(a.train_build, a.manifest, "train", x=x_tr, causal=not a.noncausal)
             tr["obs"] = LD.resample_obs(tr["obs"], a.obs_step)
             if a.train_capped:
                 keep = tr["meta"]["capped"].to_numpy() == 1
