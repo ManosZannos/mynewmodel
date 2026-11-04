@@ -19,7 +19,7 @@ def _track(mmsi, minutes, seg=1, lat0=33.0, lon0=-118.0, turn_deg_per_min=0.0, s
     return pd.DataFrame({"mmsi": mmsi, "t": pd.Timestamp(t0, tz="UTC") + pd.to_timedelta(np.arange(minutes), unit="min"),
                          "seg_id": seg, "lat": lat, "lon": lon, "sog": speed_kn, "cog": hdg % 360, "COG_VALID": 1,
                          "GAP_IMP": 0, "IN_CORE": 1, "MMSI_QC": 0, "vessel_cat": "cargo", "transceiver": "A",
-                         "R_AFTER_S": 0})
+                         "R_AFTER_S": 0, "P_AGE_S": 0, "P_LAT": lat, "P_LON": lon, "P_SOG": speed_kn, "P_COG": hdg % 360})
 
 
 def _x():
@@ -46,7 +46,7 @@ def test_shapes_and_origin():
     w = SB.build_windows(x, SB.DEFAULTS)
     obs, fut, pos, _ = LD.make_arrays(x, w)
     n = len(w)
-    assert obs.shape == (n, LD.OBS, len(LD.FEATURES)) and fut.shape == (n, LD.PRED, 2) and pos.shape == (n, LD.OBS, 2)
+    assert obs.shape == (n, LD.OBS + 1, len(LD.FEATURES)) and fut.shape == (n, LD.PRED, 2) and pos.shape == (n, LD.OBS, 2)
     assert np.allclose(pos[:, -1], 0) and np.allclose(obs[:, -1, :2], 0), "αρχή = τελευταίο σημείο παρατήρησης"
     assert np.isfinite(obs).all() and np.isfinite(fut).all()
     step = 10 * 1852 / 60
@@ -89,7 +89,7 @@ def test_load_split_end_to_end_csv():
     try:
         x = _x()
         for day, g in x.groupby(x["t"].dt.strftime("%Y-%m-%d")):
-            g[SB.COLS + ["R_AFTER_S"]].to_csv(d / f"day_{day}.csv.gz", index=False)
+            g[SB.COLS + LD.CAUSAL_COLS].to_csv(d / f"day_{day}.csv.gz", index=False)
         xr = LD.load_rows(str(d))
         w = SB.build_windows(SB.load_build(str(d)), SB.DEFAULTS)
         w["tier_cv"] = "easy"
@@ -146,7 +146,7 @@ def test_nonoverlap_coverage_unaligned_segment():
 def test_resample_obs():
     x = _x()
     w = SB.build_windows(x, SB.DEFAULTS)
-    obs, _, _, _ = LD.make_arrays(x, w)
+    obs, _, _, _ = LD.make_arrays(x, w, causal=False)
     o20, o120 = LD.resample_obs(obs, 20), LD.resample_obs(obs, 120)
     assert o20.shape[1] == 3 * (LD.OBS - 1) + 1 and o120.shape[1] == LD.OBS // 2
     assert np.allclose(o20[:, ::3, :2], obs[:, :, :2], atol=1e-6), "τα σημεία των 60 s πρέπει να διατηρούνται"
@@ -170,34 +170,65 @@ def _one_window(x):
     return w.iloc[[i]].reset_index(drop=True), 15
 
 
+def _last_report_at(x, r0, age_s):
+    """Row t0 = r0 + 9: last report at t0 - age_s, on the straight track of MMSI 1 (exact position)."""
+    a = age_s / 60.0
+    for c in ("lat", "lon"):
+        x.loc[r0 + 9, "P_" + c.upper()] = (1 - a) * x.loc[r0 + 9, c] + a * x.loc[r0 + 8, c]
+    x.loc[r0 + 9, "P_AGE_S"] = age_s
+
+
 def test_causal_mask_and_origin():
-    """v1.2: the last obs points used reports after t0 (interpolation look-ahead) and the origin did too."""
+    """v1.2: the last obs points used reports after t0. v1.4: the origin was the last available grid point,
+    which drops the last real report before t0 (§12.6). v1.5: extra token = last report, origin = that report."""
     x = _x()
     w, r0 = _one_window(x)
     x.loc[r0 + 9, "R_AFTER_S"] = 30       # needs a report 30 s after t0  -> unavailable
     x.loc[r0 + 8, "R_AFTER_S"] = 90       # report 30 s after t0          -> unavailable
     x.loc[r0 + 7, "R_AFTER_S"] = 100      # report 20 s before t0         -> available
+    _last_report_at(x, r0, 20)            # that report is the last one at or before t0
     obs, fut, pos, extra = LD.make_arrays(x, w)
-    assert obs.shape[-1] == len(LD.FEATURES) and LD.FEATURES[-1] == "available"
-    assert list(obs[0, :, -1]) == [1] * 8 + [0, 0], obs[0, :, -1]
-    assert np.allclose(obs[0, 8:], 0) and extra["last_avail"][0] == 7
-    assert np.allclose(pos[0, 7], 0), "αρχή = τελευταίο διαθέσιμο σημείο"
+    i_av, i_dt = LD.FEATURES.index("available"), LD.FEATURES.index("dt_min")
+    assert obs.shape[1] == LD.OBS + 1 and obs.shape[-1] == len(LD.FEATURES)
+    assert list(obs[0, :, i_av]) == [1] * 8 + [0, 0] + [1], obs[0, :, i_av]
+    assert np.allclose(obs[0, 8:10], 0) and extra["last_avail"][0] == 7
+    assert np.allclose(obs[0, :8, i_dt], np.arange(9, 1, -1)) and abs(obs[0, -1, i_dt] - 20 / 60) < 1e-6
+    assert np.allclose(obs[0, -1, :2], 0) and abs(extra["p_age_s"][0] - 20) < 1e-9, "αρχή = τελευταία αναφορά"
+    step = 10 * 1852 / 60
+    assert abs(np.linalg.norm(pos[0, 7]) - step * 100 / 60) < 0.5, "θέση 7 (t0 - 120 s) σε σχέση με την αναφορά t0 - 20 s"
+    assert abs(np.linalg.norm(fut[0, 0]) - step * 80 / 60) < 0.5, "στόχος σε σχέση με την αναφορά"
     x2 = x.copy()
     x2.loc[[r0 + 8, r0 + 9], ["lat", "lon"]] += 0.01
     x2.loc[[r0 + 8, r0 + 9], ["sog", "cog"]] = [25.0, 10.0]
     obs2, fut2, _, _ = LD.make_arrays(x2, w)
     assert np.array_equal(obs, obs2) and np.array_equal(fut, fut2), "είσοδος/στόχος εξαρτώνται από σημεία μετά το t0"
     obs_nc = LD.make_arrays(x, w, causal=False)[0]
-    assert obs_nc[0, :, -1].all() and not np.allclose(obs_nc[0, 9], 0)
+    assert obs_nc.shape[1] == LD.OBS and obs_nc[0, :, -1].all() and not np.allclose(obs_nc[0, 9], 0)
 
 
-def test_causal_cv_extrapolates_from_last_available():
+def test_causal_cv_from_last_report():
+    """v1.4: CV extrapolated from the last available grid point, ignoring the later report (§12.6)."""
     x = _x()
     w, r0 = _one_window(x)                     # MMSI 1: straight line, constant speed
     x.loc[[r0 + 8, r0 + 9], "R_AFTER_S"] = [90, 30]
+    _last_report_at(x, r0, 20)
+    x.loc[r0 + 9, "P_LAT"] += 50 / 111_195.0  # report 50 m north of the track: CV must start from it
     _, fut, pos, extra = LD.make_arrays(x, w)
-    ade, fde = BL.errors(BL.cv_predict(pos, last=extra["last_avail"]), fut)
-    assert fde[0] < 0.5 and ade[0] < 0.5, (ade, fde)     # exact on a straight line from point 7
+    pred = BL.cv_predict(pos, last=extra["last_avail"], age_s=extra["p_age_s"])
+    ade, fde = BL.errors(pred, fut)
+    assert abs(fde[0] - 50) < 0.5 and abs(ade[0] - 50) < 0.5, (ade, fde)   # parallel offset of 50 m
+
+
+def test_last_report_before_last_available_rejected():
+    """P_AGE_S older than the last available grid point means misaligned or inconsistent build columns."""
+    x = _x()
+    w, r0 = _one_window(x)
+    x.loc[r0 + 9, "P_AGE_S"] = 120            # all grid points available, but last report 2 min old
+    try:
+        LD.make_arrays(x, w)
+    except AssertionError:
+        return
+    raise AssertionError("ασυνεπές P_AGE_S έγινε δεκτό")
 
 
 def test_missing_r_after_s_rejected_in_causal_mode():
@@ -209,6 +240,18 @@ def test_missing_r_after_s_rejected_in_causal_mode():
         LD.make_arrays(x, w, causal=False)
         return
     raise AssertionError("build χωρίς R_AFTER_S έγινε δεκτό σε αιτιατή λειτουργία")
+
+
+def test_missing_last_report_rejected_in_causal_mode():
+    """v1.5: a stage A < v3.5 build (no P_* columns) cannot give the causal observation."""
+    x = _x().drop(columns=["P_AGE_S"])
+    w, _ = _one_window(_x())
+    try:
+        LD.make_arrays(x, w)
+    except AssertionError:
+        LD.make_arrays(x, w, causal=False)
+        return
+    raise AssertionError("build χωρίς P_* έγινε δεκτό σε αιτιατή λειτουργία")
 
 
 def test_cog_ignored_when_sog_missing():

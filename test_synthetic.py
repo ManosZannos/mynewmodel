@@ -686,6 +686,37 @@ def test_r_after_s_marks_later_report():
     assert len(part) == len(ok), "σημεία που χρειάζονται αναφορά μετά το T δεν πρέπει να υπάρχουν στο κομμένο"
 
 
+def test_last_report_columns():
+    # v3.5: P_* = last report at or before the grid point (raw position, SOG, COG with A10 validity, age).
+    # Depends only on reports <= g, so rows with t <= T are identical whether or not data after T exist.
+    tr = Track(3600, lambda t: 10.0, lambda t: 45.0 + 0.02 * t)
+    times = report_times(3600, 60, 80, phase=17)
+    raw = make_reports(tr, times)
+    out, _, _ = run(raw)
+    for c in ("P_AGE_S", "P_LAT", "P_LON", "P_SOG", "P_COG"):
+        assert c in out.columns, f"λείπει η στήλη {c}"
+    g = (out["t"] - T0).dt.total_seconds().to_numpy()
+    p = np.searchsorted(times, g, side="right") - 1
+    assert np.array_equal(out["P_AGE_S"].to_numpy(), (g - times[p]).astype(int)), "λάθος P_AGE_S"
+    assert np.allclose(out["P_LAT"], raw["latitude"].to_numpy()[p]) and np.allclose(out["P_LON"], raw["longitude"].to_numpy()[p])
+    assert np.allclose(out["P_SOG"], raw["sog"].to_numpy()[p]) and np.allclose(out["P_COG"], raw["cog"].to_numpy()[p])
+    span = out["INTERP_SPAN"].to_numpy()
+    assert np.array_equal((out["P_AGE_S"] + out["R_AFTER_S"]).to_numpy(), span.astype(int)), "P_AGE_S + R_AFTER_S ≠ span"
+    cut = 1800
+    part, _, _ = run(raw[raw["_t_s"] <= cut])
+    cols = ["t", "P_AGE_S", "P_LAT", "P_LON", "P_SOG", "P_COG"]
+    ok = out[g <= cut].reset_index(drop=True)
+    assert len(ok) - 1 <= len(part) <= len(ok), "λείπουν γραμμές πέρα από το λεπτό της τελευταίας αναφοράς"
+    pd.testing.assert_frame_equal(ok[cols].iloc[:len(part)], part[cols], check_dtype=False)   # minutes needing a report after T are absent
+
+
+def test_last_report_cog_invalid_when_slow():
+    # A10 applies to the last report: SOG < 0.5 kn -> P_COG = NaN
+    tr = Track(1800, lambda t: 0.2, lambda t: 90.0)
+    out, _, _ = run(make_reports(tr, report_times(1800, 60, 80, phase=5)))
+    assert len(out) and out["P_COG"].isna().all(), out["P_COG"].head()
+
+
 def _mixed_scenario():
     rng = np.random.default_rng(42)
     parts = []
@@ -728,6 +759,19 @@ def test_output_invariants():
         v = np.hypot(np.diff(x), np.diff(y)) / dt / KN
         assert (v <= cfg["speed_caps_kn"]["global"]).all(), "βήμα πάνω από το γενικό όριο"
         assert (dt >= 60).all()
+
+
+def test_v4_invariants():
+    # V4 on stage A output: all checks pass on a clean build and each corruption is caught
+    import v4_invariants as V4
+    out, _, cfg = run(_mixed_scenario())
+    res = V4.check(out, cfg)
+    assert all(r["ok"] for r in res.values()), {k: r for k, r in res.items() if not r["ok"]}
+    bad = {"unique_mmsi_t": pd.concat([out, out.iloc[[5]]]).sort_values(["mmsi", "t"], kind="mergesort"),
+           "no_point_in_gap_gt_B": out.assign(INTERP_SPAN=out["INTERP_SPAN"].where(out.index != 5, 500)),
+           "age_plus_after_eq_span": out.assign(P_AGE_S=out["P_AGE_S"] + (out.index == 5))}
+    for name, df in bad.items():
+        assert not V4.check(df.reset_index(drop=True), cfg)[name]["ok"], f"δεν εντοπίστηκε: {name}"
 
 
 # ---------------------------------------------------------------------------

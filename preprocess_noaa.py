@@ -47,7 +47,7 @@ REGIONS = {
 }
 
 DEFAULT_CONFIG = {
-    "config_version": "stageA-v3.4",
+    "config_version": "stageA-v3.5",
     "region": REGIONS["socal"],
     "margin_km": 10.0,              # κουτί + περιθώριο για γείτονες (στόχοι μόνο IN_CORE)
     "grid_s": 60,
@@ -419,6 +419,12 @@ def resample_segment(t, lat, lon, sog, cog, hdg, cfg):
     # v3.4: seconds from the grid point to the later report used for lat/lon/sog/cog (0 = exact report).
     # A point is causal at time T only if tg + R_AFTER_S <= T (used by the loader to mask observations).
     out["R_AFTER_S"] = np.where(exact, 0, t[r] - g).astype(np.int32)
+    # v3.5: last report at or before the grid point (raw values, A10 validity for COG): the causal observation
+    # at t0 is the row at t0. Depends only on reports <= tg. P_AGE_S + R_AFTER_S = INTERP_SPAN.
+    p = np.where(exact, r, l)
+    out["P_AGE_S"] = (g - t[p]).astype(np.int32)
+    out["P_LAT"], out["P_LON"], out["P_SOG"] = lat[p], lon[p], sog[p]
+    out["P_COG"] = np.where(cvalid[p], cog[p], np.nan)
     # ταχύτητα από θέσεις, μέσα σε συνεχόμενα λεπτά
     run_id = np.concatenate([[0], np.cumsum(np.diff(g) != G)])
     vx = np.full(len(g), np.nan)
@@ -557,7 +563,8 @@ def run_stage_a(raw: pd.DataFrame, cfg: dict):
 
     cols = ["mmsi", "t", "seg_id", "lat", "lon", "sog", "cog", "COG_VALID", "heading", "HDG_SRC",
             "vessel_cat", "transceiver", "GAP_IMP", "INTERP_SPAN", "STATIONARY", "QC_SOG", "QC_COG",
-            "IN_CORE", "MMSI_QC", "vx_sog", "vy_sog", "vx_pos", "vy_pos", "R_AFTER_S"]
+            "IN_CORE", "MMSI_QC", "vx_sog", "vy_sog", "vx_pos", "vy_pos", "R_AFTER_S",
+            "P_AGE_S", "P_LAT", "P_LON", "P_SOG", "P_COG"]
     if not outs:
         empty = pd.DataFrame(columns=cols)
         empty["t"] = pd.to_datetime(empty["t"], utc=True)

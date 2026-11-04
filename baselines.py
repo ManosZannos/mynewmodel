@@ -30,20 +30,25 @@ import pandas as pd
 
 import loader as LD
 
-BASELINES_VERSION = "baselines-v1.3"
+BASELINES_VERSION = "baselines-v1.4"
 STRATA = ["tier_cv", "scene_group", "vessel_cat"]
 
 
 # ---------------------------------------------------------------------------
-def cv_predict(pos, pred=LD.PRED, last=None):
+def cv_predict(pos, pred=LD.PRED, last=None, age_s=None):
     """pos (n, 10, 2) → (n, pred, 2): velocity of the 3 minutes ending at the last available point
-    (last = index per window; None = last obs point), extrapolated to the target minutes."""
+    (last = index per window; None = last obs point), extrapolated to the target minutes.
+    v1.4: with age_s (loader causal mode, origin = last report at t0 - age_s) the extrapolation starts
+    from the last report (the origin) instead of the last available point."""
     n, T, _ = pos.shape
     c = np.full(n, T - 1) if last is None else np.asarray(last)
     rows = np.arange(n)
     p_c = pos[rows, c].astype(np.float64)
     v = (p_c - pos[rows, c - 3].astype(np.float64)) / 3.0
     k = (T - 1 - c)[:, None] + np.arange(1, pred + 1)[None, :]
+    if age_s is not None:
+        p_c = np.zeros_like(p_c)
+        k = np.asarray(age_s, float)[:, None] / 60.0 + np.arange(1, pred + 1)[None, :]
     return p_c[:, None, :] + v[:, None, :] * k[..., None]
 
 
@@ -215,7 +220,8 @@ def main(argv=None):
         res["commit"] = None
 
     if a.model == "cv":
-        pred = cv_predict(ev["pos"], last=ev["meta"]["last_avail"].to_numpy())
+        pred = cv_predict(ev["pos"], last=ev["meta"]["last_avail"].to_numpy(),
+                          age_s=None if a.noncausal else ev["meta"]["p_age_s"].to_numpy())
     else:
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
