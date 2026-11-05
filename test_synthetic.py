@@ -890,6 +890,20 @@ def test_v4_v11_box_strict_on_reports_tolerant_on_grid():
     assert not chk("P_LAT", 1.0)["reports_in_box_with_margin"]["ok"]
 
 
+def test_compare_builds_reports_changes():
+    import compare_builds as CB
+    out, _, _ = run(_mixed_scenario())
+    same = CB.compare_days(out, out.copy())
+    assert same["only_old"] == same["only_new"] == 0 and same["changed"] == {} and same["changed_rows"] == 0
+    new = out.copy()
+    new.loc[3, "lat"] += math.degrees(10.0 / R_EARTH)          # 10 m north
+    new.loc[7, "cog"] = 123.0
+    r = CB.compare_days(out, new)
+    assert r["changed"].keys() == {"lat/lon", "cog"} and r["changed_rows"] == 2
+    assert abs(float(r["disp_m"][0]) - 10.0) < 0.05
+    assert CB.compare_days(out, new.iloc[1:])["only_old"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Έλεγχος της ίδιας της γεννήτριας (δεν χρειάζεται pipeline)
 # ---------------------------------------------------------------------------
