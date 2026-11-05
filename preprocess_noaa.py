@@ -47,7 +47,7 @@ REGIONS = {
 }
 
 DEFAULT_CONFIG = {
-    "config_version": "stageA-v3.5",
+    "config_version": "stageA-v3.6",
     "region": REGIONS["socal"],
     "margin_km": 10.0,              # κουτί + περιθώριο για γείτονες (στόχοι μόνο IN_CORE)
     "grid_s": 60,
@@ -176,11 +176,17 @@ def _ang_diff(a, b):
     return np.abs((np.asarray(a, float) - np.asarray(b, float) + 180.0) % 360.0 - 180.0)
 
 
+def _wrap360(a):
+    """Angle in [0, 360). `a % 360.0` alone returns exactly 360.0 for tiny negative inputs (-1e-15 % 360.0)."""
+    a = np.mod(np.asarray(a, float), 360.0) + 0.0      # + 0.0 turns -0.0 into 0.0
+    return np.where(a >= 360.0, 0.0, a)
+
+
 def _circ_interp(a0, a1, alpha):
     a0r, a1r = np.radians(a0), np.radians(a1)
     x = (1 - alpha) * np.cos(a0r) + alpha * np.cos(a1r)
     y = (1 - alpha) * np.sin(a0r) + alpha * np.sin(a1r)
-    return np.degrees(np.arctan2(y, x)) % 360.0
+    return _wrap360(np.degrees(np.arctan2(y, x)))
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +293,7 @@ def despike_vessel(lat, lon, t, sog, cog, cap, cfg):
             hy = h10 * dt_ac * vya + h01 * dy_ac + h11 * dt_ac * vyc
             px, py = np.where(hok, hx, px), np.where(hok, hy, py)
         dev = np.hypot(dx_ab - px, dy_ab - py)
-        bearing = np.degrees(np.arctan2(dx_ac, dy_ac)) % 360.0
+        bearing = _wrap360(np.degrees(np.arctan2(dx_ac, dy_ac)))
         n_s = (~np.isnan(sg[a])).astype(float) + (~np.isnan(sg[c])).astype(float)
         sum_s = np.nan_to_num(sg[a]) + np.nan_to_num(sg[c])
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -352,8 +358,38 @@ def segment_vessel(lat, lon, t, sog, cap, cfg):
 # ---------------------------------------------------------------------------
 # A8–A11: resampling ενός segment
 # ---------------------------------------------------------------------------
-def resample_segment(t, lat, lon, sog, cog, hdg, cfg):
+def _hermite_guard(g, l, exact, use, lin_xy, her_xy, sog_pt, lat0, lon0, cap, cfg):
+    """v3.6: where the kinematic Hermite makes a grid step above the A6 threshold (a reported SOG/COG that does not
+    match the chord, e.g. a timestamp error), use linear interpolation instead, for every report interval the step
+    touches. Linear steps never exceed the chord speed, which A6/A7 already bounded, so the loop ends with no step
+    above the threshold. The threshold is the A6 one from the SOG of the reports bounding the two grid points
+    (`sog_pt`: max SOG of the left and right report of each grid point). No new parameter, no row changes."""
+    dc = cfg["despike"]
+    n = len(g)
+    i = np.arange(n - 1)
+    run = np.diff(g) == cfg["grid_s"]
+    thr = _pair_threshold(sog_pt[:-1], sog_pt[1:], cap, dc)
+    lin_iv = np.zeros(int(l.max()) + 2, bool)          # report intervals (indexed by left report) forced linear
+    while True:
+        h = use & ~lin_iv[l]
+        gx = np.where(h, her_xy[0], lin_xy[0])
+        gy = np.where(h, her_xy[1], lin_xy[1])
+        if not h.any():
+            return gx, gy
+        la, lo = _from_local(gx, gy, lat0, lon0)
+        v, *_ = _implied_kn(la, lo, g, i, i + 1, dc["pos_noise_m"])
+        bad = np.flatnonzero(run & (v > thr))
+        pts = np.concatenate([bad, bad + 1])
+        pts = pts[~exact[pts]]                            # exact points sit on a report, no interval to blame
+        iv = l[pts]
+        if len(iv) == 0 or lin_iv[iv].all():
+            return gx, gy
+        lin_iv[iv] = True
+
+
+def resample_segment(t, lat, lon, sog, cog, hdg, cfg, cap=None):
     G = cfg["grid_s"]
+    cap = cfg["speed_caps_kn"]["global"] if cap is None else cap
     t0, t1 = int(t[0]), int(t[-1])
     g = np.arange(-(-t0 // G) * G, (t1 // G) * G + 1, G, dtype=np.int64)
     if len(g) == 0:
@@ -387,8 +423,8 @@ def resample_segment(t, lat, lon, sog, cog, hdg, cfg):
         h00, h10, h01, h11 = 2 * a3 - 3 * a2 + 1, a3 - 2 * a2 + alpha, -2 * a3 + 3 * a2, a3 - a2
         hx = h00 * x[l] + h10 * h * vxr[l] + h01 * x[r] + h11 * h * vxr[r]
         hy = h00 * y[l] + h10 * h * vyr[l] + h01 * y[r] + h11 * h * vyr[r]
-        gx = np.where(use, hx, gx)
-        gy = np.where(use, hy, gy)
+        gx, gy = _hermite_guard(g, l, exact, use, (gx, gy), (hx, hy), np.fmax(sog[l], sog[r]),
+                                lat0, lon0, cap, cfg)
 
     # SOG (A9)
     sa, sb = sog[l], sog[r]
@@ -425,6 +461,9 @@ def resample_segment(t, lat, lon, sog, cog, hdg, cfg):
     out["P_AGE_S"] = (g - t[p]).astype(np.int32)
     out["P_LAT"], out["P_LON"], out["P_SOG"] = lat[p], lon[p], sog[p]
     out["P_COG"] = np.where(cvalid[p], cog[p], np.nan)
+    # v3.6: SOG of the first report at or after the grid point (== P_SOG when exact). NOT causal (R6, not a model
+    # input); with P_SOG it gives V4 the report SOG that the A6 threshold and the Hermite guard use.
+    out["N_SOG"] = sog[r]
     # ταχύτητα από θέσεις, μέσα σε συνεχόμενα λεπτά
     run_id = np.concatenate([[0], np.cumsum(np.diff(g) != G)])
     vx = np.full(len(g), np.nan)
@@ -462,7 +501,7 @@ def resample_segment(t, lat, lon, sog, cog, hdg, cfg):
         qc_sog = ((gsog >= cfg["qc_sog_min_kn"]) & ~np.isnan(vpos_kn) &
                   (np.abs(gsog - vpos_kn) / gsog > cfg["qc_sog_rel"]))
     out["QC_SOG"] = qc_sog.astype(np.int8)
-    bearing_pos = np.degrees(np.arctan2(vx, vy)) % 360.0
+    bearing_pos = _wrap360(np.degrees(np.arctan2(vx, vy)))
     qc_cog = cog_valid & (vpos_kn >= cvm) & (_ang_diff(gcog, bearing_pos) > cfg["qc_cog_max_deg"])
     out["QC_COG"] = qc_cog.astype(np.int8)
     out["GAP_IMP"] = (span > cfg["gap_imp_flag_s"]).astype(np.int8)
@@ -547,7 +586,7 @@ def run_stage_a(raw: pd.DataFrame, cfg: dict):
                 funnel["dropped"]["short_segment"] += int(m.sum())
                 continue
             funnel["kept_reports"] += int(m.sum())
-            o = resample_segment(ts, lat[m], lon[m], sog[m], cog[m], hdg[m], cfg)
+            o = resample_segment(ts, lat[m], lon[m], sog[m], cog[m], hdg[m], cfg, cap)
             if o is None:
                 continue
             # υποχρεωτική τρύπα ≥ 1 λεπτού μετά από τομή
@@ -564,7 +603,7 @@ def run_stage_a(raw: pd.DataFrame, cfg: dict):
     cols = ["mmsi", "t", "seg_id", "lat", "lon", "sog", "cog", "COG_VALID", "heading", "HDG_SRC",
             "vessel_cat", "transceiver", "GAP_IMP", "INTERP_SPAN", "STATIONARY", "QC_SOG", "QC_COG",
             "IN_CORE", "MMSI_QC", "vx_sog", "vy_sog", "vx_pos", "vy_pos", "R_AFTER_S",
-            "P_AGE_S", "P_LAT", "P_LON", "P_SOG", "P_COG"]
+            "P_AGE_S", "P_LAT", "P_LON", "P_SOG", "P_COG", "N_SOG"]
     if not outs:
         empty = pd.DataFrame(columns=cols)
         empty["t"] = pd.to_datetime(empty["t"], utc=True)

@@ -19,10 +19,11 @@ import pandas as pd
 
 import preprocess_noaa as PA
 
-V4_VERSION = "v4-v1.0"
+V4_VERSION = "v4-v1.1"
+BOX_TOL_M = 50.0     # grid points may leave the box+margin by this much: Hermite can overshoot between two reports
 COLS = ["mmsi", "t", "seg_id", "lat", "lon", "sog", "cog", "COG_VALID", "heading", "HDG_SRC", "GAP_IMP",
         "INTERP_SPAN", "STATIONARY", "QC_SOG", "QC_COG", "IN_CORE", "MMSI_QC", "R_AFTER_S",
-        "P_AGE_S", "P_LAT", "P_LON", "P_SOG", "P_COG"]
+        "P_AGE_S", "P_LAT", "P_LON", "P_SOG", "P_COG", "N_SOG"]
 FLAGS = ["COG_VALID", "GAP_IMP", "STATIONARY", "QC_SOG", "QC_COG", "IN_CORE", "MMSI_QC"]
 
 
@@ -40,7 +41,11 @@ def check(df: pd.DataFrame, cfg: dict) -> dict:
     put("no_nan_key_position", df[["mmsi", "t", "seg_id", "lat", "lon"]].isna().any(axis=1).sum())
     put("unique_mmsi_t", df.duplicated(["mmsi", "t"]).sum())
     put("t_on_grid", (tm % G != 0).sum())
-    put("in_box_with_margin", (~PA.box_with_margin(df, cfg["region"], cfg["margin_km"])).sum())
+    # A2 applies to reports: strict on the last report (P_LAT/P_LON); grid points only within BOX_TOL_M
+    rep_pos = pd.DataFrame({"lat": df["P_LAT"], "lon": df["P_LON"]})
+    put("reports_in_box_with_margin", (~PA.box_with_margin(rep_pos, cfg["region"], cfg["margin_km"])).sum())
+    put("grid_in_box_margin_tol50m",
+        (~PA.box_with_margin(df, cfg["region"], cfg["margin_km"] + BOX_TOL_M / 1000.0)).sum())
 
     # ranges
     sog, cog, hdg = (df[c].to_numpy(float) for c in ("sog", "cog", "heading"))
@@ -72,7 +77,9 @@ def check(df: pd.DataFrame, cfg: dict) -> dict:
     with np.errstate(divide="ignore", invalid="ignore"):
         v = d / dt / PA.KN
     step = same_s & (dt == G)
-    thr = PA._pair_threshold(sog[:-1], sog[1:], cfg["speed_caps_kn"]["global"], cfg["despike"])
+    # A6 threshold from the SOG of the reports bounding the two grid points (not from the interpolated grid SOG)
+    s_rep = np.fmax(df["P_SOG"].to_numpy(float), df["N_SOG"].to_numpy(float))
+    thr = PA._pair_threshold(s_rep[:-1], s_rep[1:], cfg["speed_caps_kn"]["global"], cfg["despike"])
     put("no_step_above_A6_threshold", (step & (v > thr)).sum(), steps=int(step.sum()))
 
     # implied speed / SOG within ±10% on ≥ 90% of moving steps (SOG ≥ 3 kn at both ends)

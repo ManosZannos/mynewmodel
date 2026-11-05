@@ -775,6 +775,122 @@ def test_v4_invariants():
 
 
 # ---------------------------------------------------------------------------
+# stageA-v3.6: γωνίες στο [0, 360), φρουρός Hermite, V4 v1.1
+# ---------------------------------------------------------------------------
+def test_v36_version():
+    assert cfg_default()["config_version"] == "stageA-v3.6"
+
+
+def test_v36_circ_interp_below_360():
+    # arctan2 returns a tiny negative angle here and `% 360.0` rounds it up to exactly 360.0
+    p = pipeline()
+    for a, b in [(359.9, 0.1), (359.0, 1.0), (359.8, 0.2), (360.0, 360.0)]:
+        r = float(p._circ_interp(a, b, 0.5))
+        assert 0.0 <= r < 360.0, f"_circ_interp({a}, {b}, 0.5) = {r!r}"
+
+
+def test_v36_angles_in_range_end_to_end():
+    # COG alternates 359.9° / 0.1° (heading 359° / 1°) on a northbound track: every grid point is a midpoint
+    tr = straight(900, kn=10, course=0.0)
+    raw = make_reports(tr, report_times(900, 60, 60, phase=30))
+    k = np.arange(len(raw)) % 2
+    raw["cog"] = np.where(k == 0, 359.9, 0.1)
+    raw["heading"] = np.where(k == 0, 359.0, 1.0)
+    out, _, _ = run(raw)
+    assert len(out) > 5
+    for c in ("cog", "heading"):
+        v = out[c].dropna()
+        assert len(v) > 5 and ((v >= 0) & (v < 360)).all(), f"{c}: max {v.max()!r}"
+    assert ang_diff(out["cog"].dropna(), 0).max() < 1.0
+
+
+def _random_segment(rng, n_rep=40):
+    """Reports of one vessel (chord speed 14–22 kn, always below the 27 kn floor of the A6 threshold) whose SOG is
+    mostly too low and whose COG is very noisy, so that the Hermite tangents disagree with the chords."""
+    dt = rng.choice([60, 70, 80, 120, 170], n_rep, p=[0.3, 0.3, 0.2, 0.1, 0.1])
+    t = 1000 + np.concatenate([[0], np.cumsum(dt[1:])]).astype(np.int64)
+    course = np.cumsum(rng.normal(0, 15, n_rep))
+    speed = rng.uniform(14, 22, n_rep)
+    x = np.concatenate([[0], np.cumsum(speed[:-1] * KN * np.diff(t) * np.sin(np.radians(course[:-1])))])
+    y = np.concatenate([[0], np.cumsum(speed[:-1] * KN * np.diff(t) * np.cos(np.radians(course[:-1])))])
+    lat, lon = xy_to_latlon(x, y)
+    sog = np.round(np.clip(speed * rng.uniform(0.3, 1.0, n_rep), 0, 40), 1)
+    cog = np.round((course + rng.normal(0, 60, n_rep)) % 360, 1)
+    return t, np.asarray(lat), np.asarray(lon), sog, cog, np.full(n_rep, np.nan)
+
+
+def _step_violations(p, cfg, t, sog, out):
+    """Grid steps above the A6 threshold computed from the SOG of the reports bounding the two grid points."""
+    tg = out["tg"].to_numpy(np.int64)
+    l, r = np.searchsorted(t, tg, "right") - 1, np.searchsorted(t, tg, "left")
+    s = np.fmax(sog[l], sog[r])
+    i = np.arange(len(tg) - 1)
+    v, *_ = p._implied_kn(out["lat"].to_numpy(float), out["lon"].to_numpy(float), tg, i, i + 1, 0.0)
+    thr = p._pair_threshold(s[:-1], s[1:], cfg["speed_caps_kn"]["global"], cfg["despike"])
+    return int(((np.diff(tg) == cfg["grid_s"]) & (v > thr + 1e-9)).sum())
+
+
+def test_v36_hermite_guard_no_step_above_threshold():
+    p, cfg = pipeline(), cfg_default()
+    n_bad, n_seg = 0, 0
+    for seed in range(60):
+        t, lat, lon, sog, cog, hdg = _random_segment(np.random.default_rng(seed))
+        out = p.resample_segment(t, lat, lon, sog, cog, hdg, cfg)
+        if out is None:
+            continue
+        n_seg += 1
+        n_bad += _step_violations(p, cfg, t, sog, out)
+    assert n_seg >= 50
+    assert n_bad == 0, f"{n_bad} grid steps above the A6 threshold"
+
+
+def test_v36_hermite_overshoot_falls_back_to_linear():
+    # Chord 24 kn north, but the reports claim 10 kn east: Hermite runs at up to 1.5 x the chord speed between
+    # the reports (about 31 kn per grid step > the 27 kn threshold), so every interval must fall back to linear.
+    tr = straight(1800, kn=24.0, course=0.0)
+    raw = make_reports(tr, report_times(1800, 180, 180, phase=30))
+    raw["sog"], raw["cog"] = 10.0, 90.0
+    herm, _, _ = run(raw)
+    lin, _, _ = run(raw, interp_method="linear")
+    assert len(herm) == len(lin) > 10
+    dx, dy = latlon_to_xy(herm["lat"].to_numpy(), herm["lon"].to_numpy())
+    lx, ly = latlon_to_xy(lin["lat"].to_numpy(), lin["lon"].to_numpy())
+    assert np.hypot(dx - lx, dy - ly).max() < 1.0, "Hermite overshoot was not replaced by linear"
+
+
+def test_v4_v11_step_threshold_from_report_sog():
+    # grid SOG is low (10 kn) but the bounding reports say 35 kn: the A6 threshold is 52.5 kn, so a 40 kn step passes
+    import v4_invariants as V4
+    out, _, cfg = run(_mixed_scenario())
+    same = (out["mmsi"].to_numpy()[1:] == out["mmsi"].to_numpy()[:-1]) & \
+           (out["seg_id"].to_numpy()[1:] == out["seg_id"].to_numpy()[:-1])
+    i = int(np.flatnonzero(same)[10])
+    shift = np.degrees(40 * KN * 60 / R_EARTH)                 # one 40 kn step north
+    m = (out["mmsi"] == out["mmsi"].iloc[i]) & (out.index > i)
+    for sog_ref, ok in [(35.0, True), (10.0, False)]:
+        df = out.copy()
+        df.loc[m, "lat"] += shift
+        df.loc[i:i + 1, "sog"] = 10.0
+        df.loc[i:i + 1, "P_SOG"] = sog_ref
+        df["N_SOG"] = df["P_SOG"]
+        assert V4.check(df, cfg)["no_step_above_A6_threshold"]["ok"] is ok, sog_ref
+
+
+def test_v4_v11_box_strict_on_reports_tolerant_on_grid():
+    import v4_invariants as V4
+    out, _, cfg = run(_mixed_scenario())
+    edge = cfg["region"]["lat_max"] + math.degrees(cfg["margin_km"] * 1000 / R_EARTH)
+    def chk(col, metres):
+        df = out.copy()
+        df.loc[5, col] = edge + math.degrees(metres / R_EARTH)
+        return V4.check(df, cfg)
+    r = chk("lat", 20.0)           # Hermite may overshoot the margin between two inside reports
+    assert r["grid_in_box_margin_tol50m"]["ok"] and r["reports_in_box_with_margin"]["ok"]
+    assert not chk("lat", 100.0)["grid_in_box_margin_tol50m"]["ok"]
+    assert not chk("P_LAT", 1.0)["reports_in_box_with_margin"]["ok"]
+
+
+# ---------------------------------------------------------------------------
 # Έλεγχος της ίδιας της γεννήτριας (δεν χρειάζεται pipeline)
 # ---------------------------------------------------------------------------
 def selfcheck():
