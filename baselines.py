@@ -30,7 +30,7 @@ import pandas as pd
 
 import loader as LD
 
-BASELINES_VERSION = "baselines-v1.4"
+BASELINES_VERSION = "baselines-v1.5"
 STRATA = ["tier_cv", "scene_group", "vessel_cat"]
 
 
@@ -96,6 +96,13 @@ def print_metrics(tag, m):
 def shore_dir_of(build):
     c = sorted(glob.glob(f"{build}/stageC/shore_*"))
     return c[-1] if c else None
+
+
+def device_info(torch):
+    """v1.5: device and GPU name for the results (the CPU fallback used to be silent)."""
+    if torch.cuda.is_available():
+        return {"device": "cuda", "gpu": torch.cuda.get_device_name(0)}
+    return {"device": "cpu", "gpu": None}
 
 
 def train_rows(train_build, eval_build, x_eval):
@@ -224,7 +231,9 @@ def main(argv=None):
                           age_s=None if a.noncausal else ev["meta"]["p_age_s"].to_numpy())
     else:
         import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        res["device"] = device_info(torch)
+        device = res["device"]["device"]
+        print(f"  συσκευή: {device}" + (f" ({res['device']['gpu']})" if res["device"]["gpu"] else " — ΧΩΡΙΣ GPU"))
         res["versions"]["torch"] = torch.__version__
         if a.load_model:
             model = make_lstm(ev["obs"].shape[-1], LD.PRED).to(device)

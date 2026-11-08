@@ -295,8 +295,8 @@
 | `stageC_shore.py` | Στάδιο Γ (ακτογραμμή) | stageC-v1.3 | `test_stageC.py`: 16 |
 | `v5c_visual.py` | V5-Γ (hotspots ON_LAND, ανοχή τ) | — | — |
 | `stageB_manifests.py` | Στάδιο Β (παράθυρα, manifests, QC ακτής) | stageB-v1.4 | `test_stageB.py`: 15 |
-| `loader.py` | Παράθυρα → πίνακες για μοντέλα | loader-v1.5 | `test_loader.py`: 17 |
-| `baselines.py` | CV, LSTM, μετρικές ανά stratum | baselines-v1.4 | (μέσα στο `test_loader.py`) |
+| `loader.py` | Παράθυρα → πίνακες για μοντέλα | loader-v1.5 | `test_loader.py`: 18 |
+| `baselines.py` | CV, LSTM, μετρικές ανά stratum | baselines-v1.5 | (μέσα στο `test_loader.py`) |
 | `compare_runs.py` | Ζευγαρωτή σύγκριση ανά seed ± ΤΣ | — | (μέσα στο `test_loader.py`) |
 
 **Αλλαγές εκδόσεων μετά την v3.3 / v1.2:**
@@ -307,7 +307,7 @@
 - stageB-v1.3: `dropped_gap` στο time split, `seen_share` (πλοία / παράθυρα / παράθυρα κύριας), `check_funnel` ανά manifest που σταματά με σφάλμα αν το funnel δεν κλείνει.
 - stageB-v1.4: QC ακτής με `--shore_dir` (§4.2).
 - stageC-v1.1: το κλειδί της cache περιλαμβάνει τα αρχεία OSM. v1.2: κουτί σε ακέραιες μοίρες. v1.3: εμπόδια στο `D_LAND_COG`.
-- loader-v1.5: 11ο βήμα παρατήρησης = η τελευταία πραγματική αναφορά ≤ t0 (`P_*`), με αρχή συντεταγμένων τη θέση της· `dt_min` σε λεπτά πριν το t0. baselines-v1.4: το CV ξεκινά από την τελευταία πραγματική αναφορά.
+- loader-v1.5: 11ο βήμα παρατήρησης = η τελευταία πραγματική αναφορά ≤ t0 (`P_*`), με αρχή συντεταγμένων τη θέση της· `dt_min` σε λεπτά πριν το t0. baselines-v1.4: το CV ξεκινά από την τελευταία πραγματική αναφορά. baselines-v1.5: η συσκευή (`device`, όνομα GPU) γράφεται στο JSON και τυπώνεται, γιατί η μετάβαση σε CPU όταν δεν βρίσκεται GPU ήταν σιωπηλή (`test_device_recorded`).
 - loader-v1.1–v1.4: `pred_gap_frac`, `nonoverlap` (ανά segment), `resample_obs`, αιτιατή μάσκα παρατήρησης με κανάλι `available`, COG μόνο όπου υπάρχει SOG.
 - baselines-v1.1–v1.3: μία φόρτωση build, strata `nonoverlap` και παρεμβολής, `--obs_step`, αιτιατό CV, `--noncausal` μόνο για μέτρηση.
 

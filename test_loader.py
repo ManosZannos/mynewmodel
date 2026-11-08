@@ -266,6 +266,15 @@ def test_cog_ignored_when_sog_missing():
     assert obs[0, k - 1, i_cv] == 1
 
 
+def test_device_recorded():
+    """baselines v1.5: the device (and GPU name) goes into the results; the CPU fallback was silent."""
+    from types import SimpleNamespace as NS
+    gpu = NS(cuda=NS(is_available=lambda: True, get_device_name=lambda i: "RTX 4090"))
+    cpu = NS(cuda=NS(is_available=lambda: False))
+    assert BL.device_info(gpu) == {"device": "cuda", "gpu": "RTX 4090"}
+    assert BL.device_info(cpu) == {"device": "cpu", "gpu": None}
+
+
 if __name__ == "__main__":
     k = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and k in n]
