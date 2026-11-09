@@ -295,8 +295,8 @@
 | `stageC_shore.py` | Στάδιο Γ (ακτογραμμή) | stageC-v1.3 | `test_stageC.py`: 16 |
 | `v5c_visual.py` | V5-Γ (hotspots ON_LAND, ανοχή τ) | — | — |
 | `stageB_manifests.py` | Στάδιο Β (παράθυρα, manifests, QC ακτής) | stageB-v1.4 | `test_stageB.py`: 15 |
-| `loader.py` | Παράθυρα → πίνακες για μοντέλα | loader-v1.5 | `test_loader.py`: 19 |
-| `baselines.py` | CV, LSTM, μετρικές ανά stratum | baselines-v1.6 | (μέσα στο `test_loader.py`) |
+| `loader.py` | Παράθυρα → πίνακες για μοντέλα | loader-v1.5 | `test_loader.py`: 22 |
+| `baselines.py` | CV, LSTM, μετρικές ανά stratum | baselines-v1.7 | (μέσα στο `test_loader.py`) |
 | `compare_runs.py` | Ζευγαρωτή σύγκριση ανά seed ± ΤΣ | — | (μέσα στο `test_loader.py`) |
 
 **Αλλαγές εκδόσεων μετά την v3.3 / v1.2:**
@@ -307,7 +307,7 @@
 - stageB-v1.3: `dropped_gap` στο time split, `seen_share` (πλοία / παράθυρα / παράθυρα κύριας), `check_funnel` ανά manifest που σταματά με σφάλμα αν το funnel δεν κλείνει.
 - stageB-v1.4: QC ακτής με `--shore_dir` (§4.2).
 - stageC-v1.1: το κλειδί της cache περιλαμβάνει τα αρχεία OSM. v1.2: κουτί σε ακέραιες μοίρες. v1.3: εμπόδια στο `D_LAND_COG`.
-- loader-v1.5: 11ο βήμα παρατήρησης = η τελευταία πραγματική αναφορά ≤ t0 (`P_*`), με αρχή συντεταγμένων τη θέση της· `dt_min` σε λεπτά πριν το t0. baselines-v1.4: το CV ξεκινά από την τελευταία πραγματική αναφορά. baselines-v1.5: η συσκευή (`device`, όνομα GPU) γράφεται στο JSON και τυπώνεται, γιατί η μετάβαση σε CPU όταν δεν βρίσκεται GPU ήταν σιωπηλή (`test_device_recorded`). baselines-v1.6: `--train_nonoverlap`, εκπαίδευση μόνο στα παράθυρα `nonoverlap` του train (stride 20) με αξιολόγηση σε όλα (`test_train_subset_nonoverlap`).
+- loader-v1.5: 11ο βήμα παρατήρησης = η τελευταία πραγματική αναφορά ≤ t0 (`P_*`), με αρχή συντεταγμένων τη θέση της· `dt_min` σε λεπτά πριν το t0. baselines-v1.4: το CV ξεκινά από την τελευταία πραγματική αναφορά. baselines-v1.5: η συσκευή (`device`, όνομα GPU) γράφεται στο JSON και τυπώνεται, γιατί η μετάβαση σε CPU όταν δεν βρίσκεται GPU ήταν σιωπηλή (`test_device_recorded`). baselines-v1.6: `--train_nonoverlap`, εκπαίδευση μόνο στα παράθυρα `nonoverlap` του train (stride 20) με αξιολόγηση σε όλα (`test_train_subset_nonoverlap`). baselines-v1.7: πρωτόκολλο σύγκλισης (§12), καμπύλη ανά epoch, καλύτερο epoch και λόγος διακοπής στο JSON (`test_lstm_stops_on_patience`, `test_lstm_max_epochs_flagged`, `test_lstm_learns_constant_velocity`).
 - loader-v1.1–v1.4: `pred_gap_frac`, `nonoverlap` (ανά segment), `resample_obs`, αιτιατή μάσκα παρατήρησης με κανάλι `available`, COG μόνο όπου υπάρχει SOG.
 - baselines-v1.1–v1.3: μία φόρτωση build, strata `nonoverlap` και παρεμβολής, `--obs_step`, αιτιατό CV, `--noncausal` μόνο για μέτρηση.
 
@@ -358,6 +358,8 @@
 ## 12. Αποτελέσματα δοκιμών
 
 Όλα τα αποτελέσματα μοντέλων είναι στη Southern California, vessel-val, κύρια μετρική (n = 38,654), 3 seeds, εκτός αν σημειώνεται αλλιώς. Τα test sets δεν έχουν αξιολογηθεί.
+
+**Πρωτόκολλο εκπαίδευσης (baselines-v1.7, ισχύει για κάθε μοντέλο που συγκρίνεται, και για το CPA-GRN):** έως 200 epochs· early stopping με patience 8 στο ADE του συνόλου early stopping (10% των πλοίων του train, hash MMSI), βελτίωση > 0.1 m· `ReduceLROnPlateau` ×0.5 με patience 3· επιστροφή στο καλύτερο epoch. Run που σταματά στο όριο epochs (`stop = max_epochs`) δεν έχει συγκλίνει και δεν χρησιμοποιείται για απόφαση. Οι τιμές ορίστηκαν πριν από οποιοδήποτε αποτέλεσμα με το πρωτόκολλο και δεν ρυθμίζονται ανά μοντέλο. Τα αποτελέσματα LSTM των §12.3–12.8 είναι με όριο 20 epochs (patience 3, `ReduceLROnPlateau` patience 1)· στους §12.7–12.8 όλα τα runs έφτασαν το όριο με lr ακόμα 1e-3.
 
 ### 12.1 Διαστήματα αναφορών NOAA 2025
 

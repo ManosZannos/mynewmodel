@@ -286,6 +286,44 @@ def test_train_subset_nonoverlap():
     assert BL.train_subset(tr) is tr
 
 
+# --- baselines v1.7: convergence protocol (needs torch) ---
+def _lstm_data(n, seed):
+    """obs (n, 11, F) random; fut = constant velocity from obs[:, -1, :2] (km/min) -> learnable target (m)."""
+    rng = np.random.default_rng(seed)
+    obs = rng.normal(size=(n, LD.OBS + 1, len(LD.FEATURES))).astype(np.float32) * 0.3
+    v = obs[:, -1, :2].astype(np.float64)
+    fut = v[:, None, :] * np.arange(1, LD.PRED + 1)[None, :, None] * LD.SCALES["pos_m"]
+    return {"obs": obs, "fut": fut.astype(np.float32)}
+
+
+def _args(**kw):
+    from types import SimpleNamespace as NS
+    return NS(**{"seed": 0, "lr": 3e-3, "epochs": 200, "batch": 64, "patience": 8, "lr_patience": 3, **kw})
+
+
+def test_lstm_stops_on_patience():
+    """v1.6: the stop reason was not recorded (all runs hit max epochs unnoticed)."""
+    tr, es = _lstm_data(128, 0), _lstm_data(64, 1)
+    _, info = BL.train_lstm(tr, es, _args(lr=0.0, patience=2), "cpu")    # lr 0: no improvement after epoch 1
+    assert info["stop"] == "patience" and info["epochs_run"] == 3 and info["best_epoch"] == 1, info
+    assert [c["epoch"] for c in info["curve"]] == [1, 2, 3] and {"train_ADE", "es_ADE", "lr"} <= set(info["curve"][0])
+
+
+def test_lstm_max_epochs_flagged():
+    tr, es = _lstm_data(128, 0), _lstm_data(64, 1)
+    _, info = BL.train_lstm(tr, es, _args(epochs=2, patience=50), "cpu")
+    assert info["stop"] == "max_epochs" and info["epochs_run"] == 2 and len(info["curve"]) == 2, info
+
+
+def test_lstm_learns_constant_velocity():
+    """Sanity: the LSTM must learn a constant-velocity target far below the zero predictor."""
+    tr, es = _lstm_data(1024, 0), _lstm_data(256, 1)
+    model, info = BL.train_lstm(tr, es, _args(), "cpu")
+    zero = BL.errors(np.zeros_like(es["fut"]), es["fut"])[0].mean()
+    assert info["stop"] == "patience", info["stop"]
+    assert info["best_early_stop_ADE"] < 0.1 * zero, (info["best_early_stop_ADE"], zero)
+
+
 if __name__ == "__main__":
     k = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and k in n]

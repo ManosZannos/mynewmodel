@@ -30,7 +30,7 @@ import pandas as pd
 
 import loader as LD
 
-BASELINES_VERSION = "baselines-v1.6"
+BASELINES_VERSION = "baselines-v1.7"
 STRATA = ["tier_cv", "scene_group", "vessel_cat"]
 
 
@@ -159,10 +159,10 @@ def train_lstm(tr, es, a, device):
     np.random.seed(a.seed)
     model = make_lstm(tr["obs"].shape[-1], LD.PRED).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=1)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=a.lr_patience)
     X = torch.from_numpy(tr["obs"])
     Y = torch.from_numpy(tr["fut"] / LD.SCALES["pos_m"])
-    best, best_state, bad = np.inf, None, 0
+    best, best_state, bad, best_ep, curve, stop = np.inf, None, 0, 0, [], "max_epochs"
     g = torch.Generator().manual_seed(a.seed)
     for ep in range(1, a.epochs + 1):
         model.train()
@@ -178,17 +178,25 @@ def train_lstm(tr, es, a, device):
             opt.step()
             tot += float(loss) * len(i)
         ade_es = errors(lstm_predict(model, es["obs"], device), es["fut"])[0].mean()
+        lr = opt.param_groups[0]["lr"]                  # lr used in this epoch (before the scheduler step)
         sched.step(ade_es)
-        print(f"    epoch {ep:>2}: train ADE {tot / len(X) * LD.SCALES['pos_m']:.1f} m | early-stop ADE {ade_es:.1f} m | "
-              f"lr {opt.param_groups[0]['lr']:.1e} | {time.time() - t0:.0f} s")
+        tr_ade = tot / len(X) * LD.SCALES["pos_m"]
+        curve.append({"epoch": ep, "train_ADE": round(tr_ade, 2), "es_ADE": round(float(ade_es), 2), "lr": lr})
+        print(f"    epoch {ep:>3}: train ADE {tr_ade:.1f} m | early-stop ADE {ade_es:.1f} m | "
+              f"lr {lr:.1e} | {time.time() - t0:.0f} s")
         if ade_es < best - 0.1:
-            best, best_state, bad = ade_es, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}, 0
+            best, best_ep, bad = ade_es, ep, 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         else:
             bad += 1
             if bad >= a.patience:
+                stop = "patience"
                 break
     model.load_state_dict(best_state)
-    return model, {"best_early_stop_ADE": round(float(best), 2), "epochs_run": ep}
+    if stop == "max_epochs":
+        print(f"  ΠΡΟΣΟΧΗ: δεν συνέκλινε (όριο {a.epochs} epochs) — το run δεν χρησιμοποιείται για απόφαση")
+    return model, {"best_early_stop_ADE": round(float(best), 2), "epochs_run": ep, "best_epoch": best_ep,
+                   "stop": stop, "curve": curve}
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +216,10 @@ def main(argv=None):
                     help="παλιά (μη αιτιατή) παρατήρηση — μόνο για να μετρηθεί η επίδραση της παρεμβολής")
     ap.add_argument("--obs_step", type=int, default=60, choices=[20, 60, 120],
                     help="πυκνότητα παρατήρησης (s) για το πείραμα πλέγματος· οι στόχοι μένουν στα 60 s")
-    ap.add_argument("--epochs", type=int, default=20)
-    ap.add_argument("--patience", type=int, default=3)
+    # v1.7: convergence protocol for every compared model (v1.6: 20/3 — all runs hit the epoch limit)
+    ap.add_argument("--epochs", type=int, default=200)
+    ap.add_argument("--patience", type=int, default=8, help="early stopping (epochs χωρίς βελτίωση > 0.1 m)")
+    ap.add_argument("--lr_patience", type=int, default=3, help="ReduceLROnPlateau (×0.5)")
     ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=0)
