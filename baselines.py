@@ -30,7 +30,7 @@ import pandas as pd
 
 import loader as LD
 
-BASELINES_VERSION = "baselines-v1.5"
+BASELINES_VERSION = "baselines-v1.6"
 STRATA = ["tier_cv", "scene_group", "vessel_cat"]
 
 
@@ -103,6 +103,17 @@ def device_info(torch):
     if torch.cuda.is_available():
         return {"device": "cuda", "gpu": torch.cuda.get_device_name(0)}
     return {"device": "cpu", "gpu": None}
+
+
+def train_subset(tr, capped=False, nonoverlap=False):
+    """Train windows only with capped == 1 (V6) and/or nonoverlap == 1 (stride 20, v1.6)."""
+    keep = np.ones(len(tr["meta"]), bool)
+    for col, on in (("capped", capped), ("nonoverlap", nonoverlap)):
+        if on:
+            keep &= tr["meta"][col].to_numpy() == 1
+    if keep.all():
+        return tr
+    return {**tr, "obs": tr["obs"][keep], "fut": tr["fut"][keep], "meta": tr["meta"][keep].reset_index(drop=True)}
 
 
 def train_rows(train_build, eval_build, x_eval):
@@ -190,6 +201,8 @@ def main(argv=None):
     ap.add_argument("--eval_manifest", default=None, help="προεπιλογή: το manifest")
     ap.add_argument("--eval_split", default="val")
     ap.add_argument("--train_capped", action="store_true", help="εκπαίδευση μόνο σε παράθυρα capped (V6)")
+    ap.add_argument("--train_nonoverlap", action="store_true",
+                    help="εκπαίδευση μόνο σε παράθυρα nonoverlap (stride 20)· η αξιολόγηση μένει σε όλα")
     ap.add_argument("--load_model", default=None)
     ap.add_argument("--noncausal", action="store_true",
                     help="παλιά (μη αιτιατή) παρατήρηση — μόνο για να μετρηθεί η επίδραση της παρεμβολής")
@@ -206,6 +219,7 @@ def main(argv=None):
     eb, em = a.eval_build or a.train_build, a.eval_manifest or a.manifest
     tag = a.tag or f"{a.model}_{Path(a.train_build).name}_{Path(eb).name}_{em}_{a.eval_split}" + \
         (f"_s{a.seed}" if a.model == "lstm" else "") + ("_trcapped" if a.train_capped else "") + \
+        ("_trnonoverlap" if a.train_nonoverlap else "") + \
         (f"_obs{a.obs_step}s" if a.obs_step != 60 else "") + ("_noncausal" if a.noncausal else "")
     if a.obs_step != 60 and not a.noncausal:
         sys.exit("το πείραμα πυκνότητας (--obs_step) ορίζεται μόνο με --noncausal")
@@ -243,9 +257,10 @@ def main(argv=None):
             x_tr = train_rows(a.train_build, eb, x_ev)
             tr = LD.load_split(a.train_build, a.manifest, "train", x=x_tr, causal=not a.noncausal)
             tr["obs"] = LD.resample_obs(tr["obs"], a.obs_step)
-            if a.train_capped:
-                keep = tr["meta"]["capped"].to_numpy() == 1
-                tr = {**tr, "obs": tr["obs"][keep], "fut": tr["fut"][keep], "meta": tr["meta"][keep].reset_index(drop=True)}
+            n_all = len(tr["obs"])
+            tr = train_subset(tr, a.train_capped, a.train_nonoverlap)
+            if a.train_nonoverlap:
+                print(f"  stride 20 (nonoverlap): {len(tr['obs']):,} από {n_all:,} παράθυρα train")
             esm = _hash01(tr["meta"]["mmsi"].to_numpy()) < 0.1
             es = {"obs": tr["obs"][esm], "fut": tr["fut"][esm]}
             tr = {"obs": tr["obs"][~esm], "fut": tr["fut"][~esm]}

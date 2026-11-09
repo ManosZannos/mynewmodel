@@ -275,6 +275,17 @@ def test_device_recorded():
     assert BL.device_info(cpu) == {"device": "cpu", "gpu": None}
 
 
+def test_train_subset_nonoverlap():
+    """baselines v1.6: training on stride 20 (nonoverlap windows of train) was not possible."""
+    meta = pd.DataFrame({"capped": [1, 1, 0, 1], "nonoverlap": [1, 0, 1, 0], "mmsi": [1, 1, 2, 2]})
+    tr = {"obs": np.arange(4)[:, None], "fut": np.arange(4)[:, None] * 10, "meta": meta}
+    s = BL.train_subset(tr, nonoverlap=True)
+    assert s["obs"][:, 0].tolist() == [0, 2] and s["fut"][:, 0].tolist() == [0, 20]
+    assert s["meta"]["mmsi"].tolist() == [1, 2] and s["meta"].index.tolist() == [0, 1]
+    assert BL.train_subset(tr, capped=True, nonoverlap=True)["obs"][:, 0].tolist() == [0]
+    assert BL.train_subset(tr) is tr
+
+
 if __name__ == "__main__":
     k = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and k in n]
