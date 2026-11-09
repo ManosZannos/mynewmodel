@@ -315,6 +315,19 @@ def test_lstm_max_epochs_flagged():
     assert info["stop"] == "max_epochs" and info["epochs_run"] == 2 and len(info["curve"]) == 2, info
 
 
+def test_lstm_lr_uses_early_stop_threshold():
+    """v1.7: the scheduler counted 0.04 m as improvement (rel 1e-4), early stopping did not -> stop with lr never reduced."""
+    tr, es = _lstm_data(128, 0), _lstm_data(64, 1)
+    seq = iter(300.0 - 0.04 * np.arange(10))            # es ADE improves 0.04 m/epoch: < 0.1 m, > rel 1e-4 (0.03 m)
+    orig = BL.errors
+    BL.errors = lambda p, f: (np.array([next(seq)]),)
+    try:
+        _, info = BL.train_lstm(tr, es, _args(lr=1e-3, epochs=5, patience=50, lr_patience=1), "cpu")
+    finally:
+        BL.errors = orig
+    assert [c["lr"] for c in info["curve"]] == [1e-3, 1e-3, 1e-3, 5e-4, 5e-4], info["curve"]
+
+
 def test_lstm_learns_constant_velocity():
     """Sanity: the LSTM must learn a constant-velocity target far below the zero predictor."""
     tr, es = _lstm_data(1024, 0), _lstm_data(256, 1)

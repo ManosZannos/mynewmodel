@@ -30,7 +30,7 @@ import pandas as pd
 
 import loader as LD
 
-BASELINES_VERSION = "baselines-v1.7"
+BASELINES_VERSION = "baselines-v1.8"
 STRATA = ["tier_cv", "scene_group", "vessel_cat"]
 
 
@@ -159,7 +159,9 @@ def train_lstm(tr, es, a, device):
     np.random.seed(a.seed)
     model = make_lstm(tr["obs"].shape[-1], LD.PRED).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=a.lr_patience)
+    # v1.8: same improvement criterion as early stopping (> 0.1 m), not the default relative 1e-4
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=a.lr_patience,
+                                                       threshold=0.1, threshold_mode="abs")
     X = torch.from_numpy(tr["obs"])
     Y = torch.from_numpy(tr["fut"] / LD.SCALES["pos_m"])
     best, best_state, bad, best_ep, curve, stop = np.inf, None, 0, 0, [], "max_epochs"
