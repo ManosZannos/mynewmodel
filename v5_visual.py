@@ -83,7 +83,7 @@ def scan(raw, cfg):
             dt = np.diff(t[keep])
             jump_cut = (np.diff(seg) > 0) & (dt <= cfg["seg_gap_s"])
             cut[kept_idx[1:][jump_cut]] = True
-        rows.append(pd.DataFrame({"mmsi": mmsi, "t": t, "lat": lat, "lon": lon, "sog": sog,
+        rows.append(pd.DataFrame({"mmsi": mmsi, "t": t, "lat": lat, "lon": lon, "sog": sog, "cog": cog,
                                   "spike": ~keep, "cut_before": cut}))
     return pd.concat(rows, ignore_index=True)
 
@@ -125,6 +125,9 @@ def panel(ax, rep, grid, title):
         ax.plot(rx[ok], ry[ok], "o", ms=2.2, mfc="none", color="0.35", zorder=4)
         sp = rep["spike"].to_numpy()
         ax.plot(rx[sp], ry[sp], "x", ms=7, mew=1.6, color="red", zorder=6)
+        if "spike_v8" in rep:  # v8_spikes.py: spikes of the reference implementation
+            s8 = rep["spike_v8"].to_numpy()
+            ax.plot(rx[s8], ry[s8], "+", ms=9, mew=1.4, color="purple", zorder=7)
         ct = rep["cut_before"].to_numpy()
         ax.plot(rx[ct], ry[ct], "s", ms=5, mfc="none", mew=1.3, color="orange", zorder=5)
     ax.set_aspect("equal", adjustable="datalim")

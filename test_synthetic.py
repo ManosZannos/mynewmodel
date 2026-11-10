@@ -943,6 +943,21 @@ def test_v8_compare_aligns_implementations():
     assert r["segments"]["v8_split_in_ref"] == 1 and r["segments"]["ref_split_in_v8"] == 0
 
 
+def test_v8_spikes_same_input():
+    # v8_spikes.py: both despikes see the same reports; an isolated 1 km lateral spike is flagged by both
+    import v5_visual as V5
+    import v8_spikes as VS
+    tr = straight(2400, kn=10, course=0)
+    raw = make_reports(tr, report_times(2400, 60, 60, phase=17))
+    k = len(raw) // 2
+    x, y = latlon_to_xy(raw.loc[k, "latitude"], raw.loc[k, "longitude"])
+    raw.loc[k, "latitude"], raw.loc[k, "longitude"] = xy_to_latlon(x + 1000, y)
+    rep = VS.add_triplet(VS.add_v8(V5.scan(raw_only(raw), cfg_default())))
+    out, _ = VS.summary(rep)
+    assert (out["both"], out["only_ours"], out["only_v8"], out["blocked_v8"]) == (1, 0, 0, 0), out
+    assert rep.loc[rep["spike"], "err"].iloc[0] > 900
+
+
 # ---------------------------------------------------------------------------
 # Έλεγχος της ίδιας της γεννήτριας (δεν χρειάζεται pipeline)
 # ---------------------------------------------------------------------------
