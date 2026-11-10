@@ -8,11 +8,13 @@ differences by SOG and by deviation from the predicted position, counts how many
 two chord tolerances (AMB-08), and draws PNG samples:
 
   only_v8_*.png  only_ours_*.png  blocked_v8_*.png   (red × ours, purple + V8)
+  chain_ours_*.png   reports kept only because of our chain limit (AMB-10)
 
     python v8_spikes.py --raw_dir data/2025_03 --month 2025-03 --days 1 2 3 \
         --build dataset_v8ref/socal_2025-03_b19c45d7 --out reports/v8_spikes
 """
 import argparse
+import copy
 import json
 import os
 import sys
@@ -20,6 +22,7 @@ import sys
 import numpy as np
 import pandas as pd
 
+import preprocess_noaa as P
 import v5_visual as V5
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "docs"))
@@ -35,6 +38,17 @@ def add_v8(rep):
         sp.append(~keep)
         bl.append(blocked)
     return rep.assign(spike_v8=np.concatenate(sp), blocked_v8=np.concatenate(bl))
+
+
+def add_ours_free(rep, cfg):
+    """spike_free: our despike without the chain limit; chain_ours = removed only without it (AMB-10)."""
+    free = copy.deepcopy(cfg)
+    free["despike"]["max_consecutive"] = 10 ** 9
+    cap = cfg["speed_caps_kn"]["global"]  # shortcut: only the global cap exists (v3.2); per-type caps would need scan's map
+    sp = [~P.despike_vessel(g["lat"].to_numpy(float), g["lon"].to_numpy(float), g["t"].to_numpy(np.int64),
+                            g["sog"].to_numpy(float), g["cog"].to_numpy(float), cap, free)[0]
+          for _, g in rep.groupby("mmsi", sort=False)]
+    return rep.assign(spike_free=np.concatenate(sp))
 
 
 def add_triplet(rep):
@@ -76,6 +90,15 @@ def summary(rep):
     cls = {"both": sp & v8, "only_ours": sp & ~v8, "only_v8": ~sp & v8}
     out = {k: int(v.sum()) for k, v in cls.items()}
     out["blocked_v8"] = int(rep["blocked_v8"].sum())
+    cls["chain_ours"] = rep["spike_free"].to_numpy() & ~sp
+    out["chain_ours"] = int(cls["chain_ours"].sum())
+    out["chain_ours_vessels"] = int(rep.loc[cls["chain_ours"], "mmsi"].nunique())
+    # AMB-11: same event, other point -- only-ours report whose previous or next report is only-V8
+    m, ov = rep["mmsi"].to_numpy(), cls["only_v8"]
+    adj = np.zeros(len(rep), bool)
+    adj[1:] |= ov[:-1] & (m[1:] == m[:-1])
+    adj[:-1] |= ov[1:] & (m[:-1] == m[1:])
+    out["only_ours_with_adjacent_only_v8"] = int((cls["only_ours"] & adj).sum())
     sog_bin = pd.cut(rep["sog"], [-np.inf, 10, 20, np.inf], right=False, labels=["<10", "10-20", ">=20"])
     err_bin = pd.cut(rep["err"], [0, 150, 300, 1000, np.inf], right=False,
                      labels=["<150", "150-300", "300-1000", ">=1000"])
@@ -104,7 +127,7 @@ def main():
     cfg = meta["config"]
     print(f"[v8_spikes] {cfg['config_version']} vs {R.VERSION}, μέρες {a.days}")
     rep = V5.scan(V5.load_raw(a.raw_dir, a.month, cfg, days=set(a.days)), cfg)
-    rep = add_triplet(add_v8(rep))
+    rep = add_triplet(add_ours_free(add_v8(rep), cfg))
     out, cls = summary(rep)
     out.update(config_version=cfg["config_version"], v8_version=R.VERSION, days=a.days,
                build_despike=meta["funnel"]["dropped"].get("despike"), scan_despike=int(rep["spike"].sum()))
@@ -116,7 +139,8 @@ def main():
     grid = V5.load_grid(a.build)
     made = []
     for stem, mask, n in (("only_v8", cls["only_v8"], a.n), ("only_ours", cls["only_ours"], a.n),
-                          ("blocked_v8", rep["blocked_v8"].to_numpy(), a.n // 2)):
+                          ("blocked_v8", rep["blocked_v8"].to_numpy(), a.n // 2),
+                          ("chain_ours", cls["chain_ours"], a.n)):
         d = rep[mask]
         if d.empty:
             continue

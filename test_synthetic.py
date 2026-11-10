@@ -952,10 +952,33 @@ def test_v8_spikes_same_input():
     k = len(raw) // 2
     x, y = latlon_to_xy(raw.loc[k, "latitude"], raw.loc[k, "longitude"])
     raw.loc[k, "latitude"], raw.loc[k, "longitude"] = xy_to_latlon(x + 1000, y)
-    rep = VS.add_triplet(VS.add_v8(V5.scan(raw_only(raw), cfg_default())))
+    cfg = cfg_default()
+    rep = VS.add_triplet(VS.add_ours_free(VS.add_v8(V5.scan(raw_only(raw), cfg)), cfg))
     out, _ = VS.summary(rep)
-    assert (out["both"], out["only_ours"], out["only_v8"], out["blocked_v8"]) == (1, 0, 0, 0), out
+    assert (out["both"], out["only_ours"], out["only_v8"], out["blocked_v8"], out["chain_ours"]) == (1, 0, 0, 0, 0), out
     assert rep.loc[rep["spike"], "err"].iloc[0] > 900
+
+
+def test_v8_spikes_chain_and_swap():
+    # chain_ours: 3 consecutive lateral spikes (500, 900, 500 m); our chain limit keeps one of them
+    import v5_visual as V5
+    import v8_spikes as VS
+    tr = straight(2400, kn=10, course=0)
+    raw = make_reports(tr, report_times(2400, 60, 60, phase=17))
+    k = len(raw) // 2
+    for j, d in zip(range(k, k + 3), (500, 900, 500)):
+        x, y = latlon_to_xy(raw.loc[j, "latitude"], raw.loc[j, "longitude"])
+        raw.loc[j, "latitude"], raw.loc[j, "longitude"] = xy_to_latlon(x + d, y)
+    cfg = cfg_default()
+    rep = VS.add_triplet(VS.add_ours_free(VS.add_v8(V5.scan(raw_only(raw), cfg)), cfg))
+    out, _ = VS.summary(rep)
+    assert out["chain_ours"] == 1 and not (rep["spike"] & ~rep["spike_free"]).any(), out
+    # swap: ours 0 / V8 1 of the same vessel count; ours 3 / V8 4 do not (4 is another vessel)
+    r = pd.DataFrame({"mmsi": [1, 1, 1, 1, 2], "sog": 10.0, "err": 0.0, "tol_ours": 1.0, "tol_v8": 1.0,
+                      "spike": [True, False, False, True, False], "spike_v8": [False, True, False, False, True],
+                      "blocked_v8": False, "spike_free": [True, False, False, True, False]})
+    out, _ = VS.summary(r)
+    assert (out["only_ours"], out["only_v8"], out["only_ours_with_adjacent_only_v8"]) == (2, 2, 1), out
 
 
 # ---------------------------------------------------------------------------
