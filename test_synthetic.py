@@ -914,6 +914,23 @@ def test_a6_noise_tol_cut_dt():
     assert A.cut_dt(rep)[0] == 30 and np.isnan(A.cut_dt(rep)[1]) and A.cut_dt(rep)[2] == 5
 
 
+def test_v8_compare_aligns_implementations():
+    """t datetime vs int minutes, seg_id as partition, angle wrap, float tolerance, extra rows."""
+    import pandas as pd
+    import v8_compare as VC
+    t = pd.to_datetime(["2025-03-01 00:01", "2025-03-01 00:02", "2025-03-01 00:03"], utc=True)
+    ref = pd.DataFrame({"mmsi": 1, "t": t, "seg_id": ["1_0000", "1_0000", "1_0001"],
+                        "lat": 33.0, "lon": -118.0, "cog": [359.95, 10.0, 20.0], "sog": [5.0, 5.0, 5.0]})
+    v8 = pd.DataFrame({"mmsi": 1, "t": np.array([1, 2, 3, 4], np.int32), "seg_id": np.array([7, 7, 7, 7], np.int32),
+                       "lat": [33.0, 33.0, 33.0 + 1e-4, 33.0], "lon": -118.0,
+                       "cog": [0.02, 10.0, 25.0, 0.0], "sog": [5.001, 5.0, 5.0, 5.0]})
+    r = VC.compare(ref, v8)
+    assert (r["common"], r["only_ref"], r["only_v8"]) == (3, 0, 1), r
+    assert r["columns"]["cog"]["diff"] == 1 and r["columns"]["sog"]["diff"] == 0       # 359.95 vs 0.02: same
+    assert r["pos_m"]["gt_1m"] == 1                                                      # 1e-4 deg ≈ 11 m
+    assert r["segments"]["v8_split_in_ref"] == 1 and r["segments"]["ref_split_in_v8"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Έλεγχος της ίδιας της γεννήτριας (δεν χρειάζεται pipeline)
 # ---------------------------------------------------------------------------
