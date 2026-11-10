@@ -337,6 +337,24 @@ def test_longitudinal_spikes_removed():
         assert pos_error_m(tr, out).max() < 5.0
 
 
+def test_chain_limit_forces_cut():
+    # AMB-10: 3 consecutive lateral spikes (500, 900, 500 m); 2 are removed, the 3rd would exceed
+    # max_consecutive, so it is kept and a cut is forced before it ("πέρα από αυτό τομή")
+    tr = straight(2400, kn=10, course=0)
+    raw = make_reports(tr, report_times(2400, 60, 60, phase=17))
+    k = len(raw) // 2
+    for j, d in zip(range(k, k + 3), (500, 900, 500)):
+        x, y = latlon_to_xy(raw.loc[j, "latitude"], raw.loc[j, "longitude"])
+        raw.loc[j, "latitude"], raw.loc[j, "longitude"] = xy_to_latlon(x + d, y)
+    out, funnel, _ = run(raw)
+    assert funnel["dropped"].get("despike", 0) == 2, funnel["dropped"]
+    assert funnel.get("forced_cuts") == 1, funnel.get("forced_cuts")
+    assert pipeline()._merge_funnel(pipeline()._merge_funnel(None, funnel), funnel)["forced_cuts"] == 2
+    assert out["seg_id"].nunique() == 2, "η αλυσίδα > 2 πρέπει να κόψει το segment"
+    g = out.groupby("seg_id")["t"]
+    assert g.min().max() - g.max().min() >= pd.Timedelta(minutes=2), "τρύπα ≥ 1 λεπτού μετά την τομή"
+
+
 def test_teleport_cuts_with_hole():
     tr1 = straight(1200, kn=10, course=0)
     tr2 = straight(1200, kn=10, course=0, x0=5000, y0=tr1.y[-1], t0=T0 + pd.Timedelta(seconds=1260))
@@ -957,6 +975,22 @@ def test_v8_spikes_same_input():
     out, _ = VS.summary(rep)
     assert (out["both"], out["only_ours"], out["only_v8"], out["blocked_v8"], out["chain_ours"]) == (1, 0, 0, 0, 0), out
     assert rep.loc[rep["spike"], "err"].iloc[0] > 900
+
+
+def test_v5_scan_duplicates_match_stage_a():
+    # A5 tie-break: equally complete duplicates with different positions; scan must keep the same
+    # record as run_stage_a (sort by lat, lon, ...), not the first in file order
+    import v5_visual as V5
+    tr = straight(2400, kn=10, course=0)
+    raw = make_reports(tr, report_times(2400, 60, 60, phase=17))
+    k = len(raw) // 2
+    d = raw.loc[[k]].copy()
+    x, y = latlon_to_xy(d["latitude"].iloc[0], d["longitude"].iloc[0])
+    d["latitude"], d["longitude"] = xy_to_latlon(x + 1000, y + 1000)
+    raw = pd.concat([d, raw], ignore_index=True)
+    _, funnel, cfg = run(raw)
+    rep = V5.scan(raw_only(raw), cfg)
+    assert int(rep["spike"].sum()) == funnel["dropped"].get("despike", 0), (int(rep["spike"].sum()), funnel["dropped"])
 
 
 def test_v8_spikes_chain_and_swap():

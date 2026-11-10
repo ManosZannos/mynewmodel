@@ -109,6 +109,7 @@ def main():
     fr = json.load(open(os.path.join(a.ref_build, "build_meta.json"), encoding="utf-8"))["funnel"]
     fv = json.load(open(os.path.join(a.v8_build, "funnel.json"), encoding="utf-8"))
     res["funnel"] = {"ref": {"dropped": fr["dropped"], "implied_cuts": fr.get("implied_cuts"),
+                             "forced_cuts": fr.get("forced_cuts"),
                              "segments": fr["segments"], "mmsi_qc": len(fr["mmsi_qc_flagged"])},
                      "v8": {"reports": fv["reports"], "grid": fv["grid"], "counters": fv["counters"],
                             "mmsi_qc": fv["mmsi_qc"]["n_flagged"]}}

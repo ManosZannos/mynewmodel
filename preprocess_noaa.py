@@ -249,9 +249,11 @@ def _implied_kn(lat, lon, t, i, j, tol):
 
 
 def despike_vessel(lat, lon, t, sog, cog, cap, cfg):
-    """Επιστρέφει μάσκα αναφορών που κρατιούνται και πλήθος αφαιρέσεων."""
+    """Επιστρέφει μάσκα αναφορών που κρατιούνται, πλήθος αφαιρέσεων και μάσκα blocked (spikes που
+    μένουν γιατί η αφαίρεση θα έκανε αλυσίδα > max_consecutive· το A7 κόβει πριν από αυτά, AMB-10)."""
     dc = cfg["despike"]
     keep = np.ones(len(t), bool)
+    blocked = np.zeros(len(t), bool)
     removed = 0
     cvm = cfg["cog_valid_min_sog_kn"]
     for _ in range(dc["max_passes"]):
@@ -327,6 +329,7 @@ def despike_vessel(lat, lon, t, sog, cog, cap, cfg):
             while pos + right + 1 < len(keep) and removed_mask[pos + right + 1]:
                 right += 1
             if left + right + 1 > max_run:      # αλυσίδα αφαιρέσεων → τομή, όχι διαγραφή
+                blocked[pos] = True
                 continue
             chosen.add(k)
         if not chosen:
@@ -334,13 +337,14 @@ def despike_vessel(lat, lon, t, sog, cog, cap, cfg):
         drop_pos = idx[np.array(sorted(chosen)) + 1]
         keep[drop_pos] = False
         removed += len(drop_pos)
-    return keep, removed
+    return keep, removed, blocked
 
 
 # ---------------------------------------------------------------------------
 # A7: segmentation
 # ---------------------------------------------------------------------------
-def segment_vessel(lat, lon, t, sog, cap, cfg):
+def segment_vessel(lat, lon, t, sog, cap, cfg, blocked=None):
+    """blocked: τομή πριν από τις αναφορές που κράτησε το όριο αλυσίδας του A6 (v3.7, AMB-10)."""
     n = len(t)
     if n == 0:
         return np.zeros(0, int), 0
@@ -351,6 +355,8 @@ def segment_vessel(lat, lon, t, sog, cap, cfg):
     thr = _pair_threshold(sog[i], sog[j], cap, dc)
     jump = v > thr
     cut = (dt > cfg["seg_gap_s"]) | jump
+    if blocked is not None:
+        cut |= blocked[j]
     seg = np.concatenate([[0], np.cumsum(cut)])
     return seg, int(jump.sum())
 
@@ -517,7 +523,8 @@ def run_stage_a(raw: pd.DataFrame, cfg: dict):
               "dropped": {k: 0 for k in DROP_KEYS},
               "nulled": {"heading_sentinel": 0, "cog_sentinel": 0, "sog_sentinel": 0,
                          "sog_implausible": 0},
-              "mmsi_qc_flagged": [], "segments": 0, "grid_rows": 0, "implied_cuts": 0}
+              "mmsi_qc_flagged": [], "segments": 0, "grid_rows": 0, "implied_cuts": 0,
+              "forced_cuts": 0}
     df = standardize(raw)
 
     def drop(mask, key):
@@ -569,10 +576,11 @@ def run_stage_a(raw: pd.DataFrame, cfg: dict):
         cap = float(g["cap"].iloc[0])
         n_rep = len(t)
 
-        keep, n_spk = despike_vessel(lat, lon, t, sog, cog, cap, cfg)
+        keep, n_spk, blocked = despike_vessel(lat, lon, t, sog, cog, cap, cfg)
         funnel["dropped"]["despike"] += n_spk
+        funnel["forced_cuts"] += int(blocked.sum())
         t, lat, lon, sog, cog, hdg = (a[keep] for a in (t, lat, lon, sog, cog, hdg))
-        seg, n_cut = segment_vessel(lat, lon, t, sog, cap, cfg)
+        seg, n_cut = segment_vessel(lat, lon, t, sog, cap, cfg, blocked[keep])
         funnel["implied_cuts"] += n_cut
         if n_rep >= cfg.get("mmsi_qc_min_reports", 50) and (n_spk + n_cut) / n_rep > cfg["mmsi_qc_max_anomaly_frac"]:
             funnel["mmsi_qc_flagged"].append(int(mmsi))
@@ -644,7 +652,7 @@ def _git_commit():
 def _merge_funnel(acc, f):
     if acc is None:
         return copy.deepcopy(f)
-    for k in ("raw_rows", "kept_reports", "segments", "grid_rows", "implied_cuts"):
+    for k in ("raw_rows", "kept_reports", "segments", "grid_rows", "implied_cuts", "forced_cuts"):
         acc[k] += f[k]
     for d in ("dropped", "nulled"):
         for k, v in f[d].items():

@@ -67,7 +67,9 @@ def scan(raw, cfg):
     df["cap"] = df["mmsi"].map(cat).fillna("unknown").map(lambda c: caps.get(c, caps["global"])).astype(float)
     df.loc[df["sog"] > df["cap"], "sog"] = np.nan
     df["_n"] = df[["sog", "cog", "heading"]].notna().sum(axis=1)
-    df = df.sort_values(["mmsi", "t", "_n"], ascending=[True, True, False], kind="mergesort")
+    df = df.sort_values(["mmsi", "t", "_n", "lat", "lon", "sog", "cog", "heading"],  # same A5 tie-break as run_stage_a
+                        ascending=[True, True, False, True, True, True, True, True],
+                        kind="mergesort", na_position="last")
     df = df[~df.duplicated(["mmsi", "t"], keep="first")]
     rows = []
     for mmsi, g in df.groupby("mmsi", sort=True):
@@ -75,9 +77,9 @@ def scan(raw, cfg):
         lat, lon = g["lat"].to_numpy(float), g["lon"].to_numpy(float)
         sog, cog = g["sog"].to_numpy(float), g["cog"].to_numpy(float)
         cap = float(g["cap"].iloc[0])
-        keep, _ = P.despike_vessel(lat, lon, t, sog, cog, cap, cfg)
+        keep, _, blocked = P.despike_vessel(lat, lon, t, sog, cog, cap, cfg)
         kept_idx = np.flatnonzero(keep)
-        seg, _ = P.segment_vessel(lat[keep], lon[keep], t[keep], sog[keep], cap, cfg)
+        seg, _ = P.segment_vessel(lat[keep], lon[keep], t[keep], sog[keep], cap, cfg, blocked[keep])
         cut = np.zeros(len(t), bool)
         if len(kept_idx) > 1:
             dt = np.diff(t[keep])

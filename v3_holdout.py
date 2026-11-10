@@ -57,7 +57,7 @@ def clean_reports(raw: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         lat, lon = g["lat"].to_numpy(float), g["lon"].to_numpy(float)
         sog, cog = g["sog"].to_numpy(float), g["cog"].to_numpy(float)
         cap = float(g["cap"].iloc[0])
-        keep, _ = P.despike_vessel(lat, lon, t, sog, cog, cap, cfg)
+        keep, *_ = P.despike_vessel(lat, lon, t, sog, cog, cap, cfg)
         t, lat, lon, sog, cog = t[keep], lat[keep], lon[keep], sog[keep], cog[keep]
         seg, _ = P.segment_vessel(lat, lon, t, sog, cap, cfg)
         out.append(pd.DataFrame({"mmsi": mmsi, "seg": seg, "t": t, "lat": lat, "lon": lon,
