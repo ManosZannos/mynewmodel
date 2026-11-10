@@ -355,6 +355,34 @@ def test_chain_limit_forces_cut():
     assert g.min().max() - g.max().min() >= pd.Timedelta(minutes=2), "τρύπα ≥ 1 λεπτού μετά την τομή"
 
 
+def test_forced_cut_counts_in_mmsi_qc():
+    # AMB-24: 50 reports, 2 spikes + 1 forced cut = 6% > 5% (spikes alone 4%)
+    tr = straight(3000, kn=10, course=0)
+    raw = make_reports(tr, report_times(3000, 60, 60, phase=17))
+    assert len(raw) == 50
+    k = len(raw) // 2
+    for j, d in zip(range(k, k + 3), (500, 900, 500)):
+        x, y = latlon_to_xy(raw.loc[j, "latitude"], raw.loc[j, "longitude"])
+        raw.loc[j, "latitude"], raw.loc[j, "longitude"] = xy_to_latlon(x + d, y)
+    _, funnel, _ = run(raw)
+    assert funnel["dropped"].get("despike", 0) == 2 and funnel["forced_cuts"] == 1
+    assert funnel["mmsi_qc_flagged"] == [367000001], funnel["mmsi_qc_flagged"]
+
+
+def test_chord_criterion_cog_valid_without_sog():
+    # AMB-09: COG validity as in A10 (invalid only if missing or SOG known and < 0.5); a 300 m lateral
+    # spike with no SOG anywhere is below the 27 kn speed criterion, so only the chord criterion catches it
+    tr = straight(2400, kn=10, course=0)
+    raw = make_reports(tr, report_times(2400, 60, 60, phase=17))
+    raw["sog"] = np.nan
+    k = len(raw) // 2
+    x, y = latlon_to_xy(raw.loc[k, "latitude"], raw.loc[k, "longitude"])
+    raw.loc[k, "latitude"], raw.loc[k, "longitude"] = xy_to_latlon(x + 300, y)
+    out, funnel, _ = run(raw)
+    assert funnel["dropped"].get("despike", 0) == 1, funnel["dropped"]
+    assert pos_error_m(tr, out).max() < 5.0
+
+
 def test_teleport_cuts_with_hole():
     tr1 = straight(1200, kn=10, course=0)
     tr2 = straight(1200, kn=10, course=0, x0=5000, y0=tr1.y[-1], t0=T0 + pd.Timedelta(seconds=1260))

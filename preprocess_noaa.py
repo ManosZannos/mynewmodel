@@ -301,8 +301,8 @@ def despike_vessel(lat, lon, t, sog, cog, cap, cfg):
         with np.errstate(divide="ignore", invalid="ignore"):
             s_mean = np.where(n_s > 0, sum_s / n_s, v_ac) * KN
         chord_thr = np.maximum(dc["chord_min_m"], dc["chord_k"] * s_mean * dt_ac)
-        cog_ok_a = ~np.isnan(cg[a]) & (sg[a] >= cvm)
-        cog_ok_c = ~np.isnan(cg[c]) & (sg[c] >= cvm)
+        cog_ok_a = ~np.isnan(cg[a]) & ~(sg[a] < cvm)      # A10 validity: unknown SOG keeps the COG (v3.7, AMB-09)
+        cog_ok_c = ~np.isnan(cg[c]) & ~(sg[c] < cvm)
         agree = (cog_ok_a & cog_ok_c &
                  (_ang_diff(cg[a], bearing) <= dc["cog_agree_deg"]) &
                  (_ang_diff(cg[c], bearing) <= dc["cog_agree_deg"]))
@@ -582,7 +582,7 @@ def run_stage_a(raw: pd.DataFrame, cfg: dict):
         t, lat, lon, sog, cog, hdg = (a[keep] for a in (t, lat, lon, sog, cog, hdg))
         seg, n_cut = segment_vessel(lat, lon, t, sog, cap, cfg, blocked[keep])
         funnel["implied_cuts"] += n_cut
-        if n_rep >= cfg.get("mmsi_qc_min_reports", 50) and (n_spk + n_cut) / n_rep > cfg["mmsi_qc_max_anomaly_frac"]:
+        if n_rep >= cfg.get("mmsi_qc_min_reports", 50) and (n_spk + n_cut + int(blocked.sum())) / n_rep > cfg["mmsi_qc_max_anomaly_frac"]:
             funnel["mmsi_qc_flagged"].append(int(mmsi))
 
         prev_end = None
