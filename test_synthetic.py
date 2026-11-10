@@ -904,6 +904,16 @@ def test_compare_builds_reports_changes():
     assert CB.compare_days(out, new.iloc[1:])["only_old"] == 1
 
 
+def test_a6_noise_tol_cut_dt():
+    """Δt before a cut: from the previous KEPT report of the same vessel (spikes skipped, no cross-vessel diff)."""
+    import pandas as pd
+    import a6_noise_tol as A
+    rep = pd.DataFrame({"mmsi": [1, 1, 1, 1, 2, 2], "t": [0, 10, 15, 40, 100, 105],
+                        "spike": [False, False, True, False, False, False],
+                        "cut_before": [False, False, False, True, True, True]})
+    assert A.cut_dt(rep)[0] == 30 and np.isnan(A.cut_dt(rep)[1]) and A.cut_dt(rep)[2] == 5
+
+
 # ---------------------------------------------------------------------------
 # Έλεγχος της ίδιας της γεννήτριας (δεν χρειάζεται pipeline)
 # ---------------------------------------------------------------------------
