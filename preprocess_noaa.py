@@ -47,7 +47,7 @@ REGIONS = {
 }
 
 DEFAULT_CONFIG = {
-    "config_version": "stageA-v3.6",
+    "config_version": "stageA-v3.7",
     "region": REGIONS["socal"],
     "margin_km": 10.0,              # κουτί + περιθώριο για γείτονες (στόχοι μόνο IN_CORE)
     "grid_s": 60,
@@ -304,7 +304,7 @@ def despike_vessel(lat, lon, t, sog, cog, cap, cfg):
         agree = (cog_ok_a & cog_ok_c &
                  (_ang_diff(cg[a], bearing) <= dc["cog_agree_deg"]) &
                  (_ang_diff(cg[c], bearing) <= dc["cog_agree_deg"]))
-        crit_chord = agree & (dev > chord_thr)
+        crit_chord = agree & (dev > chord_thr) & (v_ac <= thr_ac)   # AMB-06b: i-1 -> i+1 αληθοφανές, όπως στο 1ο κριτήριο
         score_chord = dev / chord_thr
 
         cand = near & (crit_speed | crit_chord)

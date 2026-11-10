@@ -350,6 +350,18 @@ def test_teleport_cuts_with_hole():
         "πρέπει να μείνει τουλάχιστον ένα κενό λεπτό μετά την τομή"
 
 
+def test_longitudinal_jump_cuts_not_spike():
+    # AMB-06b: άλμα 20 km κατά μήκος της πορείας σε 60 s. Το COG των γειτόνων συμφωνεί με τη χορδή,
+    # αλλά το i-1 -> i+1 δεν είναι αληθοφανές, άρα κανένα spike (ούτε το σημείο πριν το άλμα): τομή.
+    tr1 = straight(1200, kn=10, course=0)
+    tr2 = straight(1200, kn=10, course=0, y0=tr1.y[-1] + 20000, t0=T0 + pd.Timedelta(seconds=1200))
+    r1 = make_reports(tr1, report_times(1200, 60, 60, phase=17))
+    r2 = make_reports(tr2, report_times(1200, 60, 60, phase=17))
+    out, funnel, _ = run(pd.concat([r1, r2], ignore_index=True))
+    assert funnel["dropped"].get("despike", 0) == 0, "το άλμα 20 km θεωρήθηκε spike"
+    assert out["seg_id"].nunique() == 2, "το άλμα 20 km πρέπει να κόψει το segment"
+
+
 def test_gaps_bridging_and_segmentation():
     cfg = cfg_default()
     gaps_len = [120, 180, 300, 480, cfg["seg_gap_s"] + 300]
@@ -778,7 +790,7 @@ def test_v4_invariants():
 # stageA-v3.6: γωνίες στο [0, 360), φρουρός Hermite, V4 v1.1
 # ---------------------------------------------------------------------------
 def test_v36_version():
-    assert cfg_default()["config_version"] == "stageA-v3.6"
+    assert cfg_default()["config_version"] == "stageA-v3.7"
 
 
 def test_v36_circ_interp_below_360():
