@@ -31,8 +31,8 @@ def compare_days(old: pd.DataFrame, new: pd.DataFrame) -> dict:
     only_old, only_new = int((~k_old.isin(k_new)).sum()), int((~k_new.isin(k_old)).sum())
     res = {"rows_old": len(old), "rows_new": len(new), "only_old": only_old, "only_new": only_new,
            "changed": {}, "disp_m": np.zeros(0), "changed_vessels": set(), "changed_segments": set()}
-    if only_old or only_new:
-        return res
+    if only_old or only_new:                 # compare the common (mmsi, t) rows; both frames are sorted by KEY
+        old, new = old[k_old.isin(k_new)].reset_index(drop=True), new[k_new.isin(k_old)].reset_index(drop=True)
     changed_any = np.zeros(len(old), bool)
     for c in [c for c in old.columns if c in new.columns and c not in KEY]:
         a, b = old[c], new[c]

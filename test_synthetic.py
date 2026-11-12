@@ -959,7 +959,8 @@ def test_compare_builds_reports_changes():
     r = CB.compare_days(out, new)
     assert r["changed"].keys() == {"lat/lon", "cog"} and r["changed_rows"] == 2
     assert abs(float(r["disp_m"][0]) - 10.0) < 0.05
-    assert CB.compare_days(out, new.iloc[1:])["only_old"] == 1
+    r = CB.compare_days(out, new.iloc[1:])                     # v3.7: keys differ, common rows still compared
+    assert r["only_old"] == 1 and r["changed"].keys() == {"lat/lon", "cog"} and r["changed_rows"] == 2, r
 
 
 def test_a6_noise_tol_cut_dt():
