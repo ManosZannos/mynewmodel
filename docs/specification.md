@@ -199,7 +199,7 @@
 
 **Μεταδεδομένα (****`build_meta.json`****):** config, commit hash, εκδόσεις pandas/numpy, snapshot OSM, λίστα αρχείων εισόδου με sha256, το funnel (§7), κάλυψη ανά μέρα και ώρα, sha256 της εξόδου.
 
-Τα παλιά CSV (`frame_id, vessel_id, LON, LAT, SOG, Heading` με z-score) καταργούνται. Ο νέος loader διαβάζει Parquet + manifest. Η αλλαγή στο `dataset.py` αφορά τη Φάση 3.
+Τα παλιά CSV (`frame_id, vessel_id, LON, LAT, SOG, Heading` με z-score) καταργούνται. Ο νέος loader διαβάζει Parquet + manifest. Το παλιό `dataset.py` αφαιρέθηκε (2026-11-13)· η Φάση 3 χτίζεται πάνω στο `loader.py` (`docs/phase3_handoff.md`).
 
 ## 7. Επαλήθευση και κριτήρια εξόδου
 
