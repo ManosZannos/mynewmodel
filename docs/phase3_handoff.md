@@ -32,24 +32,21 @@ python compare_builds.py dataset/socal_2025-12_70a880d6   dataset/socal_2025-12_
 
 Αναμένεται: αλλαγές σε λίγα πλοία (SoCal Μάρτιος: 64 πλοία, 1,373 νέες / 108 χαμένες γραμμές), κυρίως `seg_id` από τις νέες τομές, μετατόπιση lat/lon < 1 m.
 
-**b. Μεταφορά στον DGX μέσω laptop** (ο RTX δεν φτάνει τον DGX στη θύρα 22). Μόνο ό,τι διαβάζει ο loader:
+**b. Μεταφορά στον DGX, απευθείας από τον RTX.** Μόνο ό,τι διαβάζει ο loader· το `-R` κρατά τη δομή φακέλων:
 
 ```bash
 # RTX
 cd ~/PLAN/dataset
-tar cf ~/b19c45d7_v37.tar \
+rsync -aR --info=progress2 \
   socal_2025-03_b19c45d7/day_*.parquet socal_2025-03_b19c45d7/build_meta.json \
   socal_2025-03_b19c45d7/stageB/windows.parquet socal_2025-03_b19c45d7/stageB/targets_vessel.parquet \
-  socal_2025-03_b19c45d7/stageB/manifest_vessel.json socal_2025-03_b19c45d7/stageC/shore_2026-10-29
+  socal_2025-03_b19c45d7/stageB/manifest_vessel.json \
+  socal_2025-03_b19c45d7/stageC/shore_2026-10-29 \
+  ihatz@dgx.ceid.upatras.gr:/storage/data4/ihatz/PLAN/dataset/
 ```
-```powershell
-# laptop
-scp up1084543@150.140.140.42:b19c45d7_v37.tar $env:TEMP\
-scp $env:TEMP\b19c45d7_v37.tar ihatz@dgx.ceid.upatras.gr:/storage/data4/ihatz/
-```
+Εναλλακτικά `scp -r socal_2025-03_b19c45d7 ihatz@dgx.ceid.upatras.gr:/storage/data4/ihatz/PLAN/dataset/` (όλος ο φάκελος). Η απευθείας μεταφορά RTX → DGX έχει χρησιμοποιηθεί ξανά (preprocessed δεδομένα της παλιάς εργασίας)· το timeout της 2026-11-12 ήταν επειδή ο DGX είχε κλείσει.
 ```bash
 # DGX
-cd /storage/data4/ihatz/PLAN/dataset && tar xf /storage/data4/ihatz/b19c45d7_v37.tar
 cd /storage/data4/ihatz/PLAN && git pull && git log --oneline -1
 B=dataset/socal_2025-03_b19c45d7
 ls $B/day_*.parquet | wc -l                          # 31
@@ -57,7 +54,7 @@ ls $B/stageC/shore_2026-10-29/day_*.parquet | wc -l  # 31
 ls $B/stageB/                                        # windows, targets_vessel, manifest_vessel
 python test_loader.py 2>&1 | tail -1                 # 23/23
 ```
-Μετά τον έλεγχο: σβήνεται το tar στους τρεις υπολογιστές. Στο `stageC/` πρέπει να υπάρχει μόνο το `shore_2026-10-29` (το `baselines.shore_dir_of` παίρνει τον τελευταίο αλφαβητικά).
+Στο `stageC/` πρέπει να υπάρχει μόνο το `shore_2026-10-29` (το `baselines.shore_dir_of` παίρνει τον τελευταίο αλφαβητικά).
 
 **c. LSTM baselines (DGX).** Ίδια ορίσματα με τη v3.6 (`reports/conv_v18`: defaults, seeds 0–2), πρώτα τα αιτιατά:
 
