@@ -29,7 +29,8 @@ def load(pattern, metric):
     out = {}
     for f in sorted(glob.glob(pattern)):
         r = json.loads(Path(f).read_text(encoding="utf-8"))
-        seed = r.get("args", {}).get("seed") if r.get("args", {}).get("model") == "lstm" else None
+        # every trained model has a seed (lstm, phase3); only the deterministic CV has none
+        seed = r.get("args", {}).get("seed") if r.get("args", {}).get("model") != "cv" else None
         if seed in out:
             raise ValueError(f"διπλό seed {seed} στο {pattern}")
         out[seed] = float(get(r["metrics"], metric))
