@@ -84,6 +84,36 @@ def test_training_on_test_split_refused():
     raise AssertionError("εκπαίδευση με αξιολόγηση σε test έγινε δεκτή")
 
 
+def test_field_columns_order_and_missing_windows():
+    """Context is read by window_id in the order of the split; a window without a field row is an error."""
+    d = Path(tempfile.mkdtemp())
+    try:
+        f = pd.DataFrame({"window_id": [30, 10, 20], "land_00": [.3, .1, .2], "vt_00": [0, 0, 1.], "vd_00": [0, 0, .5],
+                          "hab_00": [1., 1, 1], "hab_n": [.2, .2, .2], "shore_d": [.9, .8, .7]})
+        f.to_parquet(d / "field.parquet", index=False)
+        c = P3.load_field(d / "field.parquet", np.array([10, 20, 30]), ["land", "vessels"])
+        assert np.allclose(c, [[.1, 0, 0], [.2, 1, .5], [.3, 0, 0]]), c
+        assert P3.load_field(d / "field.parquet", np.array([20]), ["habit"]).shape == (1, 2), "hab_00 και hab_n"
+        assert np.allclose(P3.load_field(d / "field.parquet", np.array([30]), ["shore"]), [[.9]])
+        try:
+            P3.load_field(d / "field.parquet", np.array([10, 99]), ["land"])
+        except AssertionError:
+            return
+        raise AssertionError("παράθυρο χωρίς πεδίο έγινε δεκτό")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_shuffle_context():
+    """Mechanism check: rows are permuted (same multiset), within the group when groups are given."""
+    c = np.arange(40, dtype=np.float32).reshape(20, 2)
+    s = P3.shuffle_context(c)
+    assert not np.array_equal(s, c) and np.array_equal(np.sort(s[:, 0]), c[:, 0]) and np.array_equal(P3.shuffle_context(c), s)
+    g = np.array(["harbor"] * 10 + ["offshore"] * 10)
+    sg = P3.shuffle_context(c, g)
+    assert not np.array_equal(sg, c) and sg[:10, 0].max() < 20 <= sg[10:, 0].min(), "ανακάτεμα μόνο μέσα στο scene_group"
+
+
 # --- scorecard ---
 def _runs(d, name, fde, strata=None, n_params=None, model=None):
     for s, v in enumerate(fde):
@@ -142,6 +172,15 @@ def _args(**kw):
 _ARCH = {"encoder": "tcn", "hidden": 32, "no_cv": False, "no_rotate": False}
 
 
+def test_shuffle_train_needs_context():
+    try:
+        P3.main(["--train_build", "x", "--shuffle_train"])
+    except SystemExit as e:
+        assert "context" in str(e.code), e.code           # our message, not argparse's "unrecognized arguments"
+        return
+    raise AssertionError("--shuffle_train χωρίς κανάλια έγινε δεκτό")
+
+
 def test_torch_new_net_is_cv():
     """Zero-initialised last layer: an untrained network predicts exactly the CV baseline, for both encoders."""
     d = _turns([1, 2, 3], 0)
@@ -192,6 +231,46 @@ def test_torch_end_to_end_and_checkpoint_arch():
         r2 = P3.main(common + ["--load_model", r["model_path"], "--tag", "reload"])
         assert r2["arch"] == r["arch"] and r2["n_params"] == r["n_params"] and r2["args"]["seed"] == 3
         assert r2["metrics"] == r["metrics"] and "train" not in r2
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_torch_context_channels_end_to_end():
+    """stageD field -> phase3 --channels: the context reaches the network (untrained = CV, perturbed head reacts to it),
+    the checkpoint keeps the channels, and --shuffle_context changes the predictions of a trained model."""
+    import torch
+    import stageD_field as D
+    from test_stageD import _build
+    c = np.random.default_rng(0).random((6, 5)).astype(np.float32)
+    p = P3.prepare(_turns([1, 2], 0))
+    p = {k: v[:6] for k, v in p.items()} | {"c": c}
+    net = P3.make_net({**_ARCH, "n_ctx": 5})
+    assert np.array_equal(P3.predict(P3.net_fn(net, "cpu"), p), p["cv"])
+    torch.manual_seed(0)
+    torch.nn.init.normal_(net.head[-1].weight)
+    a = P3.predict(P3.net_fn(net, "cpu"), p)
+    assert np.abs(a - P3.predict(P3.net_fn(net, "cpu"), {**p, "c": c[::-1].copy()})).max() > 1.0, "το context αγνοείται"
+    d = Path(tempfile.mkdtemp())
+    try:
+        rng = np.random.default_rng(1)
+        _build(d, [_track(m, 60, turn_deg_per_min=float(rng.uniform(-3, 3)), lat0=33.0 + 0.004 * m) for m in range(1, 13)], n_train=8)
+        D.main([str(d), "--skip_land"])
+        common = ["--train_build", str(d), "--out_dir", str(d / "out")]
+        r = P3.main(common + ["--channels", "vessels,habit", "--hidden", "16", "--epochs", "2", "--batch", "16"])
+        assert r["arch"]["channels"] == ["habit", "vessels"] and r["arch"]["n_ctx"] == 3 * 16 + 1 and r["tag"].startswith("m_habit+vessels_")
+        r2 = P3.main(common + ["--load_model", r["model_path"], "--tag", "reload"])
+        assert r2["metrics"] == r["metrics"] and r2["arch"] == r["arch"]
+        r3 = P3.main(common + ["--load_model", r["model_path"], "--shuffle_context", "all"])
+        assert r3["tag"].endswith("_shufall") and r3["metrics"]["headline"]["n"] == r["metrics"]["headline"]["n"]
+        rt = P3.main(common + ["--channels", "vessels", "--shuffle_train", "--hidden", "16", "--epochs", "2", "--batch", "16"])
+        assert rt["tag"].endswith("_trshuf") and rt["arch"]["shuffle_train"] and rt["arch"]["n_ctx"] == 2 * 16
+        rt2 = P3.main(common + ["--load_model", rt["model_path"], "--tag", "reload2"])     # flag comes from the checkpoint
+        assert rt2["metrics"] == rt["metrics"], "η αξιολόγηση του σκέλους ελέγχου δεν ανακατεύει όπως η εκπαίδευση"
+        try:
+            P3.main(common + ["--channels", "vessels", "--shuffle_context", "all"])
+        except SystemExit:
+            return
+        raise AssertionError("--shuffle_context χωρίς --load_model έγινε δεκτό")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
