@@ -286,6 +286,16 @@ def test_train_subset_nonoverlap():
     assert BL.train_subset(tr) is tr
 
 
+def test_lstm_load_model_needs_seed():
+    """baselines v1.9: --load_model without --seed wrote every LSTM checkpoint to the same _s0 file."""
+    try:
+        BL.main(["--train_build", "missing_build", "--model", "lstm", "--load_model", "x.pt", "--eval_split", "test"])
+    except SystemExit as e:
+        assert "--seed" in str(e.code), e.code
+    else:
+        raise AssertionError("χωρίς --seed έπρεπε να σταματήσει")
+
+
 # --- baselines v1.7: convergence protocol (needs torch) ---
 def _lstm_data(n, seed):
     """obs (n, 11, F) random; fut = constant velocity from obs[:, -1, :2] (km/min) -> learnable target (m)."""

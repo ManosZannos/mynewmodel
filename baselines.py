@@ -30,7 +30,7 @@ import pandas as pd
 
 import loader as LD
 
-BASELINES_VERSION = "baselines-v1.8"
+BASELINES_VERSION = "baselines-v1.9"  # v1.9: lstm --load_model needs --seed (it names the output)
 STRATA = ["tier_cv", "scene_group", "vessel_cat"]
 
 
@@ -224,10 +224,14 @@ def main(argv=None):
     ap.add_argument("--lr_patience", type=int, default=3, help="ReduceLROnPlateau (×0.5)")
     ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=None, help="προεπιλογή 0· με --load_model του lstm υποχρεωτικό")
     ap.add_argument("--tag", default=None)
     ap.add_argument("--out_dir", default="reports/v6")
     a = ap.parse_args(argv)
+    if a.seed is None:
+        if a.load_model and a.model == "lstm":
+            sys.exit("--load_model του lstm θέλει --seed: το checkpoint δεν το γράφει και ονομάζει το αρχείο εξόδου")
+        a.seed = 0
     eb, em = a.eval_build or a.train_build, a.eval_manifest or a.manifest
     tag = a.tag or f"{a.model}_{Path(a.train_build).name}_{Path(eb).name}_{em}_{a.eval_split}" + \
         (f"_s{a.seed}" if a.model == "lstm" else "") + ("_trcapped" if a.train_capped else "") + \

@@ -173,6 +173,20 @@ def test_shapely_land_rays_follow_the_course():
     assert np.isclose(v[0, 0], 1 - (2000 / 300) / CFG["t_max_min"], atol=0.01) and v[0, 8] == 0
 
 
+def test_land_diag_groups_and_contrib():
+    """land_diag.py (new): ahead bins from the 3 front sectors, 'narrow channel' = land on both beams,
+    contributions of the groups add up to the total difference."""
+    import land_diag as LDG
+    f = pd.DataFrame(np.zeros((3, 16)), columns=[f"land_{k:02d}" for k in range(16)])
+    f.loc[1, "land_15"] = 0.9                            # land ahead (port bow), no beams
+    f.loc[2, ["land_04", "land_12", "land_01"]] = [0.8, 0.6, 0.2]
+    g = LDG.land_groups(f)
+    assert list(g["ahead"]) == ["0 (καμία)", "(2/3, 1]", "(0, 1/3]"], list(g["ahead"])
+    assert g["channel"].tolist() == [False, False, True]
+    t = LDG.table([9, 9, 9, 9], [10, 10, 10, 10], [10, 30, 10, 0], np.array(["x", "x", "y", "y"]))
+    assert abs(t["contrib"].sum() - 1) < 1e-9 and t["diff"].tolist() == [10, -5], t
+
+
 if __name__ == "__main__":
     k = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and k in n]
