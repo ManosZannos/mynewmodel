@@ -280,6 +280,12 @@ def test_torch_context_channels_end_to_end():
         assert r["arch"]["channels"] == ["habit", "vessels"] and r["arch"]["n_ctx"] == 3 * 16 + 1 and r["tag"].startswith("m_habit+vessels_")
         r2 = P3.main(common + ["--load_model", r["model_path"], "--tag", "reload"])
         assert r2["metrics"] == r["metrics"] and r2["arch"] == r["arch"]
+        shutil.copytree(d / "stageD", d / "stageD_alt")
+        ra = P3.main(common + ["--channels", "habit", "--field_dir", "stageD_alt", "--hidden", "16", "--epochs", "1", "--batch", "16"])
+        assert ra["tag"].endswith("_stageD_alt") and ra["arch"]["field_dir"] == "stageD_alt"
+        shutil.rmtree(d / "stageD")                                   # the reload must read stageD_alt from the checkpoint
+        assert P3.main(common + ["--load_model", ra["model_path"], "--tag", "reload_alt"])["metrics"] == ra["metrics"]
+        shutil.copytree(d / "stageD_alt", d / "stageD")
         r3 = P3.main(common + ["--load_model", r["model_path"], "--shuffle_context", "all"])
         assert r3["tag"].endswith("_shufall") and r3["metrics"]["headline"]["n"] == r["metrics"]["headline"]["n"]
         rt = P3.main(common + ["--channels", "vessels", "--shuffle_train", "--hidden", "16", "--epochs", "2", "--batch", "16"])

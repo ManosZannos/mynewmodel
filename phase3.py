@@ -34,10 +34,10 @@ import pandas as pd
 import baselines as BL
 import loader as LD
 
-PHASE3_VERSION = "phase3-v0.4"      # v0.4: --loss euclid; v0.3: --shuffle_train; v0.2: context channels of the polar field (stageD_field.py)
+PHASE3_VERSION = "phase3-v0.5"      # v0.5: --field_dir; v0.4: --loss euclid; v0.3: --shuffle_train; v0.2: context channels of the polar field (stageD_field.py)
 RES_SCALE = LD.SCALES["pos_m"]      # network output unit (m); provisional, like the loader scales (spec §4.3)
 HUBER_M = 100.0                     # fixed before any result: errors above 100 m are penalised linearly
-ARCH = ("encoder", "hidden", "no_cv", "no_rotate", "channels", "shuffle_train", "loss")
+ARCH = ("encoder", "hidden", "no_cv", "no_rotate", "channels", "shuffle_train", "loss", "field_dir")
 # channel -> column prefixes of stageD/field.parquet ("shore" = scalar distances of stage C, comparison arm)
 CHANNELS = {"land": ("land_",), "vessels": ("vt_", "vd_"), "habit": ("hab_",), "shore": ("shore_",)}
 DILATIONS = (1, 2, 4)               # kernel 3 -> receptive field 15 >= the 11 input steps
@@ -257,6 +257,8 @@ def main(argv=None, name=None, ctx_module=None, ctx_loader=None):
     ap.add_argument("--no_rotate", action="store_true", help="δοκιμή: χωρίς περιστροφή στην πορεία")
     ap.add_argument("--channels", default="", help="κανάλια του πολικού πεδίου (stageD/field.parquet), π.χ. "
                     "land,vessels,habit· shore = βαθμωτές αποστάσεις του σταδίου Γ (σκέλος σύγκρισης)")
+    ap.add_argument("--field_dir", default="stageD", help="φάκελος του πεδίου μέσα στο build (π.χ. stageD_gap1, "
+                    "έλεγχος διαρροής της συνήθειας)· αποθηκεύεται στο checkpoint")
     ap.add_argument("--shuffle_context", choices=["all", "scene"], default=None,
                     help="έλεγχος μηχανισμού, μόνο με --load_model: το context κάθε παραθύρου αντικαθίσταται από άλλου "
                     "παραθύρου (all: οποιουδήποτε· scene: του ίδιου scene_group)")
@@ -301,11 +303,12 @@ def main(argv=None, name=None, ctx_module=None, ctx_loader=None):
     def ctx(build, d):
         if ctx_loader:
             return ctx_loader(build, d)
-        return load_field(Path(build) / "stageD" / "field.parquet", d["meta"]["window_id"].to_numpy(), ch) if ch else None
+        return load_field(Path(build) / arch.get("field_dir", "stageD") / "field.parquet", d["meta"]["window_id"].to_numpy(), ch) if ch else None
     tag = a.tag or (("m_" + "+".join(ch) if ch else "m0") + f"_{Path(a.train_build).name}_{Path(eb).name}_{em}_{a.eval_split}_s{seed}"
                     + ("_gru" if arch["encoder"] == "gru" else "") + (f"_h{arch['hidden']}" if arch["hidden"] != 128 else "")
                     + ("_nocv" if arch["no_cv"] else "") + ("_norot" if arch["no_rotate"] else "")
                     + ("_eucl" if arch.get("loss", "huber") == "euclid" else "")
+                    + (f"_{arch['field_dir']}" if arch.get("field_dir", "stageD") != "stageD" else "")
                     + ("_trshuf" if arch.get("shuffle_train") else "")
                     + (f"_shuf{a.shuffle_context}" if a.shuffle_context else ""))
     out = Path(a.out_dir)

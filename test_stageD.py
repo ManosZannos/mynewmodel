@@ -51,7 +51,7 @@ def test_vessels_channel_values():
 def test_habit_leaves_own_vessel_out():
     lat, lon = np.full(5, 33.0), np.full(5, -118.0)
     keys = D.habit_keys(lat, lon, np.full(5, 90.0), CFG)
-    tab = D.habit_table(keys, [0, 0, 0, 1, 1], [1, 1, 1, 2, 2])
+    tab = D.habit_table(keys, [0, 0, 0, 1, 1], [1, 1, 1, 2, 2], [0] * 5)
     q = D.habit_keys([33.0, 33.0, 33.5], [-118.0, -118.0, -118.0], [90.0, 90.0, 90.0], CFG)
     h, n = D.habit_values(tab, q, [1, 9, 9], CFG)
     assert np.allclose(h[0, :2], [0.0, 1.0]) and np.isclose(n[0], 2 / CFG["count_cap"]), "το πλοίο 1 βλέπει μόνο το 2"
@@ -59,6 +59,20 @@ def test_habit_leaves_own_vessel_out():
     assert not h[2].any() and n[2] == 0, "κελί χωρίς ιστορικό"
     other_course = D.habit_keys([33.0], [-118.0], [270.0], CFG)
     assert D.habit_values(tab, other_course, [9], CFG)[1][0] == 0, "άλλη πορεία στο ίδιο κελί"
+
+
+def test_habit_gap_days_leaves_out_same_days():
+    """Vessel 2 passes the cell on days 0 and 5, vessel 3 on day 1, vessel 1 (the query's own) on day 0.
+    gap 0 for a query on day 0 drops only vessel 2's day-0 counts; gap 1 also vessel 3; the own vessel stays out."""
+    keys = D.habit_keys(np.full(5, 33.0), np.full(5, -118.0), np.full(5, 90.0), CFG)
+    tab = D.habit_table(keys, [0, 1, 2, 3, 4], [2, 2, 3, 1, 1], [0, 5, 1, 0, 0])
+    q = D.habit_keys([33.0], [-118.0], [90.0], CFG)
+
+    def n(g):
+        return D.habit_values(tab, q, [1], CFG, [0], g)[1][0] * CFG["count_cap"]
+    assert round(n(None)) == 3 and round(n(0)) == 2 and round(n(1)) == 1, (n(None), n(0), n(1))
+    h = D.habit_values(tab, q, [1], CFG, [0], 1)[0][0]
+    assert h[1] == 1.0 and h.sum() == 1.0, "μένει μόνο το πλοίο 2 της μέρας 5 (τομέας 1)"
 
 
 def test_habit_cells_are_about_cell_m():
@@ -103,6 +117,10 @@ def test_end_to_end_skip_land():
         hn = f["hab_n"].to_numpy()
         assert not hn[m == 4].any(), "πλοίο του val σε περιοχή χωρίς train: κανένα ιστορικό"
         own_only = [v for v in (1, 2, 3) if v in set(tab["mmsi"])]
+        D.main([str(d), "--skip_land", "--habit_gap_days", "0", "--out_name", "stageD_gap0"])
+        g0 = pd.read_parquet(d / "stageD_gap0" / "field.parquet").set_index("window_id").loc[f.index]
+        assert not g0["hab_n"].any(), "όλα τα ίχνη είναι της ίδιας μέρας: χωρίς αυτή δεν μένει ιστορικό"
+        assert np.array_equal(g0.filter(like="vd_").to_numpy(), f.filter(like="vd_").to_numpy())
         assert not hn[np.isin(m, own_only)].any(), "κάθε πλοίο του train είναι μόνο του στα κελιά του: αφαιρείται"
         # a second build reads the table of the first: the same vessels are now 'other' traffic
         d2 = Path(tempfile.mkdtemp())

@@ -14,6 +14,8 @@ stageD_field.py — στάδιο Δ: πολικό πεδίο γύρω από τ�
 Πορεία και ταχύτητα του στόχου: το αιτιατό CV του baselines.py (ίδια γωνία με την περιστροφή του phase3.py).
 Γείτονες: τελευταία αναφορά ≤ t0 κάθε άλλου πλοίου (P_* της γραμμής του λεπτού t0), προωθημένη στο t0 με SOG/COG.
 Ο πίνακας συνήθειας γράφεται στο build του train και διαβάζεται από τα άλλα builds με --prior_build.
+Έλεγχος διαρροής: --habit_gap_days D αφαιρεί από τη συνήθεια κάθε παραθύρου τις συνεισφορές όλων των πλοίων από
+μέρες (UTC) σε απόσταση ≤ D από τη μέρα του t0 (ταυτόχρονη κίνηση, π.χ. συνοδεία)· γράφεται σε --out_name.
 
     python stageD_field.py dataset/socal_2025-03_b19c45d7 --osm_dir data/osm/2026-10-29
     python stageD_field.py dataset/socal_2025-12_b19c45d7 --osm_dir data/osm/2026-10-29 --prior_build dataset/socal_2025-03_b19c45d7
@@ -36,7 +38,7 @@ import loader as LD
 import phase3 as P3
 
 DEFAULTS = {
-    "stageD_version": "stageD-v1.0",
+    "stageD_version": "stageD-v1.1",   # v1.1: day in the habit table, --habit_gap_days, --out_name
     "K": 16,                  # sectors
     "t_max_min": 20.0,        # twice the prediction horizon
     "radius_m": 5000.0,       # neighbour radius (spec §4.2)
@@ -110,19 +112,28 @@ def habit_keys(lat, lon, course_deg, cfg):
     return pd.DataFrame({"ci": ci, "cj": cj, "cb": sector(course_deg, 0.0, cfg["K"])})
 
 
-def habit_table(keys, out_sec, mmsi):
-    """Counts per (cell, course bin, sector reached, vessel): per vessel, so a window can leave its own vessel out."""
-    return keys.assign(sec=np.asarray(out_sec), mmsi=np.asarray(mmsi)).value_counts().rename("n").reset_index()
+def habit_table(keys, out_sec, mmsi, day):
+    """Counts per (cell, course bin, sector reached, vessel, UTC day): per vessel, so a window can leave its own
+    vessel out; per day, so a leakage check can leave out the traffic of the same days."""
+    return keys.assign(sec=np.asarray(out_sec), mmsi=np.asarray(mmsi), day=np.asarray(day)).value_counts().rename("n").reset_index()
 
 
-def habit_values(tab, keys, mmsi, cfg):
+def habit_values(tab, keys, mmsi, cfg, day=None, gap_days=None):
+    """Habit of each query: counts of the table without its own vessel; with gap_days, also without every vessel's
+    counts from days within gap_days of the query's day (own vessel subtracted once)."""
     K, k3 = cfg["K"], ["ci", "cj", "cb"]
 
     def wide(by):
         return tab.groupby(by + ["sec"])["n"].sum().unstack("sec", fill_value=0).reindex(columns=range(K), fill_value=0)
+
+    def get(q, by):
+        return q.join(wide(by), on=by)[list(range(K))].fillna(0).to_numpy(float)
     q = keys.assign(mmsi=np.asarray(mmsi))
-    h = (q.join(wide(k3), on=k3)[list(range(K))].fillna(0).to_numpy(float)
-         - q.join(wide(k3 + ["mmsi"]), on=k3 + ["mmsi"])[list(range(K))].fillna(0).to_numpy(float))
+    h = get(q, k3) - get(q, k3 + ["mmsi"])
+    if gap_days is not None:
+        for o in range(-gap_days, gap_days + 1):
+            qd = q.assign(day=np.asarray(day) + o)
+            h -= get(qd, k3 + ["day"]) - get(qd, k3 + ["mmsi", "day"])
     n = h.sum(1)
     return h / np.maximum(n, 1.0)[:, None], np.minimum(n, cfg["count_cap"]) / cfg["count_cap"]
 
@@ -206,12 +217,17 @@ def main(argv=None):
     ap.add_argument("--skip_land", action="store_true", help="μόνο για tests: κανάλι ξηράς = 0 (γράφεται στο meta)")
     ap.add_argument("--prior_build", default=None, help="build με πίνακα συνήθειας (το build του train)")
     ap.add_argument("--manifest", default="vessel", help="manifest του οποίου το train δίνει τον πίνακα συνήθειας")
+    ap.add_argument("--habit_gap_days", type=int, default=None,
+                    help="έλεγχος διαρροής: χωρίς τις συνεισφορές των ημερών σε απόσταση ≤ D από τη μέρα του παραθύρου")
+    ap.add_argument("--out_name", default="stageD", help="φάκελος εξόδου μέσα στο build (π.χ. stageD_gap1)")
     a = ap.parse_args(argv)
+    if a.habit_gap_days is not None and a.out_name == "stageD":
+        sys.exit("--habit_gap_days θέλει άλλο --out_name, ώστε να μένει το κανονικό πεδίο")
     if not a.osm_dir and not a.skip_land:
         sys.exit("χρειάζεται --osm_dir (ή --skip_land για tests)")
     cfg, t_start = dict(DEFAULTS), time.time()
     K, sb = cfg["K"], Path(a.build_dir) / "stageB"
-    out = Path(a.build_dir) / "stageD"
+    out = Path(a.build_dir) / a.out_name
     out.mkdir(parents=True, exist_ok=True)
     shore_dir = BL.shore_dir_of(a.build_dir)
     print(f"[stageD] {a.build_dir} | στάδιο Γ: {shore_dir}")
@@ -235,6 +251,7 @@ def main(argv=None):
     print(f"  πλοία: {(vd > 0).any(1).mean():.1%} των παραθύρων με γείτονα σε {cfg['radius_m'] / 1000:.0f} km | {time.time() - t_start:.0f} s")
 
     keys, tab, prior = habit_keys(s["lat"], s["lon"], s["course"], cfg), None, None
+    day = s["tm0"].to_numpy() // 1440                          # UTC day of t0
     tpath = sb / f"targets_{a.manifest}.parquet"
     t = LD._read_tab(tpath) if (tpath.exists() or tpath.with_name(tpath.stem + ".csv.gz").exists()) else None
     if a.prior_build:
@@ -242,10 +259,10 @@ def main(argv=None):
     elif t is not None and (t["split"] == "train").any():
         tr_ids = set(t.loc[t["split"] == "train", "window_id"])
         fit = s["window_id"].isin(tr_ids).to_numpy() & (BL._hash01(s["mmsi"].to_numpy()) >= 0.1)   # not the early-stopping vessels
-        tab, prior = habit_table(keys[fit], s["out_sec"].to_numpy()[fit], s["mmsi"].to_numpy()[fit]), a.build_dir
+        tab, prior = habit_table(keys[fit], s["out_sec"].to_numpy()[fit], s["mmsi"].to_numpy()[fit], day[fit]), a.build_dir
         tab.to_parquet(out / "habit_table.parquet", index=False)
     if tab is not None:
-        hab, hab_n = habit_values(tab, keys, s["mmsi"].to_numpy(), cfg)
+        hab, hab_n = habit_values(tab, keys, s["mmsi"].to_numpy(), cfg, day, a.habit_gap_days)
         print(f"  συνήθεια (από {prior}): {(hab_n > 0).mean():.1%} των παραθύρων με ιστορικό | {time.time() - t_start:.0f} s")
     else:
         hab, hab_n = np.zeros((n, K)), np.zeros(n)
@@ -272,6 +289,7 @@ def main(argv=None):
                                                          "pandas": pd.__version__, "loader": LD.LOADER_VERSION,
                                                          "phase3": P3.PHASE3_VERSION},
             "shore_dir": shore_dir, "osm_dir": a.osm_dir, "skip_land": a.skip_land, "habit_prior": prior,
+            "habit_gap_days": a.habit_gap_days, "out_name": a.out_name,
             "funnel": {"eligible_windows": int(len(w)), "rows_out": int(len(f))},
             "summary": {"land_any": float((land > 0).any(1).mean()), "vessels_any": float((vd > 0).any(1).mean()),
                         "habit_any": float((hab_n > 0).mean()), "seconds": round(time.time() - t_start, 1)}}
