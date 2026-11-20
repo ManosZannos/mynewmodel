@@ -166,10 +166,30 @@ def test_scorecard_verdicts():
 # --- torch ---
 def _args(**kw):
     from types import SimpleNamespace as NS
-    return NS(**{"seed": 0, "lr": 3e-3, "epochs": 200, "batch": 64, "patience": 8, "lr_patience": 3, "no_cv": False, **kw})
+    return NS(**{"seed": 0, "lr": 3e-3, "epochs": 200, "batch": 64, "patience": 8, "lr_patience": 3, "no_cv": False, "loss": "huber", **kw})
 
 
 _ARCH = {"encoder": "tcn", "hidden": 32, "no_cv": False, "no_rotate": False}
+
+
+def test_loss_option_accepted():
+    """--loss euclid must parse: training on a test split is then refused by our own message (old code: argparse error)."""
+    try:
+        P3.main(["--train_build", "x", "--loss", "euclid", "--eval_split", "test"])
+    except SystemExit as e:
+        assert "val" in str(e.code), e.code
+        return
+    raise AssertionError("δεν σταμάτησε")
+
+
+def test_torch_loss_fn():
+    """euclid = mean Euclidean error; huber = quadratic under HUBER_M, linear (slope delta) above it."""
+    import torch
+    y = torch.zeros(2, 1, 2)
+    out = torch.tensor([[[0.03, 0.04]], [[3.0, 4.0]]])               # errors 50 m and 5 km (RES_SCALE 1000 m)
+    assert abs(float(P3.loss_fn(out, y, "euclid")) - (0.05 + 5.0) / 2) < 1e-6
+    d = P3.HUBER_M / P3.RES_SCALE
+    assert abs(float(P3.loss_fn(out, y, "huber")) - (0.5 * 0.05 ** 2 + d * (5.0 - 0.5 * d)) / 2) < 1e-6
 
 
 def test_shuffle_train_needs_context():
