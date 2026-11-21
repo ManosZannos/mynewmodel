@@ -183,6 +183,9 @@ def test_land_diag_groups_and_contrib():
     g = LDG.land_groups(f)
     assert list(g["ahead"]) == ["0 (καμία)", "(2/3, 1]", "(0, 1/3]"], list(g["ahead"])
     assert g["channel"].tolist() == [False, False, True]
+    assert list(g["front"]) == ["καμία κοντά", "μόνο πλάγια", "καμία κοντά"], list(g["front"])
+    f.loc[0, "land_00"] = 0.7
+    assert LDG.land_groups(f)["front"][0] == "ακριβώς μπροστά"
     t = LDG.table([9, 9, 9, 9], [10, 10, 10, 10], [10, 30, 10, 0], np.array(["x", "x", "y", "y"]))
     assert abs(t["contrib"].sum() - 1) < 1e-9 and t["diff"].tolist() == [10, -5], t
 

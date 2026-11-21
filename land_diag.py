@@ -5,6 +5,7 @@ land_diag.py — διαγνωστικό, ΜΕΤΑ τα test: πού κερδίζ
 
 Για τα παράθυρα της κύριας μετρικής, ανά ομάδα:
   ahead    εγγύτητα της ξηράς στους 3 τομείς μπροστά (max του land_kk: 0 = καμία μέσα σε T_max, 1 = τώρα)
+  front    ξηρά κοντά (> 2/3) ακριβώς μπροστά (τομέας 0) ή μόνο στους πλάγιους μπροστινούς (1, K−1)
   channel  ξηρά και στις δύο πλευρές (τομείς K/4 και 3K/4, εγγύτητα > 0.5): «στενό κανάλι»
   tier_cv, scene_group
 στήλες: share (των παραθύρων), FDE του CV / Α / Β, diff = Β − Α, contrib = μερίδιο της συνολικής διαφοράς
@@ -28,11 +29,13 @@ AHEAD_LABELS = ["0 (καμία)", "(0, 1/3]", "(1/3, 2/3]", "(2/3, 1]"]
 
 
 def land_groups(f):
-    """f: rows of stageD/field.parquet -> {'ahead': labels, 'channel': bool} per window."""
+    """f: rows of stageD/field.parquet -> {'ahead': labels, 'front': labels, 'channel': bool} per window."""
     land = f.filter(like="land_").to_numpy()
     K = land.shape[1]
     ahead = land[:, [0, 1, K - 1]].max(1)
+    dead, flank = land[:, 0] > 2 / 3, land[:, [1, K - 1]].max(1) > 2 / 3
     return {"ahead": pd.cut(ahead, AHEAD_BINS, labels=AHEAD_LABELS).astype(str),
+            "front": np.where(dead, "ακριβώς μπροστά", np.where(flank, "μόνο πλάγια", "καμία κοντά")),
             "channel": (land[:, K // 4] > 0.5) & (land[:, 3 * K // 4] > 0.5)}
 
 
@@ -72,7 +75,7 @@ def main(argv=None):
     fa, fb = model_fde(a.model_a, a.build_dir, d, device), model_fde(a.model_b, a.build_dir, d, device)
     f = pd.read_parquet(Path(a.build_dir) / "stageD" / "field.parquet").set_index("window_id").loc[m["window_id"]]
     g = land_groups(f)
-    keys = {"ahead": g["ahead"], "channel": np.where(g["channel"], "στενό", "όχι"),
+    keys = {"ahead": g["ahead"], "front": g["front"], "channel": np.where(g["channel"], "στενό", "όχι"),
             "tier_cv": m["tier_cv"].to_numpy(), "scene_group": m["scene_group"].to_numpy()}
     print(f"[land_diag] {a.build_dir} / {a.manifest} / {a.split} | κύρια μετρική n={int(h.sum()):,}\n"
           f"  Α {a.model_a}: FDE {fa[h].mean():.1f}\n  Β {a.model_b}: FDE {fb[h].mean():.1f}")
