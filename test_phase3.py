@@ -182,6 +182,16 @@ def test_loss_option_accepted():
     raise AssertionError("δεν σταμάτησε")
 
 
+def test_eval_field_dir_needs_load_model():
+    """phase3-v0.6: --eval_field_dir only for evaluation of a checkpoint (old code: argparse error, exit 2)."""
+    try:
+        P3.main(["--train_build", "x", "--eval_field_dir", "stageD_hab"])
+    except SystemExit as e:
+        assert "--load_model" in str(e.code), e.code
+        return
+    raise AssertionError("δεν σταμάτησε")
+
+
 def test_torch_loss_fn():
     """euclid = mean Euclidean error; huber = quadratic under HUBER_M, linear (slope delta) above it."""
     import torch
@@ -285,6 +295,8 @@ def test_torch_context_channels_end_to_end():
         assert ra["tag"].endswith("_stageD_alt") and ra["arch"]["field_dir"] == "stageD_alt"
         shutil.rmtree(d / "stageD")                                   # the reload must read stageD_alt from the checkpoint
         assert P3.main(common + ["--load_model", ra["model_path"], "--tag", "reload_alt"])["metrics"] == ra["metrics"]
+        rh = P3.main(common + ["--load_model", r["model_path"], "--eval_field_dir", "stageD_alt"])   # stageD is gone here
+        assert rh["tag"].endswith("_evstageD_alt") and rh["metrics"] == r["metrics"] and rh["arch"]["field_dir"] == "stageD"
         shutil.copytree(d / "stageD_alt", d / "stageD")
         r3 = P3.main(common + ["--load_model", r["model_path"], "--shuffle_context", "all"])
         assert r3["tag"].endswith("_shufall") and r3["metrics"]["headline"]["n"] == r["metrics"]["headline"]["n"]

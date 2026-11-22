@@ -34,7 +34,7 @@ import pandas as pd
 import baselines as BL
 import loader as LD
 
-PHASE3_VERSION = "phase3-v0.5"      # v0.5: --field_dir; v0.4: --loss euclid; v0.3: --shuffle_train; v0.2: context channels of the polar field (stageD_field.py)
+PHASE3_VERSION = "phase3-v0.6"      # v0.6: --eval_field_dir; v0.5: --field_dir; v0.4: --loss euclid; v0.3: --shuffle_train; v0.2: context channels of the polar field (stageD_field.py)
 RES_SCALE = LD.SCALES["pos_m"]      # network output unit (m); provisional, like the loader scales (spec §4.3)
 HUBER_M = 100.0                     # fixed before any result: errors above 100 m are penalised linearly
 ARCH = ("encoder", "hidden", "no_cv", "no_rotate", "channels", "shuffle_train", "loss", "field_dir")
@@ -259,6 +259,8 @@ def main(argv=None, name=None, ctx_module=None, ctx_loader=None):
                     "land,vessels,habit· shore = βαθμωτές αποστάσεις του σταδίου Γ (σκέλος σύγκρισης)")
     ap.add_argument("--field_dir", default="stageD", help="φάκελος του πεδίου μέσα στο build (π.χ. stageD_gap1, "
                     "έλεγχος διαρροής της συνήθειας)· αποθηκεύεται στο checkpoint")
+    ap.add_argument("--eval_field_dir", default=None, help="μόνο με --load_model: φάκελος του πεδίου του build "
+                    "αξιολόγησης αντί για του checkpoint (π.χ. stageD_hab: συνήθεια από το train της ίδιας περιοχής)")
     ap.add_argument("--shuffle_context", choices=["all", "scene"], default=None,
                     help="έλεγχος μηχανισμού, μόνο με --load_model: το context κάθε παραθύρου αντικαθίσταται από άλλου "
                     "παραθύρου (all: οποιουδήποτε· scene: του ίδιου scene_group)")
@@ -279,6 +281,8 @@ def main(argv=None, name=None, ctx_module=None, ctx_loader=None):
     eb, em = a.eval_build or a.train_build, a.eval_manifest or a.manifest
     if not a.load_model and a.eval_split != "val":
         sys.exit("η εκπαίδευση αξιολογεί μόνο σε val· τα test θέλουν --load_model (χωριστό βήμα)")
+    if a.eval_field_dir and not a.load_model:
+        sys.exit("--eval_field_dir αλλάζει μόνο τα δεδομένα της αξιολόγησης: θέλει --load_model")
     if a.shuffle_context and not a.load_model:
         sys.exit("--shuffle_context είναι έλεγχος αξιολόγησης: θέλει --load_model")
     if a.shuffle_train and not a.load_model and not (a.channels or name):
@@ -300,17 +304,19 @@ def main(argv=None, name=None, ctx_module=None, ctx_loader=None):
     if a.shuffle_context and not ch:
         sys.exit("--shuffle_context: το μοντέλο δεν έχει context")
 
-    def ctx(build, d):
+    def ctx(build, d, field_dir=None):
         if ctx_loader:
             return ctx_loader(build, d)
-        return load_field(Path(build) / arch.get("field_dir", "stageD") / "field.parquet", d["meta"]["window_id"].to_numpy(), ch) if ch else None
+        fd = field_dir or arch.get("field_dir", "stageD")
+        return load_field(Path(build) / fd / "field.parquet", d["meta"]["window_id"].to_numpy(), ch) if ch else None
     tag = a.tag or (("m_" + "+".join(ch) if ch else "m0") + f"_{Path(a.train_build).name}_{Path(eb).name}_{em}_{a.eval_split}_s{seed}"
                     + ("_gru" if arch["encoder"] == "gru" else "") + (f"_h{arch['hidden']}" if arch["hidden"] != 128 else "")
                     + ("_nocv" if arch["no_cv"] else "") + ("_norot" if arch["no_rotate"] else "")
                     + ("_eucl" if arch.get("loss", "huber") == "euclid" else "")
                     + (f"_{arch['field_dir']}" if arch.get("field_dir", "stageD") != "stageD" else "")
                     + ("_trshuf" if arch.get("shuffle_train") else "")
-                    + (f"_shuf{a.shuffle_context}" if a.shuffle_context else ""))
+                    + (f"_shuf{a.shuffle_context}" if a.shuffle_context else "")
+                    + (f"_ev{a.eval_field_dir}" if a.eval_field_dir else ""))
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     print(f"[phase3] {tag} | συσκευή: {device}" + (f" ({dev['gpu']})" if dev["gpu"] else " — ΧΩΡΙΣ GPU"))
@@ -349,7 +355,7 @@ def main(argv=None, name=None, ctx_module=None, ctx_loader=None):
         res["n_params"] = save_checkpoint(res["model_path"], model, arch, res["args"])
     print(f"  παράμετροι: {res['n_params']:,}")
 
-    c_ev = ctx(eb, ev)
+    c_ev = ctx(eb, ev, a.eval_field_dir)
     if arch.get("shuffle_train"):                     # the control arm never sees the context of its own window
         c_ev = shuffle_context(c_ev, seed=seed)
     if a.shuffle_context:
