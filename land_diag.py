@@ -7,9 +7,11 @@ land_diag.py — διαγνωστικό, ΜΕΤΑ τα test: πού κερδίζ
   ahead    εγγύτητα της ξηράς στους 3 τομείς μπροστά (max του land_kk: 0 = καμία μέσα σε T_max, 1 = τώρα)
   front    ξηρά κοντά (> 2/3) ακριβώς μπροστά (τομέας 0) ή μόνο στους πλάγιους μπροστινούς (1, K−1)
   channel  ξηρά και στις δύο πλευρές (τομείς K/4 και 3K/4, εγγύτητα > 0.5): «στενό κανάλι»
+  habit    πόσα πλοία στηρίζουν τη συνήθεια του κελιού (από το hab_n του πεδίου)
   tier_cv, scene_group
 στήλες: share (των παραθύρων), FDE του CV / Α / Β, diff = Β − Α, contrib = μερίδιο της συνολικής διαφοράς
-(άθροισμα 1 ανά ομαδοποίηση).
+(άθροισμα 1 ανά ομαδοποίηση). --eval_field_dir: πεδίο αξιολόγησης για όλα τα μοντέλα και τις ομάδες, όπως στο
+phase3.py· --tier: μόνο τα παράθυρα ενός tier_cv.
 
     python land_diag.py dataset/houston_2025-03_7bfeb419 --manifest alltest --split test \
         --model_a reports/phase3_rtx/<m0 tag>.pt --model_b reports/phase3_rtx/<m_land tag>.pt
@@ -26,6 +28,8 @@ import phase3 as P3
 
 AHEAD_BINS = [-np.inf, 0, 1 / 3, 2 / 3, 1]
 AHEAD_LABELS = ["0 (καμία)", "(0, 1/3]", "(1/3, 2/3]", "(2/3, 1]"]
+HAB_BINS = [-np.inf, 0, 0.1, 0.5, 1]                 # hab_n = min(πλοία, 50) / 50
+HAB_LABELS = ["0 πλοία", "1–5", "6–25", "> 25"]
 
 
 def land_groups(f):
@@ -36,7 +40,8 @@ def land_groups(f):
     dead, flank = land[:, 0] > 2 / 3, land[:, [1, K - 1]].max(1) > 2 / 3
     return {"ahead": pd.cut(ahead, AHEAD_BINS, labels=AHEAD_LABELS).astype(str),
             "front": np.where(dead, "ακριβώς μπροστά", np.where(flank, "μόνο πλάγια", "καμία κοντά")),
-            "channel": (land[:, K // 4] > 0.5) & (land[:, 3 * K // 4] > 0.5)}
+            "channel": (land[:, K // 4] > 0.5) & (land[:, 3 * K // 4] > 0.5),
+            "habit": pd.cut(f["hab_n"].to_numpy(), HAB_BINS, labels=HAB_LABELS).astype(str)}
 
 
 def table(fde_cv, fde_a, fde_b, keys):
@@ -49,10 +54,10 @@ def table(fde_cv, fde_a, fde_b, keys):
     return pd.DataFrame(rows)
 
 
-def model_fde(path, build, d, device):
+def model_fde(path, build, d, device, field_dir=None):
     model, ck = P3.load_checkpoint(path, device)
     arch = ck["arch"]
-    c = P3.load_field(Path(build) / arch.get("field_dir", "stageD") / "field.parquet",
+    c = P3.load_field(Path(build) / (field_dir or arch.get("field_dir", "stageD")) / "field.parquet",
                       d["meta"]["window_id"].to_numpy(), arch["channels"]) if arch["channels"] else None
     pred = P3.predict(P3.net_fn(model, device), P3.prepare(d, not arch["no_rotate"], c), not arch["no_cv"])
     return BL.errors(pred, d["fut"])[1]
@@ -65,19 +70,23 @@ def main(argv=None):
     ap.add_argument("--split", default="val")
     ap.add_argument("--model_a", required=True, help="checkpoint αναφοράς (M0)")
     ap.add_argument("--model_b", required=True, help="checkpoint με context")
+    ap.add_argument("--eval_field_dir", default=None, help="π.χ. stageD_hab (συνήθεια από το train της περιοχής)")
+    ap.add_argument("--tier", choices=["easy", "medium", "hard"], default=None)
     a = ap.parse_args(argv)
     import torch
     device = BL.device_info(torch)["device"]
     d = LD.load_split(a.build_dir, a.manifest, a.split, x=LD.load_rows(a.build_dir, BL.shore_dir_of(a.build_dir)))
     m = d["meta"]
-    h = m["headline"].to_numpy() == 1
+    h = (m["headline"].to_numpy() == 1) & ((m["tier_cv"].to_numpy() == a.tier) if a.tier else True)
     cv = BL.errors(P3.course(d["pos"], m["last_avail"], m["p_age_s"])[0], d["fut"])[1]
-    fa, fb = model_fde(a.model_a, a.build_dir, d, device), model_fde(a.model_b, a.build_dir, d, device)
-    f = pd.read_parquet(Path(a.build_dir) / "stageD" / "field.parquet").set_index("window_id").loc[m["window_id"]]
+    fd = a.eval_field_dir
+    fa, fb = model_fde(a.model_a, a.build_dir, d, device, fd), model_fde(a.model_b, a.build_dir, d, device, fd)
+    f = pd.read_parquet(Path(a.build_dir) / (fd or "stageD") / "field.parquet").set_index("window_id").loc[m["window_id"]]
     g = land_groups(f)
-    keys = {"ahead": g["ahead"], "front": g["front"], "channel": np.where(g["channel"], "στενό", "όχι"),
+    keys = {"ahead": g["ahead"], "front": g["front"], "channel": np.where(g["channel"], "στενό", "όχι"), "habit": g["habit"],
             "tier_cv": m["tier_cv"].to_numpy(), "scene_group": m["scene_group"].to_numpy()}
-    print(f"[land_diag] {a.build_dir} / {a.manifest} / {a.split} | κύρια μετρική n={int(h.sum()):,}\n"
+    print(f"[land_diag] {a.build_dir} / {a.manifest} / {a.split} | πεδίο {fd or 'checkpoint'} | tier {a.tier or 'όλα'} | "
+          f"κύρια μετρική n={int(h.sum()):,}\n"
           f"  Α {a.model_a}: FDE {fa[h].mean():.1f}\n  Β {a.model_b}: FDE {fb[h].mean():.1f}")
     fmt = {"share": "{:.1%}".format, "contrib": "{:+.1%}".format,
            **{k: "{:.1f}".format for k in ("FDE_cv", "FDE_a", "FDE_b")}, "diff": "{:+.1f}".format}
@@ -88,6 +97,9 @@ def main(argv=None):
     print("\n== ahead × channel")
     both = np.char.add(np.char.add(np.asarray(g["ahead"], str), " | "), keys["channel"].astype(str))
     print(table(cv[h], fa[h], fb[h], both[h]).to_string(index=False, formatters=fmt))
+    print("\n== front × habit")       # is the remaining loss where the habit has little support?
+    fh = np.char.add(np.char.add(np.asarray(g["front"], str), " | "), np.asarray(g["habit"], str))
+    print(table(cv[h], fa[h], fb[h], fh[h]).to_string(index=False, formatters=fmt))
 
 
 if __name__ == "__main__":

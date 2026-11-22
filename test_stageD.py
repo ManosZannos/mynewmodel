@@ -178,11 +178,13 @@ def test_land_diag_groups_and_contrib():
     contributions of the groups add up to the total difference."""
     import land_diag as LDG
     f = pd.DataFrame(np.zeros((3, 16)), columns=[f"land_{k:02d}" for k in range(16)])
+    f["hab_n"] = [0.0, 0.1, 0.6]                         # 0, 5 and 30 vessels
     f.loc[1, "land_15"] = 0.9                            # land ahead (port bow), no beams
     f.loc[2, ["land_04", "land_12", "land_01"]] = [0.8, 0.6, 0.2]
     g = LDG.land_groups(f)
     assert list(g["ahead"]) == ["0 (καμία)", "(2/3, 1]", "(0, 1/3]"], list(g["ahead"])
     assert g["channel"].tolist() == [False, False, True]
+    assert list(g["habit"]) == ["0 πλοία", "1–5", "> 25"], list(g["habit"])
     assert list(g["front"]) == ["καμία κοντά", "μόνο πλάγια", "καμία κοντά"], list(g["front"])
     f.loc[0, "land_00"] = 0.7
     assert LDG.land_groups(f)["front"][0] == "ακριβώς μπροστά"
