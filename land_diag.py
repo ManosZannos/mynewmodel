@@ -8,6 +8,7 @@ land_diag.py — διαγνωστικό, ΜΕΤΑ τα test: πού κερδίζ
   front    ξηρά κοντά (> 2/3) ακριβώς μπροστά (τομέας 0) ή μόνο στους πλάγιους μπροστινούς (1, K−1)
   channel  ξηρά και στις δύο πλευρές (τομείς K/4 και 3K/4, εγγύτητα > 0.5): «στενό κανάλι»
   habit    πόσα πλοία στηρίζουν τη συνήθεια του κελιού (από το hab_n του πεδίου)
+  conform  αναδρομικός έλεγχος της συνήθειας στο ίδιο το πλοίο (conf του σταδίου Δ v1.2), αν υπάρχει στο πεδίο
   tier_cv, scene_group
 στήλες: share (των παραθύρων), FDE του CV / Α / Β, diff = Β − Α, contrib = μερίδιο της συνολικής διαφοράς
 (άθροισμα 1 ανά ομαδοποίηση). --eval_field_dir: πεδίο αξιολόγησης για όλα τα μοντέλα και τις ομάδες, όπως στο
@@ -30,6 +31,8 @@ AHEAD_BINS = [-np.inf, 0, 1 / 3, 2 / 3, 1]
 AHEAD_LABELS = ["0 (καμία)", "(0, 1/3]", "(1/3, 2/3]", "(2/3, 1]"]
 HAB_BINS = [-np.inf, 0, 0.1, 0.5, 1]                 # hab_n = min(πλοία, 50) / 50
 HAB_LABELS = ["0 πλοία", "1–5", "6–25", "> 25"]
+CONF_BINS = [-np.inf, 0.25, 0.5, 0.75, np.inf]
+CONF_LABELS = ["conf ≤ .25", "(.25, .5]", "(.5, .75]", "> .75"]
 
 
 def land_groups(f):
@@ -41,7 +44,9 @@ def land_groups(f):
     return {"ahead": pd.cut(ahead, AHEAD_BINS, labels=AHEAD_LABELS).astype(str),
             "front": np.where(dead, "ακριβώς μπροστά", np.where(flank, "μόνο πλάγια", "καμία κοντά")),
             "channel": (land[:, K // 4] > 0.5) & (land[:, 3 * K // 4] > 0.5),
-            "habit": pd.cut(f["hab_n"].to_numpy(), HAB_BINS, labels=HAB_LABELS).astype(str)}
+            "habit": pd.cut(f["hab_n"].to_numpy(), HAB_BINS, labels=HAB_LABELS).astype(str),
+            **({"conform": np.where(f["conf_n"].to_numpy() > 0, pd.cut(f["conf"].to_numpy(), CONF_BINS, labels=CONF_LABELS)
+                                    .astype(str), "χωρίς ιστορικό")} if "conf" in f else {})}
 
 
 def table(fde_cv, fde_a, fde_b, keys):
@@ -84,6 +89,7 @@ def main(argv=None):
     f = pd.read_parquet(Path(a.build_dir) / (fd or "stageD") / "field.parquet").set_index("window_id").loc[m["window_id"]]
     g = land_groups(f)
     keys = {"ahead": g["ahead"], "front": g["front"], "channel": np.where(g["channel"], "στενό", "όχι"), "habit": g["habit"],
+            **({"conform": g["conform"]} if "conform" in g else {}),
             "tier_cv": m["tier_cv"].to_numpy(), "scene_group": m["scene_group"].to_numpy()}
     print(f"[land_diag] {a.build_dir} / {a.manifest} / {a.split} | πεδίο {fd or 'checkpoint'} | tier {a.tier or 'όλα'} | "
           f"κύρια μετρική n={int(h.sum()):,}\n"
@@ -100,6 +106,10 @@ def main(argv=None):
     print("\n== front × habit")       # is the remaining loss where the habit has little support?
     fh = np.char.add(np.char.add(np.asarray(g["front"], str), " | "), np.asarray(g["habit"], str))
     print(table(cv[h], fa[h], fb[h], fh[h]).to_string(index=False, formatters=fmt))
+    if "conform" in g:
+        print("\n== habit × conform")       # does the loss sit where the vessel has not been following the habit?
+        hc = np.char.add(np.char.add(np.asarray(g["habit"], str), " | "), np.asarray(g["conform"], str))
+        print(table(cv[h], fa[h], fb[h], hc[h]).to_string(index=False, formatters=fmt))
 
 
 if __name__ == "__main__":

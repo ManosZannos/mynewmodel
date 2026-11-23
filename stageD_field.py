@@ -9,6 +9,10 @@ stageD_field.py — στάδιο Δ: πολικό πεδίο γύρω από τ�
   vt_kk, vd_kk   ο πιο κρίσιμος γείτονας του τομέα: 1 − TCPA/T_max και 1 − DCPA/R (κρίσιμος = μέγιστο γινόμενο)
   hab_kk, hab_n  συνήθεια κίνησης: ποσοστό παραθύρων του train που από αυτό το κελί και με αυτή την πορεία βρέθηκαν
                  στον τομέα 10 λεπτά μετά, χωρίς το ίδιο το πλοίο και χωρίς τα πλοία του early stopping· hab_n = πλήθος
+  conf, conf_n   αναδρομικός έλεγχος της συνήθειας στο ίδιο το πλοίο: η συνήθεια στην κατάσταση του πλοίου 10 λεπτά
+                 πριν το t0 (θέση, πορεία), μερίδιο στον τομέα (±1) όπου βρέθηκε το πλοίο στο t0· conf_n = το hab_n εκεί.
+                 «Ακολουθεί αυτό το πλοίο την κίνηση της περιοχής;» Και οι δύο καταστάσεις είναι εκτιμήσεις του
+                 σταδίου στο t0 − 10 και στο t0 (αιτιατές)· 0 / 0 όπου δεν υπάρχει το προηγούμενο παράθυρο
   shore_d, shore_wf   βαθμωτές αποστάσεις του σταδίου Γ (σκέλος σύγκρισης), στο τελευταίο διαθέσιμο σημείο
 
 Πορεία και ταχύτητα του στόχου: το αιτιατό CV του baselines.py (ίδια γωνία με την περιστροφή του phase3.py).
@@ -38,7 +42,7 @@ import loader as LD
 import phase3 as P3
 
 DEFAULTS = {
-    "stageD_version": "stageD-v1.1",   # v1.1: day in the habit table, --habit_gap_days, --out_name
+    "stageD_version": "stageD-v1.2",   # v1.2: conf, conf_n; v1.1: day in the habit table, --habit_gap_days, --out_name
     "K": 16,                  # sectors
     "t_max_min": 20.0,        # twice the prediction horizon
     "radius_m": 5000.0,       # neighbour radius (spec §4.2)
@@ -162,6 +166,40 @@ def window_state(x, w):
     return s
 
 
+def prev_state(x, w, shift=LD.PRED):
+    """window_state of the same vessel shift minutes earlier (the habit horizon), where that window exists: same
+    segment, >= 4 available observation points. Returns (rows of w that have it, their earlier states)."""
+    r0 = w["row0"].to_numpy() - shift
+    tm, mm, sg = x["tm"].to_numpy(), x["mmsi"].to_numpy(), x["seg_id"].to_numpy()
+    end = r0 + LD.OBS + LD.PRED - 1
+    ok = r0 >= 0
+    ok[ok] = ((tm[r0[ok]] == w["t_start"].to_numpy()[ok] - shift) & (mm[r0[ok]] == mm[end[ok]])
+              & (sg[r0[ok]] == sg[end[ok]]) & (mm[r0[ok]] == w["mmsi"].to_numpy()[ok]))
+    idx = np.flatnonzero(ok)
+    wp = pd.DataFrame({"window_id": w["window_id"].to_numpy()[idx], "mmsi": w["mmsi"].to_numpy()[idx],
+                       "seg_id": sg[r0[idx]], "row0": r0[idx], "t_start": w["t_start"].to_numpy()[idx] - shift})
+    keep = LD.available_mask(x, LD.window_rows(x, wp)).sum(1) >= 4
+    return idx[keep], window_state(x, wp[keep].reset_index(drop=True))
+
+
+def conform_values(tab, s, idx, sp, cfg, gap_days=None):
+    """conf, conf_n per window (0 where idx has no earlier state): the habit at the earlier state, summed over the
+    sector where the vessel was at t0 and its two neighbours (sector edges are noisy at 22.5 degrees)."""
+    K, n = cfg["K"], len(s)
+    lat, lon = s["lat"].to_numpy()[idx], s["lon"].to_numpy()[idx]
+    plat, plon = sp["lat"].to_numpy(), sp["lon"].to_numpy()
+    east = np.radians(lon - plon) * LD.R_EARTH * np.cos(np.radians(plat))
+    north = np.radians(lat - plat) * LD.R_EARTH
+    sec = sector(np.degrees(np.arctan2(east, north)), sp["course"].to_numpy(), K)
+    h, hn = habit_values(tab, habit_keys(plat, plon, sp["course"].to_numpy(), cfg), sp["mmsi"].to_numpy(), cfg,
+                         sp["tm0"].to_numpy() // 1440, gap_days)
+    r = np.arange(len(idx))
+    conf, conf_n = np.zeros(n), np.zeros(n)
+    conf[idx] = h[r, sec] + h[r, (sec + 1) % K] + h[r, (sec - 1) % K]
+    conf_n[idx] = hn
+    return conf, conf_n
+
+
 def vessels_channel(x, s, cfg):
     K = cfg["K"]
     vt, vd = np.zeros((len(s), K)), np.zeros((len(s), K))
@@ -237,6 +275,8 @@ def main(argv=None):
     s = window_state(x, w)
     n = len(s)
     print(f"  επιλέξιμα παράθυρα: {n:,}")
+    p_idx, sp = prev_state(x, w)                     # early, before the long land step
+    print(f"  με κατάσταση {LD.PRED} λεπτά πριν (για το conf): {len(p_idx) / max(n, 1):.1%}")
 
     land = np.zeros((n, K))
     if not a.skip_land:
@@ -261,8 +301,12 @@ def main(argv=None):
         fit = s["window_id"].isin(tr_ids).to_numpy() & (BL._hash01(s["mmsi"].to_numpy()) >= 0.1)   # not the early-stopping vessels
         tab, prior = habit_table(keys[fit], s["out_sec"].to_numpy()[fit], s["mmsi"].to_numpy()[fit], day[fit]), a.build_dir
         tab.to_parquet(out / "habit_table.parquet", index=False)
+    conf, conf_n = np.zeros(n), np.zeros(n)
     if tab is not None:
         hab, hab_n = habit_values(tab, keys, s["mmsi"].to_numpy(), cfg, day, a.habit_gap_days)
+        conf, conf_n = conform_values(tab, s, p_idx, sp, cfg, a.habit_gap_days)
+        print(f"  conf: {(conf_n > 0).mean():.1%} των παραθύρων με ιστορικό στην προηγούμενη κατάσταση, "
+              f"διάμεσο {np.median(conf[conf_n > 0]) if (conf_n > 0).any() else float('nan'):.2f}")
         print(f"  συνήθεια (από {prior}): {(hab_n > 0).mean():.1%} των παραθύρων με ιστορικό | {time.time() - t_start:.0f} s")
     else:
         hab, hab_n = np.zeros((n, K)), np.zeros(n)
@@ -273,6 +317,7 @@ def main(argv=None):
         for k in range(K):
             f[f"{name}_{k:02d}"] = arr[:, k].astype(np.float32)
     f["hab_n"] = hab_n.astype(np.float32)
+    f["conf"], f["conf_n"] = np.clip(conf, 0, 1).astype(np.float32), conf_n.astype(np.float32)
     if "D_SHORE" in x:
         rl = s["row_last"].to_numpy()
         f["shore_d"] = np.clip(x["D_SHORE"].to_numpy(float)[rl] / cfg["land_cap_m"], 0, 1).astype(np.float32)
@@ -292,7 +337,7 @@ def main(argv=None):
             "habit_gap_days": a.habit_gap_days, "out_name": a.out_name,
             "funnel": {"eligible_windows": int(len(w)), "rows_out": int(len(f))},
             "summary": {"land_any": float((land > 0).any(1).mean()), "vessels_any": float((vd > 0).any(1).mean()),
-                        "habit_any": float((hab_n > 0).mean()), "seconds": round(time.time() - t_start, 1)}}
+                        "habit_any": float((hab_n > 0).mean()), "conf_any": float((conf_n > 0).mean()), "seconds": round(time.time() - t_start, 1)}}
     (out / "stageD_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     print(f"[stageD] {len(f):,} παράθυρα (= επιλέξιμα ✓) → {out / 'field.parquet'} | {meta['summary']['seconds']:.0f} s")
     return meta

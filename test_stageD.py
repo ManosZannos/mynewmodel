@@ -107,7 +107,7 @@ def test_end_to_end_skip_land():
         meta = D.main([str(d), "--skip_land"])
         f = pd.read_parquet(d / "stageD" / "field.parquet").set_index("window_id")
         assert meta["funnel"] == {"eligible_windows": len(w), "rows_out": len(f)} and sorted(f.index) == sorted(w["window_id"])
-        assert len(f.columns) == 4 * K + 1 and not f.filter(like="land_").to_numpy().any()
+        assert len(f.columns) == 4 * K + 1 + 2 and not f.filter(like="land_").to_numpy().any()
         vd = f.filter(like="vd_").to_numpy()
         m = w.set_index("window_id").loc[f.index, "mmsi"].to_numpy()
         assert (vd[m == 1].argmax(1) == 12).all() and (vd[m == 2].argmax(1) == 4).all(), "2 αριστερά του 1, 1 δεξιά του 2"
@@ -135,6 +135,42 @@ def test_end_to_end_skip_land():
             shutil.rmtree(d2, ignore_errors=True)
     finally:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def _bend(mmsi, lat0, straight_min=30, turn_min=30, turn=12.0):
+    """Straight east for straight_min minutes, then turning turn deg/min (one continuous track)."""
+    a = _track(mmsi, straight_min, lat0=lat0)
+    step = 10.0 * 1852 / 60.0 / (111_195.0 * np.cos(np.radians(lat0)))
+    t0 = (a["t"].iloc[-1] + pd.Timedelta(minutes=1)).tz_localize(None).isoformat()
+    b = _track(mmsi, turn_min, lat0=a["lat"].iloc[-1], lon0=a["lon"].iloc[-1] + step, turn_deg_per_min=turn, t0=t0)
+    return pd.concat([a, b], ignore_index=True)
+
+
+def test_conform_hindcast_of_habit():
+    """stageD-v1.2: conf = share the habit gave, at the vessel's own state 10 min before t0, to the sector where the
+    vessel was at t0. Train vessels 1-3 sail straight east; val vessel 4 does the same (conf 1), val vessel 5 sails the
+    same line and then turns hard (conf 0 once its last 10 minutes contain the turn). Causal: windows whose t0 is
+    before the turn get the same conf whether the vessel turns afterwards or not."""
+    def run(fifth):
+        d = Path(tempfile.mkdtemp())
+        # all inside one row of habit cells (32.99836-33.00061 deg)
+        tracks = [_track(m, 60, lat0=32.999 + 0.0002 * m) for m in (1, 2, 3)] + [_track(4, 60, lat0=32.9993), fifth]
+        w = _build(d, tracks)
+        D.main([str(d), "--skip_land"])
+        f = pd.read_parquet(d / "stageD" / "field.parquet").merge(w[["window_id", "mmsi", "t_start"]], on="window_id")
+        shutil.rmtree(d, ignore_errors=True)
+        return f
+    f = run(_bend(5, 32.9995))
+    assert {"conf", "conf_n"} <= set(f.columns)
+    v4 = f[(f["mmsi"] == 4) & (f["conf_n"] > 0)]
+    assert len(v4) and np.allclose(v4["conf"], 1.0), v4["conf"].tolist()
+    v5 = f[f["mmsi"] == 5].sort_values("t_start")
+    assert (v5.loc[v5["conf_n"] > 0, "conf"] < 0.01).any(), "η στροφή στα τελευταία 10 λεπτά δεν φαίνεται"
+    g = run(_track(5, 60, lat0=32.9995))                                 # same vessel, never turns
+    t_turn = (pd.Timestamp("2025-03-01", tz="UTC") - pd.Timestamp(0, tz="UTC")) // pd.Timedelta(minutes=1) + 30   # bend start
+    before = lambda x: x[(x["mmsi"] == 5) & (x["t_start"] + LD.OBS - 1 < t_turn)].set_index("window_id")[["conf", "conf_n"]]
+    a, b = before(f), before(g)
+    assert len(a) and a.equals(b.loc[a.index]), "το conf εξαρτάται από το μέλλον του παραθύρου"
 
 
 def test_field_report():
@@ -179,12 +215,14 @@ def test_land_diag_groups_and_contrib():
     import land_diag as LDG
     f = pd.DataFrame(np.zeros((3, 16)), columns=[f"land_{k:02d}" for k in range(16)])
     f["hab_n"] = [0.0, 0.1, 0.6]                         # 0, 5 and 30 vessels
+    f["conf"], f["conf_n"] = [0.9, 0.1, 0.0], [0.2, 0.2, 0.0]
     f.loc[1, "land_15"] = 0.9                            # land ahead (port bow), no beams
     f.loc[2, ["land_04", "land_12", "land_01"]] = [0.8, 0.6, 0.2]
     g = LDG.land_groups(f)
     assert list(g["ahead"]) == ["0 (καμία)", "(2/3, 1]", "(0, 1/3]"], list(g["ahead"])
     assert g["channel"].tolist() == [False, False, True]
     assert list(g["habit"]) == ["0 πλοία", "1–5", "> 25"], list(g["habit"])
+    assert list(g["conform"]) == ["> .75", "conf ≤ .25", "χωρίς ιστορικό"], list(g["conform"])
     assert list(g["front"]) == ["καμία κοντά", "μόνο πλάγια", "καμία κοντά"], list(g["front"])
     f.loc[0, "land_00"] = 0.7
     assert LDG.land_groups(f)["front"][0] == "ακριβώς μπροστά"
