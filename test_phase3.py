@@ -261,6 +261,9 @@ def test_torch_end_to_end_and_checkpoint_arch():
         r2 = P3.main(common + ["--load_model", r["model_path"], "--tag", "reload"])
         assert r2["arch"] == r["arch"] and r2["n_params"] == r["n_params"] and r2["args"]["seed"] == 3
         assert r2["metrics"] == r["metrics"] and "train" not in r2
+        # phase3 v0.8: post hook on the evaluation predictions (old main(): TypeError, no 'post')
+        rp = P3.main(common + ["--load_model", r["model_path"]], post=("shift", lambda p, b, dd: p + 1000.0))
+        assert rp["tag"].endswith("_shift") and rp["post"] == "shift" and rp["metrics"] != r["metrics"]
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

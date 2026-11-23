@@ -226,6 +226,34 @@ def test_land_cross_diag_frame_and_stats():
     assert t["any_land"] == 0.5 and t["end_land"] == 0.25 and t["depth_p50"] == 30 and t["FDE_share"] == 0.5, t
 
 
+
+def test_project_moves_only_land_points():
+    """phase3_project.py (new): land = west of a north-south coast; points on land end MARGIN_M into the water,
+    moving only east; points in the water do not change. Same land rule on the truth row of land_cross_diag."""
+    import land_cross_diag as LC
+    import phase3_project as PJ
+    d = Path(tempfile.mkdtemp())
+    try:
+        rng = np.random.default_rng(1)
+        _build(d, [_track(m, 60, turn_deg_per_min=float(rng.uniform(-3, 3)), lat0=33.0 + 0.004 * m) for m in range(1, 13)], n_train=8)
+        ev = LD.load_split(str(d), "vessel", "val")
+        lats, lons, dlat, dlon = E.sdf_grid(32.8, 33.3, -118.3, -117.5, 20.0)
+        east = np.outer(np.ones(len(lats)), np.radians(lons + 118.0) * LD.R_EARTH * np.cos(np.radians(33.0)))
+        r = {"lat0": lats[0], "lon0": lons[0], "dlat": dlat, "dlon": dlon}
+        fut = ev["fut"].astype(np.float64)
+        e0 = np.median(LC.sdf_at(r | {"sdf": east}, ev, fut))          # coast through the middle of the targets
+        r["sdf"] = east - e0
+        s0 = LC.sdf_at(r, ev, fut)
+        assert 0.2 < (s0 < 0).mean() < 0.8
+        p = PJ.project(r, ev, fut)
+        s1 = LC.sdf_at(r, ev, p)
+        assert np.allclose(p[s0 >= 0], fut[s0 >= 0], atol=1e-3), "σημεία στο νερό μετακινήθηκαν"
+        assert (np.abs(s1[s0 < 0] - PJ.MARGIN_M) < 25).all(), s1[s0 < 0].min()
+        assert np.allclose(p[s0 < 0][:, 1], fut[s0 < 0][:, 1], atol=1.0) and (p[s0 < 0][:, 0] > fut[s0 < 0][:, 0]).all()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     k = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and k in n]

@@ -34,7 +34,7 @@ import pandas as pd
 import baselines as BL
 import loader as LD
 
-PHASE3_VERSION = "phase3-v0.7"      # v0.7: arms' ctx_loader gets the field dir (--eval_field_dir); v0.6: --eval_field_dir; v0.5: --field_dir; v0.4: --loss euclid; v0.3: --shuffle_train; v0.2: context channels of the polar field (stageD_field.py)
+PHASE3_VERSION = "phase3-v0.8"      # v0.8: post hook (phase3_project.py); v0.7: arms' ctx_loader gets the field dir (--eval_field_dir); v0.6: --eval_field_dir; v0.5: --field_dir; v0.4: --loss euclid; v0.3: --shuffle_train; v0.2: context channels of the polar field (stageD_field.py)
 RES_SCALE = LD.SCALES["pos_m"]      # network output unit (m); provisional, like the loader scales (spec §4.3)
 HUBER_M = 100.0                     # fixed before any result: errors above 100 m are penalised linearly
 ARCH = ("encoder", "hidden", "no_cv", "no_rotate", "channels", "shuffle_train", "loss", "field_dir")
@@ -241,9 +241,10 @@ def load_checkpoint(path, device, ctx_module=None):
 
 
 # ---------------------------------------------------------------------------
-def main(argv=None, name=None, ctx_module=None, ctx_loader=None):
+def main(argv=None, name=None, ctx_module=None, ctx_loader=None, post=None):
     """name / ctx_module / ctx_loader: set by a comparison arm (a separate file) that brings its own context:
-    ctx_loader(build, split, field_dir) -> (n, C) array, ctx_module(H) -> its encoder. Everything else is identical."""
+    ctx_loader(build, split, field_dir) -> (n, C) array, ctx_module(H) -> its encoder. Everything else is identical.
+    post = (label, fn): fn(pred, build, split) -> pred, applied to the evaluation predictions (tag suffix _label)."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--train_build", required=True)
     ap.add_argument("--manifest", default="vessel")
@@ -316,7 +317,7 @@ def main(argv=None, name=None, ctx_module=None, ctx_loader=None):
                     + (f"_{arch['field_dir']}" if arch.get("field_dir", "stageD") != "stageD" else "")
                     + ("_trshuf" if arch.get("shuffle_train") else "")
                     + (f"_shuf{a.shuffle_context}" if a.shuffle_context else "")
-                    + (f"_ev{a.eval_field_dir}" if a.eval_field_dir else ""))
+                    + (f"_ev{a.eval_field_dir}" if a.eval_field_dir else "") + (f"_{post[0]}" if post else ""))
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     print(f"[phase3] {tag} | συσκευή: {device}" + (f" ({dev['gpu']})" if dev["gpu"] else " — ΧΩΡΙΣ GPU"))
@@ -329,7 +330,8 @@ def main(argv=None, name=None, ctx_module=None, ctx_loader=None):
                                     "loader": LD.LOADER_VERSION, "python": sys.version.split()[0],
                                     "numpy": np.__version__, "pandas": pd.__version__, "torch": torch.__version__},
            "args": {**vars(a), "seed": seed}, "arch": arch, "device": dev,
-           "eval": {"build": eb, "manifest": em, "split": a.eval_split, "shore_dir": sd_e}}
+           "eval": {"build": eb, "manifest": em, "split": a.eval_split, "shore_dir": sd_e},
+           "post": post[0] if post else None}
     try:
         res["commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
     except Exception:  # noqa: BLE001
@@ -361,6 +363,8 @@ def main(argv=None, name=None, ctx_module=None, ctx_loader=None):
     if a.shuffle_context:
         c_ev = shuffle_context(c_ev, ev["meta"]["scene_group"].to_numpy() if a.shuffle_context == "scene" else None)
     pred = predict(net_fn(model, device), prepare(ev, not arch["no_rotate"], c_ev), use_cv)
+    if post:
+        pred = post[1](pred, eb, ev)
     ade, fde = BL.errors(pred, ev["fut"])
     res["metrics"] = BL.metrics(ade, fde, ev["meta"])
     BL.print_metrics(tag, res["metrics"])

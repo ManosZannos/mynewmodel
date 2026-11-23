@@ -8,7 +8,9 @@ land_cross_diag.py — διαγνωστικό, χωρίς εκπαίδευση: 
   end_land   ποσοστό με το τελικό σημείο σε ξηρά
   depth_p50  διάμεση απόσταση μέσα στην ξηρά (m) των τελικών σημείων σε ξηρά
   FDE_share  μερίδιο του συνολικού FDE από τα παράθυρα any_land (άνω όριο αυτού που μπορεί να διορθώσει ένας περιορισμός)
-Η γραμμή της αλήθειας είναι το «θόρυβος» του raster (σημεία που η ακτογραμμή βάζει σε ξηρά ενώ το πλοίο ήταν εκεί).
+  FDE, FDE_proj  FDE πριν και μετά τον περιορισμό του phase3_project.py (ενδεικτικό· η απόφαση με scorecard, 6 seeds)
+Η γραμμή της αλήθειας είναι το «θόρυβος» του raster (σημεία που η ακτογραμμή βάζει σε ξηρά ενώ το πλοίο ήταν εκεί)·
+το FDE_proj της είναι η ζημιά του περιορισμού σε μια τέλεια πρόβλεψη.
 
     python land_cross_diag.py dataset/houston_2025-03_7bfeb419 --eval_field_dir stageD_hab \
         --models reports/houston2_rtx/<m0>.pt reports/houston2_rtx/<m_habit+land>.pt
@@ -68,16 +70,21 @@ def main(argv=None):
     h = np.ones(len(d["meta"]), bool)
     r = E.load_sdf(a.build_dir)
     cv = P3.course(d["pos"], d["meta"]["last_avail"], d["meta"]["p_age_s"])[0]
-    rows = {"αλήθεια": stats(sdf_at(r, d, d["fut"]), None), "CV": stats(sdf_at(r, d, cv), BL.errors(cv, d["fut"])[1])}
+    import phase3_project as PJ
+
+    def row(pred):
+        fde = BL.errors(pred, d["fut"])[1]
+        return stats(sdf_at(r, d, pred), fde) | {"FDE": fde.mean(), "FDE_proj": BL.errors(PJ.project(r, d, pred), d["fut"])[1].mean()}
+    rows = {"αλήθεια": row(d["fut"]) | {"FDE_share": np.nan}, "CV": row(cv)}
     if a.models:
         import torch
         device = BL.device_info(torch)["device"]
         for path in a.models:
-            pred = LDG.model_pred(path, a.build_dir, d, device, a.eval_field_dir)
-            rows[Path(path).stem] = stats(sdf_at(r, d, pred), BL.errors(pred, d["fut"])[1])
+            rows[Path(path).stem] = row(LDG.model_pred(path, a.build_dir, d, device, a.eval_field_dir))
     print(f"[land_cross_diag] {a.build_dir} / {a.manifest} / {a.split} | κύρια μετρική n={int(h.sum()):,}")
     print(pd.DataFrame(rows).T.to_string(formatters={"any_land": "{:.2%}".format, "end_land": "{:.2%}".format,
-                                                    "depth_p50": "{:.0f}".format, "FDE_share": "{:.2%}".format}))
+                                                    "depth_p50": "{:.0f}".format, "FDE_share": "{:.2%}".format,
+                                                    "FDE": "{:.1f}".format, "FDE_proj": "{:.1f}".format}))
 
 
 if __name__ == "__main__":
