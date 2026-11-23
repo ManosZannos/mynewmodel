@@ -60,12 +60,15 @@ def table(fde_cv, fde_a, fde_b, keys):
 
 
 def model_fde(path, build, d, device, field_dir=None):
+    return BL.errors(model_pred(path, build, d, device, field_dir), d["fut"])[1]
+
+
+def model_pred(path, build, d, device, field_dir=None):
     model, ck = P3.load_checkpoint(path, device)
     arch = ck["arch"]
     c = P3.load_field(Path(build) / (field_dir or arch.get("field_dir", "stageD")) / "field.parquet",
                       d["meta"]["window_id"].to_numpy(), arch["channels"]) if arch["channels"] else None
-    pred = P3.predict(P3.net_fn(model, device), P3.prepare(d, not arch["no_rotate"], c), not arch["no_cv"])
-    return BL.errors(pred, d["fut"])[1]
+    return P3.predict(P3.net_fn(model, device), P3.prepare(d, not arch["no_rotate"], c), not arch["no_cv"])
 
 
 def main(argv=None):

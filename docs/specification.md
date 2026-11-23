@@ -359,8 +359,8 @@
 | `compare_runs.py`, `scorecard.py` | Ζευγαρωτή σύγκριση ανά seed ± ΤΣ· ετυμηγορία με φρουρούς | — | (μέσα στο `test_loader.py`) |
 | `stageD_field.py` | Στάδιο Δ (πολικό πεδίο, §5.1) | stageD-v1.2 | `test_stageD.py`: 11 |
 | `phase3.py` | Μοντέλο της Φάσης 3 (M0, κανάλια, έλεγχοι μηχανισμού) | phase3-v0.7 | `test_phase3.py`: 17 |
-| `field_report.py`, `land_diag.py` | Διαγνωστικά: πριν από την εκπαίδευση (μόνο train/val) και μετά τα test (Houston) | — | (μέσα στο `test_stageD.py`) |
-| `stageE_arms.py`, `phase3_pool.py`, `phase3_sdf.py`, `phase3_sdf_habit.py` | Σκέλη σύγκρισης (pooling γειτόνων, patch SDF, SDF + συνήθεια) | stageE-v1.0 | `test_arms.py`: 10 |
+| `field_report.py`, `land_diag.py`, `land_cross_diag.py` | Διαγνωστικά: πριν από την εκπαίδευση (μόνο train/val), μετά τα test (Houston), προβλέψεις σε ξηρά | — | (μέσα στα `test_stageD.py`, `test_arms.py`) |
+| `stageE_arms.py`, `phase3_pool.py`, `phase3_sdf.py`, `phase3_sdf_habit.py` | Σκέλη σύγκρισης (pooling γειτόνων, patch SDF, SDF + συνήθεια) | stageE-v1.0 | `test_arms.py`: 11 |
 
 **Αλλαγές εκδόσεων μετά την v3.3 / v1.2:**
 

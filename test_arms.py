@@ -195,6 +195,34 @@ def test_torch_sdf_habit_end_to_end_eval_field_dir():
         shutil.rmtree(d, ignore_errors=True)
 
 
+
+def test_land_cross_diag_frame_and_stats():
+    """land_cross_diag.py (new): local points of the fut frame land on the right raster cells (raster = metres east /
+    north of a reference, so swapped axes, wrong sign or a wrong origin show up), and stats() counts land hits."""
+    import land_cross_diag as LC
+    d = Path(tempfile.mkdtemp())
+    try:
+        rng = np.random.default_rng(1)
+        _build(d, [_track(m, 60, turn_deg_per_min=float(rng.uniform(-3, 3)), lat0=33.0 + 0.004 * m) for m in range(1, 13)], n_train=8)
+        ev = LD.load_split(str(d), "vessel", "val")
+        lats, lons, dlat, dlon = E.sdf_grid(32.8, 33.3, -118.3, -117.5, 20.0)
+        north = np.outer(np.radians(lats - 33.0) * LD.R_EARTH, np.ones(len(lons)))
+        east = np.outer(np.ones(len(lats)), np.radians(lons + 118.0) * LD.R_EARTH * np.cos(np.radians(33.0)))
+        r = {"lat0": lats[0], "lon0": lons[0], "dlat": dlat, "dlon": dlon}
+        fut = ev["fut"].astype(np.float64)
+        sn, se = LC.sdf_at(r | {"sdf": north}, ev, fut), LC.sdf_at(r | {"sdf": east}, ev, fut)
+        assert np.abs((sn - sn[:, :1]) - (fut[..., 1] - fut[:, :1, 1])).max() < 25
+        assert np.abs((se - se[:, :1]) - (fut[..., 0] - fut[:, :1, 0])).max() < 25
+        m = ev["meta"]
+        p_last = ev["pos"][np.arange(len(m)), m["last_avail"].to_numpy()][:, None, :].astype(np.float64)
+        assert np.abs(LC.sdf_at(r | {"sdf": north}, ev, p_last)[:, 0] - np.radians(m["lat_last"].to_numpy() - 33.0) * LD.R_EARTH).max() < 15
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    s = np.array([[5.0, -1.0, 3.0], [5.0, 4.0, -30.0], [1.0, 2.0, 3.0], [9.0, 9.0, 9.0]])
+    t = LC.stats(s, np.array([1.0, 1.0, 1.0, 1.0]))
+    assert t["any_land"] == 0.5 and t["end_land"] == 0.25 and t["depth_p50"] == 30 and t["FDE_share"] == 0.5, t
+
+
 if __name__ == "__main__":
     k = sys.argv[sys.argv.index("-k") + 1] if "-k" in sys.argv else ""
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f) and k in n]
