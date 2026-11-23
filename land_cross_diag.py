@@ -48,6 +48,13 @@ def stats(s, fde):
             "FDE_share": fde[on.any(1)].sum() / fde.sum() if fde is not None else np.nan}
 
 
+def headline(d):
+    """Only the headline windows; every per-window array is cut, every other key (features, ...) is kept."""
+    h = d["meta"]["headline"].to_numpy() == 1
+    return {k: (v[h].reset_index(drop=True) if k == "meta" else
+                v[h] if isinstance(v, np.ndarray) and len(v) == len(h) else v) for k, v in d.items()}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("build_dir")
@@ -57,8 +64,8 @@ def main(argv=None):
     ap.add_argument("--eval_field_dir", default=None)
     a = ap.parse_args(argv)
     d = LD.load_split(a.build_dir, a.manifest, a.split, x=LD.load_rows(a.build_dir, BL.shore_dir_of(a.build_dir)))
-    h = d["meta"]["headline"].to_numpy() == 1
-    d = {"pos": d["pos"][h], "fut": d["fut"][h], "meta": d["meta"][h].reset_index(drop=True), "obs": d["obs"][h]}
+    d = headline(d)
+    h = np.ones(len(d["meta"]), bool)
     r = E.load_sdf(a.build_dir)
     cv = P3.course(d["pos"], d["meta"]["last_avail"], d["meta"]["p_age_s"])[0]
     rows = {"αλήθεια": stats(sdf_at(r, d, d["fut"]), None), "CV": stats(sdf_at(r, d, cv), BL.errors(cv, d["fut"])[1])}
