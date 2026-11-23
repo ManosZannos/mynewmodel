@@ -28,7 +28,7 @@ def ctx_module(H):
     return Pool()
 
 
-def ctx_loader(build, d):
+def ctx_loader(build, d, field_dir=None):
     return E.load_neighbours(build, d["meta"]["window_id"].to_numpy())
 
 

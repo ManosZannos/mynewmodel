@@ -358,9 +358,9 @@
 | `baseline_transformer.py` | Baseline: Transformer encoder (d 128, 4 κεφαλές, 2 επίπεδα, ff 256), ίδια είσοδος και πρωτόκολλο με το LSTM, υπερπαράμετροι ορισμένες πριν από κάθε run | — | (μέσα στο `test_loader.py`) |
 | `compare_runs.py`, `scorecard.py` | Ζευγαρωτή σύγκριση ανά seed ± ΤΣ· ετυμηγορία με φρουρούς | — | (μέσα στο `test_loader.py`) |
 | `stageD_field.py` | Στάδιο Δ (πολικό πεδίο, §5.1) | stageD-v1.2 | `test_stageD.py`: 11 |
-| `phase3.py` | Μοντέλο της Φάσης 3 (M0, κανάλια, έλεγχοι μηχανισμού) | phase3-v0.6 | `test_phase3.py`: 17 |
+| `phase3.py` | Μοντέλο της Φάσης 3 (M0, κανάλια, έλεγχοι μηχανισμού) | phase3-v0.7 | `test_phase3.py`: 17 |
 | `field_report.py`, `land_diag.py` | Διαγνωστικά: πριν από την εκπαίδευση (μόνο train/val) και μετά τα test (Houston) | — | (μέσα στο `test_stageD.py`) |
-| `stageE_arms.py`, `phase3_pool.py`, `phase3_sdf.py` | Εφεδρικά σκέλη (pooling γειτόνων, patch SDF)· δεν έχουν τρέξει | stageE-v1.0 | `test_arms.py`: 7 |
+| `stageE_arms.py`, `phase3_pool.py`, `phase3_sdf.py`, `phase3_sdf_habit.py` | Σκέλη σύγκρισης (pooling γειτόνων, patch SDF, SDF + συνήθεια) | stageE-v1.0 | `test_arms.py`: 10 |
 
 **Αλλαγές εκδόσεων μετά την v3.3 / v1.2:**
 

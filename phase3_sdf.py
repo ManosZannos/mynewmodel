@@ -31,7 +31,7 @@ def ctx_module(H):
     return Patch()
 
 
-def ctx_loader(build, d):
+def ctx_loader(build, d, field_dir=None):
     m = d["meta"]
     _, th = P3.course(d["pos"], m["last_avail"], m["p_age_s"])
     return E.sdf_patches(E.load_sdf(build), m["lat_last"].to_numpy(), m["lon_last"].to_numpy(), th)

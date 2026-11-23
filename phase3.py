@@ -34,7 +34,7 @@ import pandas as pd
 import baselines as BL
 import loader as LD
 
-PHASE3_VERSION = "phase3-v0.6"      # v0.6: --eval_field_dir; v0.5: --field_dir; v0.4: --loss euclid; v0.3: --shuffle_train; v0.2: context channels of the polar field (stageD_field.py)
+PHASE3_VERSION = "phase3-v0.7"      # v0.7: arms' ctx_loader gets the field dir (--eval_field_dir); v0.6: --eval_field_dir; v0.5: --field_dir; v0.4: --loss euclid; v0.3: --shuffle_train; v0.2: context channels of the polar field (stageD_field.py)
 RES_SCALE = LD.SCALES["pos_m"]      # network output unit (m); provisional, like the loader scales (spec §4.3)
 HUBER_M = 100.0                     # fixed before any result: errors above 100 m are penalised linearly
 ARCH = ("encoder", "hidden", "no_cv", "no_rotate", "channels", "shuffle_train", "loss", "field_dir")
@@ -243,7 +243,7 @@ def load_checkpoint(path, device, ctx_module=None):
 # ---------------------------------------------------------------------------
 def main(argv=None, name=None, ctx_module=None, ctx_loader=None):
     """name / ctx_module / ctx_loader: set by a comparison arm (a separate file) that brings its own context:
-    ctx_loader(build, split) -> (n, C) array, ctx_module(H) -> its encoder. Everything else is identical."""
+    ctx_loader(build, split, field_dir) -> (n, C) array, ctx_module(H) -> its encoder. Everything else is identical."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--train_build", required=True)
     ap.add_argument("--manifest", default="vessel")
@@ -305,9 +305,9 @@ def main(argv=None, name=None, ctx_module=None, ctx_loader=None):
         sys.exit("--shuffle_context: το μοντέλο δεν έχει context")
 
     def ctx(build, d, field_dir=None):
-        if ctx_loader:
-            return ctx_loader(build, d)
         fd = field_dir or arch.get("field_dir", "stageD")
+        if ctx_loader:
+            return ctx_loader(build, d, fd)
         return load_field(Path(build) / fd / "field.parquet", d["meta"]["window_id"].to_numpy(), ch) if ch else None
     tag = a.tag or (("m_" + "+".join(ch) if ch else "m0") + f"_{Path(a.train_build).name}_{Path(eb).name}_{em}_{a.eval_split}_s{seed}"
                     + ("_gru" if arch["encoder"] == "gru" else "") + (f"_h{arch['hidden']}" if arch["hidden"] != 128 else "")

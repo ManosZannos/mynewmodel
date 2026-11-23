@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_arms.py — tests των εφεδρικών σκελών (stageE_arms.py, phase3_pool.py, phase3_sdf.py) σε συνθετικά δεδομένα.
+"""test_arms.py — tests των εφεδρικών σκελών (stageE_arms.py, phase3_pool.py, phase3_sdf.py, phase3_sdf_habit.py) σε συνθετικά δεδομένα.
 Τα tests με «torch» ή «shapely» στο όνομα θέλουν την αντίστοιχη βιβλιοθήκη· τα υπόλοιπα τρέχουν και χωρίς."""
 import shutil, sys, tempfile, traceback
 from pathlib import Path
@@ -131,6 +131,66 @@ def test_torch_arms_end_to_end():
         except (SystemExit, RuntimeError):
             return
         raise AssertionError("checkpoint του pool φορτώθηκε από το sdf")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+
+def _sdf_habit_build(d):
+    """Synthetic build with stageD field (habit, no land) and a stageE SDF raster."""
+    rng = np.random.default_rng(1)
+    _build(d, [_track(m, 60, turn_deg_per_min=float(rng.uniform(-3, 3)), lat0=33.0 + 0.004 * m) for m in range(1, 13)], n_train=8)
+    D.main([str(d), "--skip_land"])
+    lats, lons, dlat, dlon = E.sdf_grid(32.8, 33.3, -118.3, -117.5, 200.0)
+    (d / "stageE").mkdir(exist_ok=True)
+    np.savez(d / "stageE" / "sdf.npz", sdf=np.outer(np.linspace(-4000, 4000, len(lats)), np.ones(len(lons))).astype(np.float16),
+             lat0=lats[0], lon0=lons[0], dlat=dlat, dlon=dlon)
+
+
+def test_sdf_habit_context_layout():
+    """Context = [SDF patch | habit of the given field dir]; another field dir changes only the habit part."""
+    import phase3_sdf_habit as SH
+    d = Path(tempfile.mkdtemp())
+    try:
+        _sdf_habit_build(d)
+        ev = LD.load_split(str(d), "vessel", "val")
+        c = SH.ctx_loader(str(d), ev)
+        assert c.shape == (len(ev["meta"]), SH.N2 + SH.NH) and c.dtype == np.float32
+        f = pd.read_parquet(d / "stageD" / "field.parquet")
+        f[[n for n in f.columns if n.startswith("hab_")]] = 0.5
+        (d / "stageD_alt").mkdir()
+        f.to_parquet(d / "stageD_alt" / "field.parquet")
+        c2 = SH.ctx_loader(str(d), ev, "stageD_alt")
+        assert np.array_equal(c2[:, :SH.N2], c[:, :SH.N2]) and (c2[:, SH.N2:] == 0.5).all()
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_torch_sdf_habit_arm():
+    """Untrained = CV; the prediction reacts to the patch and to the habit separately."""
+    import phase3_sdf_habit as SH
+    rng = np.random.default_rng(0)
+    c = rng.uniform(-1, 1, size=(6, SH.N2 + SH.NH)).astype(np.float32)
+    c_sdf, c_hab = c.copy(), c.copy()
+    c_sdf[:, :SH.N2] *= -1
+    c_hab[:, SH.N2:] = rng.uniform(0, 1, size=(6, SH.NH))
+    assert _reacts(SH.ctx_module, c, c_sdf) > 1.0, "το patch αγνοείται"
+    assert _reacts(SH.ctx_module, c, c_hab) > 1.0, "η συνήθεια αγνοείται"
+
+
+def test_torch_sdf_habit_end_to_end_eval_field_dir():
+    """phase3 v0.7: --eval_field_dir reaches the arm's ctx_loader. Old code (v0.6) called ctx_loader(build, d), so the
+    reload read stageD, which is removed here, and failed."""
+    import phase3_sdf_habit as SH
+    d = Path(tempfile.mkdtemp())
+    try:
+        _sdf_habit_build(d)
+        common = ["--train_build", str(d), "--out_dir", str(d / "out"), "--hidden", "16", "--epochs", "2", "--batch", "16"]
+        r = SH.main(common)
+        assert r["arch"]["channels"] == ["sdf+habit"] and r["arch"]["n_ctx"] == SH.N2 + SH.NH and r["tag"].startswith("m_sdf+habit_")
+        (d / "stageD").rename(d / "stageD_alt")
+        rh = SH.main(common + ["--load_model", r["model_path"], "--eval_field_dir", "stageD_alt"])
+        assert rh["metrics"] == r["metrics"] and rh["tag"].endswith("_evstageD_alt")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
