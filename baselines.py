@@ -30,7 +30,7 @@ import pandas as pd
 
 import loader as LD
 
-BASELINES_VERSION = "baselines-v1.9"  # v1.9: lstm --load_model needs --seed (it names the output)
+BASELINES_VERSION = "baselines-v1.10"  # v1.10: MODELS registry (baseline_transformer.py); v1.9: --load_model needs --seed
 STRATA = ["tier_cv", "scene_group", "vessel_cat"]
 
 
@@ -143,6 +143,11 @@ def make_lstm(n_feat, pred, hidden=128, layers=2):
     return LSTMBaseline()
 
 
+# learned baselines: name -> factory(n_feat, pred); other files register theirs (baseline_transformer.py) and
+# share the protocol below (training, early stopping, checkpoint, results)
+MODELS = {"lstm": make_lstm}
+
+
 def lstm_predict(model, obs, device, bs=8192):
     import torch
     model.eval()
@@ -157,7 +162,7 @@ def train_lstm(tr, es, a, device):
     import torch
     torch.manual_seed(a.seed)
     np.random.seed(a.seed)
-    model = make_lstm(tr["obs"].shape[-1], LD.PRED).to(device)
+    model = MODELS[getattr(a, "model", "lstm")](tr["obs"].shape[-1], LD.PRED).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
     # v1.8: same improvement criterion as early stopping (> 0.1 m), not the default relative 1e-4
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=a.lr_patience,
@@ -206,7 +211,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--train_build", required=True)
     ap.add_argument("--manifest", default="vessel")
-    ap.add_argument("--model", choices=["cv", "lstm"], required=True)
+    ap.add_argument("--model", choices=["cv", *MODELS], required=True)
     ap.add_argument("--eval_build", default=None, help="προεπιλογή: το train_build")
     ap.add_argument("--eval_manifest", default=None, help="προεπιλογή: το manifest")
     ap.add_argument("--eval_split", default="val")
@@ -229,12 +234,12 @@ def main(argv=None):
     ap.add_argument("--out_dir", default="reports/v6")
     a = ap.parse_args(argv)
     if a.seed is None:
-        if a.load_model and a.model == "lstm":
-            sys.exit("--load_model του lstm θέλει --seed: το checkpoint δεν το γράφει και ονομάζει το αρχείο εξόδου")
+        if a.load_model and a.model != "cv":
+            sys.exit(f"--load_model του {a.model} θέλει --seed: το checkpoint δεν το γράφει και ονομάζει το αρχείο εξόδου")
         a.seed = 0
     eb, em = a.eval_build or a.train_build, a.eval_manifest or a.manifest
     tag = a.tag or f"{a.model}_{Path(a.train_build).name}_{Path(eb).name}_{em}_{a.eval_split}" + \
-        (f"_s{a.seed}" if a.model == "lstm" else "") + ("_trcapped" if a.train_capped else "") + \
+        (f"_s{a.seed}" if a.model != "cv" else "") + ("_trcapped" if a.train_capped else "") + \
         ("_trnonoverlap" if a.train_nonoverlap else "") + \
         (f"_obs{a.obs_step}s" if a.obs_step != 60 else "") + ("_noncausal" if a.noncausal else "")
     if a.obs_step != 60 and not a.noncausal:
@@ -266,7 +271,7 @@ def main(argv=None):
         print(f"  συσκευή: {device}" + (f" ({res['device']['gpu']})" if res["device"]["gpu"] else " — ΧΩΡΙΣ GPU"))
         res["versions"]["torch"] = torch.__version__
         if a.load_model:
-            model = make_lstm(ev["obs"].shape[-1], LD.PRED).to(device)
+            model = MODELS[a.model](ev["obs"].shape[-1], LD.PRED).to(device)
             model.load_state_dict(torch.load(a.load_model, map_location=device))
             res["model_path"] = a.load_model
         else:

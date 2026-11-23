@@ -296,6 +296,20 @@ def test_lstm_load_model_needs_seed():
         raise AssertionError("χωρίς --seed έπρεπε να σταματήσει")
 
 
+def test_registered_model_uses_baseline_protocol():
+    """baselines v1.10: a model registered in MODELS is a --model choice and follows the same rules as the LSTM
+    (here: --load_model needs --seed). Old code: argparse rejects the name (exit 2)."""
+    BL.MODELS["dummy"] = BL.make_lstm
+    try:
+        BL.main(["--train_build", "missing_build", "--model", "dummy", "--load_model", "x.pt", "--eval_split", "test"])
+    except SystemExit as e:
+        assert "--seed" in str(e.code), e.code
+    else:
+        raise AssertionError("δεν σταμάτησε")
+    finally:
+        BL.MODELS.pop("dummy", None)
+
+
 # --- baselines v1.7: convergence protocol (needs torch) ---
 def _lstm_data(n, seed):
     """obs (n, 11, F) random; fut = constant velocity from obs[:, -1, :2] (km/min) -> learnable target (m)."""
@@ -345,6 +359,23 @@ def test_lstm_learns_constant_velocity():
     zero = BL.errors(np.zeros_like(es["fut"]), es["fut"])[0].mean()
     assert info["stop"] == "patience", info["stop"]
     assert info["best_early_stop_ADE"] < 0.1 * zero, (info["best_early_stop_ADE"], zero)
+
+
+def test_lstm_transformer_baseline_trains():
+    """baseline_transformer.py (new): output (n, PRED, 2), parameters comparable to the LSTM (0.5-1.5x), and the
+    shared protocol (train_lstm with model=transformer) learns the constant-velocity target."""
+    import baseline_transformer as TF
+    n_feat = len(LD.FEATURES)
+    count = lambda m: sum(p.numel() for p in m.parameters())
+    tf = TF.make_transformer(n_feat, LD.PRED)
+    ratio = count(tf) / count(BL.make_lstm(n_feat, LD.PRED))
+    assert 0.5 <= ratio <= 1.5, ratio
+    tr, es = _lstm_data(1024, 0), _lstm_data(256, 1)
+    model, info = BL.train_lstm(tr, es, _args(model="transformer"), "cpu")
+    import torch
+    assert model(torch.from_numpy(es["obs"][:4])).shape == (4, LD.PRED, 2)
+    zero = BL.errors(np.zeros_like(es["fut"]), es["fut"])[0].mean()
+    assert info["best_early_stop_ADE"] < 0.2 * zero, (info["best_early_stop_ADE"], zero)
 
 
 if __name__ == "__main__":
